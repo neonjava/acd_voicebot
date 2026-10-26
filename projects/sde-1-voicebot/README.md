@@ -1,63 +1,80 @@
-# AcademiaAI SDE 1 — project structure and assignments
+# SDE 1 — one project, six assignments
 
-**Planning scaffold only. No application, contracts, dependency configuration, tests, or CI have been implemented.** Folder placeholders mark where each member will work. This is intentional: teammates implement their assigned issues themselves.
+**Folders and documentation only. No application code has been generated.** Each person owns one weekly issue and works on their own branch. Hemanth assigns and reviews the work.
 
-Repository: `neonjava/acd_voicebot`. Integration branch: `team/sde-1-voicebot`.
+## Folder structure
 
-## Start here
-
-1. Accept your GitHub collaborator invitation.
-2. Read your assigned issue and [beginner guide](docs/START_HERE.md).
-3. After the structure PR is merged, create a feature branch from the team branch.
-4. Give your coding assistant the full issue and its prompt; implement that issue only.
-5. Run actual checks, open a PR, and ask Hemanth to review it.
-
-## Folder ownership
-
-| Member | Workstream | Owned implementation | Owned contract file |
-|---|---|---|---|
-| Hemanth | W1 Audio | `src/voicebot/audio/` | `src/voicebot/contracts/audio.py` |
-| Megha | W2 STT | `src/voicebot/transcription/` | `src/voicebot/contracts/transcription.py` |
-| Saanvi | W3 Reasoning | `src/voicebot/reasoning/` | `src/voicebot/contracts/reasoning.py` |
-| Shalini | W4 Workflow | `src/voicebot/workflow/` | `src/voicebot/contracts/workflow.py` |
-| Rakshita | W5 Backend | `src/voicebot/backend/` | `src/voicebot/contracts/common.py`, `sessions.py` |
-| Ruthwin | W6 Frontend | `frontend/` | frontend types following the shared wire contract |
-
-Owners also maintain matching test folders, synthetic fixtures, and workstream docs. Hemanth coordinates integration; no other QA coordinator has been assigned automatically.
-
-## Planned commands — available only after setup issues merge
-
-W5-A creates Python packaging/dependencies and common primitives. From this folder:
-
-```sh
-uv sync --locked
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
+```text
+projects/sde-1-voicebot/
+├── backend/
+│   ├── app/
+│   │   ├── audio/          # W1 — Hemanth
+│   │   ├── transcription/  # W2 — Megha
+│   │   ├── reasoning/      # W3 — Saanvi
+│   │   ├── agent/          # W4 — Shalini
+│   │   ├── sessions/       # W5 — Rakshita
+│   │   └── contracts/      # shared models, one file per owner
+│   ├── tests/             # all Python tests
+│   └── pyproject.toml     # Rakshita creates this in her issue
+├── frontend/              # W6 — Ruthwin
+├── docs/
+│   ├── START_HERE.md      # Git and coding-assistant instructions
+│   └── contracts.md       # agreed inputs/outputs for everyone
+└── README.md
 ```
 
-W6-A creates frontend tooling. From `frontend/`:
+## Assignments
 
-```sh
-npm ci
-npm test
-npm run build
-npm run dev
-```
+| Member | One issue for all Week 1 work | Feature branch |
+|---|---|---|
+| Hemanth | [#3 Audio and mock microphone](https://github.com/neonjava/acd_voicebot/issues/3) | `feature/w1-audio` |
+| Megha | [#4 Transcription](https://github.com/neonjava/acd_voicebot/issues/4) | `feature/w2-transcription` |
+| Saanvi | [#5 Context and reasoning](https://github.com/neonjava/acd_voicebot/issues/5) | `feature/w3-reasoning` |
+| Shalini | [#6 Agent workflow](https://github.com/neonjava/acd_voicebot/issues/6) | `feature/w4-agent` |
+| Rakshita | [#2 Backend and sessions](https://github.com/neonjava/acd_voicebot/issues/2) | `feature/w5-backend` |
+| Ruthwin | [#7 Frontend](https://github.com/neonjava/acd_voicebot/issues/7) | `feature/w6-frontend` |
 
-Install Git, uv, and Node 22.22.2. W5-A uses Python 3.12, managed by uv. Lockfile generation belongs to the setup owners. These commands have NOT been verified against a completed project; there is no runnable code in this scaffold.
+All feature PRs target `team/sde-1-voicebot`. Never push directly to a shared branch. Separate folders prevent most editing conflicts; branches keep unfinished work separate. Use both.
 
-## Read next
+## Finish before Saturday
 
-- [Beginner Git and AI-assistant guide](docs/START_HERE.md)
-- [Concrete shared interfaces](docs/contracts.md)
-- [Week 1 issue order](docs/WEEK1_BACKLOG.md)
-- [Architecture and integration checkpoints](docs/architecture.md)
+The delayed Week 1 is compressed into the available time. Finish implementation, integration, tests and reviews by **Friday evening**. Saturday is for the demo, not first-time integration. This is a team deadline, not a claim that tomorrow-to-Saturday is seven calendar days.
 
-## Decisions and source of truth
+| When | Everyone's checkpoint |
+|---|---|
+| Tomorrow morning | Rakshita publishes Python setup/common contracts in a small PR first. Everyone else starts their own contract or UI files in parallel; no copies of shared models. Hemanth reviews the early PR promptly. |
+| Tomorrow afternoon | Domain contracts and example data are shared. Each member has a draft PR and basic tests. Ruthwin can render Megha's transcript fixture. |
+| Next working day, before Friday | Working mocks. Megha tests actual Hemanth chunks; Rakshita calls both; Ruthwin starts connecting to the API. Saanvi/Shalini demonstrate their mocks separately. |
+| Friday morning | Required full path works: UI Start → backend session → fake audio → fake transcript → visible UI transcript. Fix interface mismatches now. |
+| Friday afternoon/evening | Failure tests, six module demos, CI, setup instructions, reviewed merges and evidence. No new optional features. |
+| Saturday | Demonstrate already-tested work. |
 
-Official requirements: supplied execution-plan PDF, version 1.0, 24 October 2026, §§7–16, and six Week 1 task screenshots. They require working module code, tests, reviewed PRs and a mock session displayed in the UI by Day 7. Every member needs a production-code PR and a separate test PR with evidence.
+## How the six parts connect
 
-Team proposals: Python 3.12/FastAPI/Uvicorn/Pydantic v2, uv/pytest/Ruff, React/TypeScript/Vite/Vitest/Testing Library, and the precise interfaces in contracts.md. Provider approval of stack/platform is not claimed. Tailwind and real providers are deferred. Week 1 uses synthetic data, in-memory sessions, and no paid APIs or real capture.
+| Connection | Agreement | Who verifies it |
+|---|---|---|
+| W1 → W2 | `app.audio` produces `AudioChunk`; W2 imports that model | Megha's real audio-to-transcript integration test |
+| W2 → W5 | `FakeTranscriber` returns typed `TranscriptEvent` objects | Rakshita's mock-session API test |
+| W5 → W6 | POST `/api/sessions/mock` returns `MockSessionResponse` | Rakshita + Ruthwin use the same JSON fixture |
+| W2 → W3 | segment ID/text become source-linked context | Saanvi's transcript-context test |
+| W3 → W4 | validated answer text can enter an allow-listed mock tool plan | Shalini's handoff test when W3 is ready; never bypass approvals |
 
-Hemanth selected private standalone development here. Do not access the original repository unless he explicitly authorizes it later. Making this repository public later will not restore its fork relationship; upstream submission will require a new fork and branch transfer preserving commit history.
+W3/W4 module deliverables are required this week. Their full UI integration is optional; never delay the required transcript demo for it. Hemanth coordinates integration; Rakshita owns CI/setup within her backend issue. Share a contract/mock early rather than waiting for a whole weekly issue to finish. If a teammate is late, use the documented synthetic fixture temporarily and report the blocker; final integration must call actual implementations.
+
+## Planned commands (after setup is implemented)
+
+From `backend/`: `uv sync --locked`, `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run python -m app`.
+
+From `frontend/`: `npm ci`, `npm test`, `npm run build`, `npm run dev`.
+
+These commands are implementation targets, not currently runnable or verified results. Use Python 3.12 and a documented Node version compatible with the chosen frontend tooling.
+
+## Read only these before coding
+
+1. Your GitHub issue.
+2. [Getting started](docs/START_HERE.md).
+3. [Shared interfaces](docs/contracts.md), especially your section and your consumer's.
+
+Official requirements come from the supplied Week 1 tasks and execution-plan PDF (version 1.0, 24 October 2026). Folder layout, precise interfaces, stack and compressed deadline are team decisions; provider approval is not claimed. The official plan asks for a production-code PR and a separate test PR per member; both can belong to the same weekly issue. Keep that issue open until everything is verified.
+
+Work only in this private repository. Do not access the original provider repository without Hemanth's later instruction. No real capture, paid providers, recordings, private screenshots or secrets in Week 1.

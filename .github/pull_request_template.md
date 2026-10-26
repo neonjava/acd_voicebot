@@ -1,6 +1,6 @@
 ## Assigned issue
 
-Closes #
+Related to # (keep the weekly issue open until all its work is verified)
 
 ## What changed and why
 

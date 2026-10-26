@@ -1,64 +1,44 @@
-# One issue at a time
+# Start your weekly assignment
 
-An issue is your assignment. A branch holds your changes separately. A commit saves reviewed changes. A pull request (PR) asks the team to review and combine them; opening a PR does not merge it.
+An issue is your task list. A branch holds your changes. A PR asks Hemanth to review and combine them.
 
-## Prepare once
+## 1. Get the project
 
-Install [Git](https://git-scm.com/downloads), [uv](https://docs.astral.sh/uv/getting-started/installation/), and Node 22.22.2. Use your own GitHub account. Never paste credentials into an AI chat.
+Accept your collaborator invitation, install Git and uv (Python) or Node/npm (frontend), then:
 
 ```sh
 git clone https://github.com/neonjava/acd_voicebot.git
 cd acd_voicebot
-git remote -v
-git config user.name
-git config user.email
-```
-
-The remote must be neonjava/acd_voicebot. If your identity is missing, set your own name and verified/noreply GitHub email. Never copy another contributor's identity.
-
-## Start an assignment
-
-After Hemanth merges the foundation PR:
-
-```sh
-git status
 git switch team/sde-1-voicebot
 git pull --ff-only origin team/sde-1-voicebot
-git switch -c feature/REPLACE-WITH-BRANCH-IN-ISSUE
+git switch -c feature/YOUR-BRANCH-FROM-THE-ISSUE
 ```
 
-If there are uncommitted changes or a command fails, show Hemanth the output. Do not reset, clean, force-push, or overwrite files to remove the error. The repository initially contains folders and documents only. W5-A creates Python tooling; W6-A creates frontend tooling. Run the planned README commands after those prerequisites exist. A focused test command works after you create its test file.
+Use your own Git identity. If you already cloned, check `git status` first; do not overwrite existing changes. All work goes under `projects/sde-1-voicebot/`, except Rakshita's explicitly assigned CI workflow.
 
-## Prompt for Antigravity or another coding assistant
+## 2. Give your coding assistant this
 
-> Implement only my assigned issue: ISSUE_URL. Read root AGENTS.md, projects/sde-1-voicebot/README.md, docs/contracts.md, and the complete issue. Confirm the repository is neonjava/acd_voicebot and your feature branch is based on team/sde-1-voicebot. Respect allowed files and dependencies. Use the assigned folders; initialize tooling only if your issue explicitly owns it. Do not generate a replacement application. Follow the exact interfaces, implement the checklist and meaningful tests, run the listed commands, and report actual results. Explain the input, output, and failure behavior to me. Do not merge, access the original repository, add real providers, or mark unfinished work done. Report missing dependencies rather than duplicating another person's code.
+> Implement my assigned weekly issue: ISSUE_URL. Read its full description, root AGENTS.md, projects/sde-1-voicebot/README.md and docs/contracts.md. Use my assigned branch and folders. Implement only my workstream, not the whole project. Use the exact shared model names and interfaces. Publish contracts and a mock early so teammates can connect. Do not duplicate another person's models or silently change interfaces. Run meaningful tests and report actual results. Explain the code simply. Do not merge, push to shared branches or access the original repository. Report missing dependencies to Hemanth.
 
-If the assistant cannot read the private issue, paste its entire body, not just the title.
+If the assistant cannot open a private issue, paste the entire issue body. Your folder starts empty; this is intentional. Rakshita creates Python tooling/common models first; Ruthwin creates frontend tooling. Follow the issue's checklist in order.
 
-## Submit your work
+## 3. Connect early
 
-1. Read the diff. Ask your assistant to explain each changed file.
-2. Run focused tests and the relevant full checks from the README.
-3. From the repository root, run `git status`, `git diff --check`, and `git diff`.
-4. Add only reviewed paths using `git add path/to/file`. Commit with a clear message.
-5. Push: `git push -u origin YOUR-FEATURE-BRANCH`.
-6. Open a PR in neonjava/acd_voicebot, base `team/sde-1-voicebot`, compare your feature branch. Include `Closes #ISSUE_NUMBER`, commands/results, and your explanation.
-7. Request Hemanth's review. Do not merge your own PR. Address feedback on the same branch.
-8. Send Hemanth your daily update for ClickUp.
-
-If using GitHub CLI, always specify the repository and base:
+After a prerequisite PR merges, with your working tree clean:
 
 ```sh
-gh pr create --repo neonjava/acd_voicebot --base team/sde-1-voicebot --head YOUR-FEATURE-BRANCH
+git fetch origin
+git merge origin/team/sde-1-voicebot
 ```
 
-## Daily report
+Stay on your own feature branch. If conflicts appear, ask Hemanth before changing another person's files. Do not force-push. Compare examples with your consumer and run the assigned cross-module test before Friday afternoon.
 
-- Completed work:
-- Files changed:
-- Test command and result:
-- Branch / PR:
-- Blocker:
-- Next step:
+## 4. Send for review
 
-Report facts only. The official plan requires a production-code PR and a separate test PR each week. Include basic tests with features; the third issue expands boundary/failure coverage and demo evidence.
+Run the issue's checks. Review `git status`, `git diff --check`, and `git diff`. Add only reviewed files, commit with your own identity and push your feature branch. Open a PR explicitly in neonjava/acd_voicebot against `team/sde-1-voicebot`; write `Related to #YOUR_ISSUE` and include real test output. Hemanth reviews/merges.
+
+Do not wait until Friday to open a PR. Small early PRs for shared contracts unblock others. The official weekly production PR and separate test PR can both reference your single issue. For a follow-up PR after a merge, create a fresh branch from the updated team branch, e.g. `feature/w1-audio-tests`. Keep the weekly issue open until all its checkboxes are verified; do not use automatic closing keywords on partial PRs.
+
+## 5. Daily update to Hemanth
+
+Send: completed work, files changed, test command/result, branch/PR link, blocker, next step. Hemanth handles ClickUp. Never claim a test or demo happened when it did not.

@@ -1,8 +1,8 @@
 # AcademiaAI — SDE 1 Voicebot
 
-Start here: [team setup and tasks](projects/sde-1-voicebot/README.md).
+[Start here: team folder and six weekly assignments](projects/sde-1-voicebot/README.md).
 
-Team development repository: `neonjava/acd_voicebot`.
-Integration branch: `team/sde-1-voicebot`.
+Work in `neonjava/acd_voicebot`, on feature branches based on `team/sde-1-voicebot`.
+Read [AGENTS.md](AGENTS.md) before using a coding assistant.
 
-This is a foundation scaffold, not a completed voicebot. Domain features belong to the assigned contributors. Read [AGENTS.md](AGENTS.md) before using a coding assistant.
+This repository currently contains folders and documentation only. Team members implement their own assignments.
