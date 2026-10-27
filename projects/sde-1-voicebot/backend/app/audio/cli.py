@@ -3,11 +3,10 @@
 import argparse
 import sys
 
-from pydantic import ValidationError
-
 from app.audio.chunker import chunk_pcm
 from app.audio.source import make_fake_pcm
 from app.contracts.audio import AudioError
+from pydantic import ValidationError
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -3,7 +3,6 @@
 import json
 
 import pytest
-
 from app.audio.chunker import chunk_pcm
 from app.audio.cli import main
 from app.audio.source import make_fake_pcm
