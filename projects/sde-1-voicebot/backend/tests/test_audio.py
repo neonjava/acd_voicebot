@@ -91,3 +91,21 @@ def test_cli_invalid_input_returns_safe_audio_error(capsys):
     assert error["code"] == "AUDIO_INVALID_INPUT"
     assert error["correlation_id"] == "correlation-demo"
     assert "-1" not in output.err
+
+
+@pytest.mark.parametrize(
+    "arguments", [["--duration-ms", "private-value"], ["--chunk-ms", "1.5"]]
+)
+def test_cli_parse_errors_do_not_echo_input(capsys, arguments):
+    assert main(arguments) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err)["code"] == "AUDIO_INVALID_INPUT"
+    assert arguments[-1] not in output.err
+
+
+def test_cli_help_exits_normally(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--help"])
+    assert exit_info.value.code == 0
+    assert "--duration-ms" in capsys.readouterr().out

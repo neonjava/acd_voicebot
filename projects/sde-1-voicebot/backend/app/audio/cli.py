@@ -9,14 +9,19 @@ from app.contracts.audio import AudioError
 from pydantic import ValidationError
 
 
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        # argparse's default error includes user input in stderr.
+        raise ValueError("invalid mock audio arguments")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Show deterministic mock audio chunks")
+    parser = SafeArgumentParser(description="Show deterministic mock audio chunks")
     parser.add_argument("--session-id", default="session-demo")
     parser.add_argument("--duration-ms", type=int, default=1000)
     parser.add_argument("--chunk-ms", type=int, default=20)
-    args = parser.parse_args(argv)
-
     try:
+        args = parser.parse_args(argv)
         pcm = make_fake_pcm(duration_ms=args.duration_ms)
         chunks = chunk_pcm(pcm, session_id=args.session_id, chunk_ms=args.chunk_ms)
     except (ValueError, ValidationError) as exc:
