@@ -24,30 +24,39 @@ def fake_w1_w2_modules():
     """Helper creating mock W1 and W2 modules matching team interfaces."""
     fake_pcm = bytes(32000)
     fake_chunks = [MagicMock() for _ in range(50)]
-    fake_segment = TranscriptSegment(
-        segment_id="session-demo-segment-0",
-        session_id="session-demo",
-        sequence_id=0,
-        start_ms=0,
-        end_ms=1000,
-        text="Hello from the mock voicebot.",
-        confidence=1.0,
-        language="en",
-        is_final=True,
-    )
-    fake_event = TranscriptEvent(
-        event_id="event-transcript-0",
-        event_type="transcript.segment",
-        schema_version="1.0",
-        session_id="session-demo",
-        correlation_id="test-corr-abc",
-        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        producer="transcription",
-        payload=fake_segment,
-    )
+
+    def fake_transcribe(
+        audio_chunks,
+        session_id: str,
+        correlation_id: str,
+        timestamp: datetime | None = None,
+    ):
+        ts = timestamp or datetime.now(timezone.utc)
+        fake_segment = TranscriptSegment(
+            segment_id=f"{session_id}-segment-0",
+            session_id=session_id,
+            sequence_id=0,
+            start_ms=0,
+            end_ms=1000,
+            text="Hello from the mock voicebot.",
+            confidence=1.0,
+            language="en",
+            is_final=True,
+        )
+        fake_event = TranscriptEvent(
+            event_id="event-transcript-0",
+            event_type="transcript.segment",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id=correlation_id,
+            timestamp=ts,
+            producer="transcription",
+            payload=fake_segment,
+        )
+        return [fake_event]
 
     mock_transcriber = MagicMock()
-    mock_transcriber.transcribe.return_value = [fake_event]
+    mock_transcriber.transcribe.side_effect = fake_transcribe
 
     return {
         "app.audio": MagicMock(),
@@ -178,3 +187,63 @@ def test_fixture_matches_service_output():
     )
     actual = actual_model.model_dump(mode="json")
     assert actual == expected, "Fixture must not drift from service output"
+
+
+def test_post_mock_session_rejects_mismatched_event_session_ids(client):
+    """Transcriber returning mismatched session ID fails response validation."""
+    fake_pcm = bytes(32000)
+    fake_chunks = [MagicMock() for _ in range(50)]
+
+    def mismatched_transcribe(
+        audio_chunks,
+        session_id: str,
+        correlation_id: str,
+        timestamp: datetime | None = None,
+    ):
+        ts = timestamp or datetime.now(timezone.utc)
+        fake_segment = TranscriptSegment(
+            segment_id="other-session-segment-0",
+            session_id="other-session",
+            sequence_id=0,
+            start_ms=0,
+            end_ms=1000,
+            text="Mismatched transcript text",
+            confidence=1.0,
+            language="en",
+            is_final=True,
+        )
+        fake_event = TranscriptEvent(
+            event_id="event-transcript-mismatched",
+            event_type="transcript.segment",
+            schema_version="1.0",
+            session_id="other-session",
+            correlation_id=correlation_id,
+            timestamp=ts,
+            producer="transcription",
+            payload=fake_segment,
+        )
+        return [fake_event]
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.side_effect = mismatched_transcribe
+
+    modules = {
+        "app.audio": MagicMock(),
+        "app.audio.source": MagicMock(make_fake_pcm=MagicMock(return_value=fake_pcm)),
+        "app.audio.chunker": MagicMock(chunk_pcm=MagicMock(return_value=fake_chunks)),
+        "app.transcription": MagicMock(),
+        "app.transcription.mock": MagicMock(
+            FakeTranscriber=MagicMock(return_value=mock_transcriber)
+        ),
+    }
+
+    with (
+        patch("importlib.util.find_spec", return_value=MagicMock()),
+        patch.dict("sys.modules", modules),
+    ):
+        response = client.post("/api/sessions/mock", json={})
+        assert response.status_code == 500
+        data = response.json()
+        err = ErrorEnvelope.model_validate(data)
+        assert err.code == "INTERNAL_SERVER_ERROR"
+        assert err.retryable is False

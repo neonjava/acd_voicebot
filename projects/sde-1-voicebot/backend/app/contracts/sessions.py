@@ -55,12 +55,27 @@ class MockSessionResponse(ContractModel):
     events: list[SessionEvent] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_event_ordering(self) -> Self:
-        """Enforce that audio events precede transcript events."""
+    def validate_events(self) -> Self:
+        """Enforce event ordering, session scoping, and consistent correlation ID."""
         seen_transcript = False
+        expected_corr_id = self.events[0].correlation_id if self.events else None
+
         for evt in self.events:
+            if evt.session_id != self.session_id:
+                raise ValueError(
+                    f"Event session_id '{evt.session_id}' does not match "
+                    f"response session_id '{self.session_id}'"
+                )
+
+            if evt.correlation_id != expected_corr_id:
+                raise ValueError(
+                    f"Inconsistent correlation_id across events: expected "
+                    f"'{expected_corr_id}', got '{evt.correlation_id}'"
+                )
+
             if evt.event_type.startswith("transcript."):
                 seen_transcript = True
             elif evt.event_type == "audio.chunk" and seen_transcript:
                 raise ValueError("audio.chunk events must precede transcript events")
+
         return self

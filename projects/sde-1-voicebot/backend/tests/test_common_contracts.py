@@ -12,6 +12,12 @@ from app.contracts.common import (
     SessionState,
     WorkflowState,
 )
+from app.contracts.sessions import (
+    AudioChunkEvent,
+    AudioChunkMetadata,
+    MockSessionResponse,
+)
+from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 
 
 class DummyPayload(ContractModel):
@@ -148,8 +154,6 @@ def test_workflow_state_enums():
 
 def test_transcript_event_valid_segment():
     """TranscriptEvent must accept TranscriptSegment for transcript.segment."""
-    from app.contracts.transcription import TranscriptEvent, TranscriptSegment
-
     seg = TranscriptSegment(
         segment_id="seg-1",
         session_id="sess-1",
@@ -215,13 +219,6 @@ def test_transcript_event_rejects_mismatched_payload_or_session():
 
 def test_mock_session_response_rejects_audio_after_transcript():
     """MockSessionResponse requires audio events to precede transcript events."""
-    from app.contracts.sessions import (
-        AudioChunkEvent,
-        AudioChunkMetadata,
-        MockSessionResponse,
-    )
-    from app.contracts.transcription import TranscriptEvent, TranscriptSegment
-
     audio_evt = AudioChunkEvent(
         event_id="evt-a",
         event_type="audio.chunk",
@@ -273,3 +270,97 @@ def test_mock_session_response_rejects_audio_after_transcript():
             mode="mock",
             events=[trans_evt, audio_evt],
         )
+
+
+def test_mock_session_response_rejects_mismatched_event_session_id():
+    """Each event's session_id must match the response's session_id."""
+    audio_evt = AudioChunkEvent(
+        event_id="evt-a",
+        event_type="audio.chunk",
+        schema_version="1.0",
+        session_id="sess-1",
+        correlation_id="corr-1",
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        producer="audio",
+        payload=AudioChunkMetadata(
+            sequence_id=0,
+            start_ms=0,
+            duration_ms=20,
+            size_bytes=640,
+        ),
+    )
+    # Transcript event has a different session ID "other-session"
+    trans_evt_other = TranscriptEvent(
+        event_id="evt-t",
+        event_type="transcript.segment",
+        schema_version="1.0",
+        session_id="other-session",
+        correlation_id="corr-1",
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        producer="transcription",
+        payload=TranscriptSegment(
+            segment_id="seg-1",
+            session_id="other-session",
+            sequence_id=0,
+            start_ms=0,
+            end_ms=1000,
+            text="Done",
+            is_final=True,
+        ),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        MockSessionResponse(
+            session_id="sess-1",
+            state="completed",
+            mode="mock",
+            events=[audio_evt, trans_evt_other],
+        )
+    assert "does not match response session_id" in str(exc_info.value)
+
+
+def test_mock_session_response_rejects_inconsistent_correlation_id():
+    """All events in MockSessionResponse must share the same correlation_id."""
+    audio_evt = AudioChunkEvent(
+        event_id="evt-a",
+        event_type="audio.chunk",
+        schema_version="1.0",
+        session_id="sess-1",
+        correlation_id="corr-1",
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        producer="audio",
+        payload=AudioChunkMetadata(
+            sequence_id=0,
+            start_ms=0,
+            duration_ms=20,
+            size_bytes=640,
+        ),
+    )
+    # Transcript event has a different correlation ID "corr-different"
+    trans_evt_diff_corr = TranscriptEvent(
+        event_id="evt-t",
+        event_type="transcript.segment",
+        schema_version="1.0",
+        session_id="sess-1",
+        correlation_id="corr-different",
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        producer="transcription",
+        payload=TranscriptSegment(
+            segment_id="seg-1",
+            session_id="sess-1",
+            sequence_id=0,
+            start_ms=0,
+            end_ms=1000,
+            text="Done",
+            is_final=True,
+        ),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        MockSessionResponse(
+            session_id="sess-1",
+            state="completed",
+            mode="mock",
+            events=[audio_evt, trans_evt_diff_corr],
+        )
+    assert "Inconsistent correlation_id across events" in str(exc_info.value)

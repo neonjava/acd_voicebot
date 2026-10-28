@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.contracts.common import SessionState
 from app.contracts.sessions import AudioChunkMetadata, MockSessionResponse
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 from app.sessions.service import MissingDependencyError, SessionService
@@ -97,6 +98,10 @@ def test_connected_w1_w2_w5_pipeline_integration():
             timestamp=ts,
         )
 
+        record = service.get_session("session-connected")
+        assert record is not None
+        assert record.state == SessionState.completed
+
 
 def test_missing_dependencies_raise_blocker_not_silent_fallback():
     """Missing upstream producers raise MissingDependencyError instead of fakes."""
@@ -107,3 +112,7 @@ def test_missing_dependencies_raise_blocker_not_silent_fallback():
         with pytest.raises(MissingDependencyError) as exc_info:
             service.run_mock_session(session_id="sess-blocker")
         assert "W1" in exc_info.value.dependency_name
+
+    record = service.get_session("sess-blocker")
+    assert record is not None
+    assert record.state == SessionState.failed

@@ -176,111 +176,119 @@ class SessionService:
         self.create_session(session_id=sid, now=ts)
         self.transition(sid, SessionState.active, now=ts)
 
-        events: list[SessionEvent] = []
+        try:
+            events: list[SessionEvent] = []
 
-        if injected_events is not None:
-            events = list(injected_events)
-        elif use_synthetic_fixture:
-            # Deterministic baseline fixture only used by explicit fixture tests
-            audio_chunk_meta = AudioChunkMetadata(
-                sequence_id=0,
-                start_ms=0,
-                duration_ms=1000,
-                sample_rate_hz=16000,
-                channels=1,
-                size_bytes=32000,
-            )
-            audio_evt = AudioChunkEvent(
-                event_id="event-audio-0",
-                event_type="audio.chunk",
-                schema_version="1.0",
+            if injected_events is not None:
+                events = list(injected_events)
+            elif use_synthetic_fixture:
+                # Deterministic baseline fixture only used by explicit fixture tests
+                audio_chunk_meta = AudioChunkMetadata(
+                    sequence_id=0,
+                    start_ms=0,
+                    duration_ms=1000,
+                    sample_rate_hz=16000,
+                    channels=1,
+                    size_bytes=32000,
+                )
+                audio_evt = AudioChunkEvent(
+                    event_id="event-audio-0",
+                    event_type="audio.chunk",
+                    schema_version="1.0",
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                    producer="audio",
+                    payload=audio_chunk_meta,
+                )
+                events.append(audio_evt)
+
+                transcript_segment = TranscriptSegment(
+                    segment_id=f"{sid}-segment-0",
+                    session_id=sid,
+                    sequence_id=0,
+                    start_ms=0,
+                    end_ms=1000,
+                    text="Hello from the mock voicebot.",
+                    confidence=1.0,
+                    language="en",
+                    is_final=True,
+                )
+                transcript_evt = TranscriptEvent(
+                    event_id="event-transcript-0",
+                    event_type="transcript.segment",
+                    schema_version="1.0",
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                    producer="transcription",
+                    payload=transcript_segment,
+                )
+                events.append(transcript_evt)
+            else:
+                # Runtime path: require actual modules or report missing dependency
+                if (
+                    importlib.util.find_spec("app.audio.source") is None
+                    or importlib.util.find_spec("app.audio.chunker") is None
+                ):
+                    raise MissingDependencyError("app.audio (W1)")
+
+                if importlib.util.find_spec("app.transcription.mock") is None:
+                    raise MissingDependencyError("app.transcription (W2)")
+
+                # Import directly without broad try-except to avoid masking bugs
+                from app.audio.chunker import chunk_pcm
+                from app.audio.source import make_fake_pcm
+                from app.transcription.mock import FakeTranscriber
+
+                pcm_bytes = make_fake_pcm(duration_ms=1000)
+                audio_chunks = chunk_pcm(pcm_bytes, session_id=sid, chunk_ms=20)
+
+                audio_chunk_meta = AudioChunkMetadata(
+                    sequence_id=0,
+                    start_ms=0,
+                    duration_ms=1000,
+                    sample_rate_hz=16000,
+                    channels=1,
+                    size_bytes=len(pcm_bytes),
+                )
+                audio_evt = AudioChunkEvent(
+                    event_id="event-audio-0",
+                    event_type="audio.chunk",
+                    schema_version="1.0",
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                    producer="audio",
+                    payload=audio_chunk_meta,
+                )
+                events.append(audio_evt)
+
+                transcriber = FakeTranscriber()
+                transcript_events: list[Any] = transcriber.transcribe(
+                    audio_chunks,
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                )
+                events.extend(transcript_events)
+
+            # Build and validate response FIRST before marking completed
+            response = MockSessionResponse(
                 session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-                producer="audio",
-                payload=audio_chunk_meta,
+                state="completed",
+                mode="mock",
+                events=events,
             )
-            events.append(audio_evt)
 
-            transcript_segment = TranscriptSegment(
-                segment_id=f"{sid}-segment-0",
-                session_id=sid,
-                sequence_id=0,
-                start_ms=0,
-                end_ms=1000,
-                text="Hello from the mock voicebot.",
-                confidence=1.0,
-                language="en",
-                is_final=True,
-            )
-            transcript_evt = TranscriptEvent(
-                event_id="event-transcript-0",
-                event_type="transcript.segment",
-                schema_version="1.0",
-                session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-                producer="transcription",
-                payload=transcript_segment,
-            )
-            events.append(transcript_evt)
-        else:
-            # Runtime path: require actual modules or report missing dependency
-            if (
-                importlib.util.find_spec("app.audio.source") is None
-                or importlib.util.find_spec("app.audio.chunker") is None
-            ):
-                raise MissingDependencyError("app.audio (W1)")
-
-            if importlib.util.find_spec("app.transcription.mock") is None:
-                raise MissingDependencyError("app.transcription (W2)")
-
-            # Import directly without broad try-except to avoid masking bugs
-            from app.audio.chunker import chunk_pcm
-            from app.audio.source import make_fake_pcm
-            from app.transcription.mock import FakeTranscriber
-
-            pcm_bytes = make_fake_pcm(duration_ms=1000)
-            audio_chunks = chunk_pcm(pcm_bytes, session_id=sid, chunk_ms=20)
-
-            audio_chunk_meta = AudioChunkMetadata(
-                sequence_id=0,
-                start_ms=0,
-                duration_ms=1000,
-                sample_rate_hz=16000,
-                channels=1,
-                size_bytes=len(pcm_bytes),
-            )
-            audio_evt = AudioChunkEvent(
-                event_id="event-audio-0",
-                event_type="audio.chunk",
-                schema_version="1.0",
-                session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-                producer="audio",
-                payload=audio_chunk_meta,
-            )
-            events.append(audio_evt)
-
-            transcriber = FakeTranscriber()
-            transcript_events: list[Any] = transcriber.transcribe(
-                audio_chunks,
-                session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-            )
-            events.extend(transcript_events)
-
-        # Transition active -> completed
-        self.transition(sid, SessionState.completed, now=ts)
-
-        return MockSessionResponse(
-            session_id=sid,
-            state="completed",
-            mode="mock",
-            events=events,
-        )
+            # Only mark it completed after response validation succeeds
+            self.transition(sid, SessionState.completed, now=ts)
+            return response
+        except Exception:
+            # Transition stored session to failed on dependency, producer,
+            # or validation failure.
+            self.transition(sid, SessionState.failed, now=ts)
+            raise
 
 
 session_service = SessionService()
