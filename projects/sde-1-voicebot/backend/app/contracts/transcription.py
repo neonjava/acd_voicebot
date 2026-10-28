@@ -37,7 +37,29 @@ class TranscriptSegment(ContractModel):
 
 
 class TranscriptEvent(EventEnvelope[Union[TranscriptSegment, ErrorEnvelope]]):
-    """Typed event envelope for transcript events."""
+    """Typed event envelope for transcript events with strict pairing validation."""
 
     producer: Literal["transcription"] = "transcription"
     event_type: Literal["transcript.segment", "transcript.error"] = "transcript.segment"
+
+    @model_validator(mode="after")
+    def validate_pairing_and_identifiers(self) -> Self:
+        if self.event_type == "transcript.segment":
+            if not isinstance(self.payload, TranscriptSegment):
+                raise ValueError(
+                    "payload must be TranscriptSegment for 'transcript.segment'"
+                )
+            if self.payload.session_id != self.session_id:
+                raise ValueError(
+                    f"payload session_id ({self.payload.session_id}) must match "
+                    f"envelope session_id ({self.session_id})"
+                )
+        elif self.event_type == "transcript.error":
+            if not isinstance(self.payload, ErrorEnvelope):
+                raise ValueError("payload must be ErrorEnvelope for 'transcript.error'")
+            if self.payload.correlation_id != self.correlation_id:
+                raise ValueError(
+                    f"payload correlation_id ({self.payload.correlation_id}) must "
+                    f"match envelope correlation_id ({self.correlation_id})"
+                )
+        return self

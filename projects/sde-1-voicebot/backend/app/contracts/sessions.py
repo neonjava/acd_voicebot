@@ -1,10 +1,11 @@
 """Session contracts and wire projections owned by W5 (Backend)."""
 
-from typing import Any, Literal
+from typing import Literal, Self, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.contracts.common import ContractModel, EventEnvelope
+from app.contracts.transcription import TranscriptEvent
 
 
 class AudioChunkMetadata(ContractModel):
@@ -31,6 +32,16 @@ class AudioChunkMetadata(ContractModel):
         return value
 
 
+class AudioChunkEvent(EventEnvelope[AudioChunkMetadata]):
+    """Typed event envelope for wire audio chunk metadata."""
+
+    producer: Literal["audio"] = "audio"
+    event_type: Literal["audio.chunk"] = "audio.chunk"
+
+
+SessionEvent = Union[AudioChunkEvent, TranscriptEvent]
+
+
 class MockSessionRequest(ContractModel):
     """Request body for creating a mock session; forbids extra fields."""
 
@@ -41,4 +52,15 @@ class MockSessionResponse(ContractModel):
     session_id: str = Field(min_length=1, pattern=r"\S")
     state: Literal["completed"] = "completed"
     mode: Literal["mock"] = "mock"
-    events: list[EventEnvelope[Any]] = Field(default_factory=list)
+    events: list[SessionEvent] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_event_ordering(self) -> Self:
+        """Enforce that audio events precede transcript events."""
+        seen_transcript = False
+        for evt in self.events:
+            if evt.event_type.startswith("transcript."):
+                seen_transcript = True
+            elif evt.event_type == "audio.chunk" and seen_transcript:
+                raise ValueError("audio.chunk events must precede transcript events")
+        return self

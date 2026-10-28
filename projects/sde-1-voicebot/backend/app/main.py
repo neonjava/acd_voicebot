@@ -95,17 +95,25 @@ async def validation_exception_handler(
     corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
-    details = {}
+    details_redacted: dict[str, str] = {}
     for err in exc.errors():
-        loc = ".".join(str(p) for p in err.get("loc", []))
-        details[loc or "body"] = err.get("msg", "Validation error")
+        err_type = str(err.get("type", ""))
+        loc = err.get("loc", ())
+        if "extra" in err_type:
+            details_redacted["body"] = "Unexpected extra field in payload."
+        elif loc and loc[0] == "header":
+            details_redacted["header"] = "Invalid header value or format."
+        elif loc and loc[0] == "query":
+            details_redacted["query"] = "Invalid query parameter."
+        else:
+            details_redacted["body"] = "Invalid payload field or structure."
 
     error_envelope = ErrorEnvelope(
         code="VALIDATION_ERROR",
         message_safe_for_user="The request payload was invalid.",
         retryable=False,
         correlation_id=corr_id,
-        details_redacted=details,
+        details_redacted=details_redacted or {"body": "Invalid request payload."},
     )
     response = JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -172,5 +180,9 @@ async def create_mock_session(
     _body: MockSessionRequest,
 ) -> MockSessionResponse:
     """Create and run a finite mock session emitting audio and transcript events."""
-    corr_id = getattr(request.state, "correlation_id", "correlation-demo")
-    return session_service.run_mock_session(correlation_id=corr_id)
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    session_id = f"session-{uuid.uuid4().hex[:12]}"
+    return session_service.run_mock_session(
+        session_id=session_id,
+        correlation_id=corr_id,
+    )

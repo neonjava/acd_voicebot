@@ -2,11 +2,15 @@
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
-from app.contracts.common import ContractModel, EventEnvelope, SessionState
-from app.contracts.sessions import AudioChunkMetadata, MockSessionResponse
-from app.contracts.transcription import TranscriptSegment
+from app.contracts.common import ContractModel, SessionState
+from app.contracts.sessions import (
+    AudioChunkEvent,
+    AudioChunkMetadata,
+    MockSessionResponse,
+    SessionEvent,
+)
+from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 
 # Documented legal transition table
 LEGAL_TRANSITIONS: dict[SessionState, set[SessionState]] = {
@@ -123,75 +127,121 @@ class SessionService:
     def run_mock_session(
         self,
         *,
-        session_id: str = "session-demo",
-        correlation_id: str = "correlation-demo",
+        session_id: str | None = None,
+        correlation_id: str | None = None,
         timestamp: datetime | None = None,
     ) -> MockSessionResponse:
         """Execute a complete mock session path: created -> active -> completed.
 
-        Emits ordered events (audio metadata first, then transcript event)
-        with consistent IDs and timestamps matching contracts.md.
+        Integrates actual W1 and W2 implementations when available, with
+        deterministic fallback matching contracts.md.
         """
+        sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
         ts = timestamp or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        # 1. Create session and follow Week 1 minimum transition path
-        self.create_session(session_id=session_id, now=ts)
-        self.transition(session_id, SessionState.active, now=ts)
+        # 1. Create session and transition created -> active
+        self.create_session(session_id=sid, now=ts)
+        self.transition(sid, SessionState.active, now=ts)
 
-        # 2. Build Audio Event (audio metadata wire projection, producer="audio")
-        audio_chunk_meta = AudioChunkMetadata(
-            sequence_id=0,
-            start_ms=0,
-            duration_ms=1000,
-            sample_rate_hz=16000,
-            channels=1,
-            size_bytes=32000,
-        )
-        audio_event: EventEnvelope[Any] = EventEnvelope[Any](
-            event_id="event-audio-0",
-            event_type="audio.chunk",
-            schema_version="1.0",
-            session_id=session_id,
-            correlation_id=correlation_id,
-            timestamp=ts,
-            producer="audio",
-            payload=audio_chunk_meta,
-        )
+        events: list[SessionEvent] = []
 
-        # 3. Build Transcript Event (final segment fixture, producer="transcription")
-        transcript_segment = TranscriptSegment(
-            segment_id=f"{session_id}-segment-0",
-            session_id=session_id,
-            sequence_id=0,
-            start_ms=0,
-            end_ms=1000,
-            text="Hello from the mock voicebot.",
-            confidence=1.0,
-            language="en",
-            is_final=True,
-        )
-        transcript_event: EventEnvelope[Any] = EventEnvelope[Any](
-            event_id="event-transcript-0",
-            event_type="transcript.segment",
-            schema_version="1.0",
-            session_id=session_id,
-            correlation_id=correlation_id,
-            timestamp=ts,
-            producer="transcription",
-            payload=transcript_segment,
-        )
+        # 2. Check for actual W1 and W2 implementations
+        try:
+            from app.audio.chunker import chunk_pcm
+            from app.audio.source import make_fake_pcm
+            from app.transcription.mock import FakeTranscriber
 
-        # Complete the session
-        self.transition(session_id, SessionState.completed, now=ts)
+            # Use actual W1 audio source and chunker
+            pcm_bytes = make_fake_pcm(duration_ms=1000)
+            audio_chunks = chunk_pcm(pcm_bytes, session_id=sid, chunk_ms=20)
 
-        # Order: audio events before transcript events
+            # Project first chunk metadata to wire contract (or full stream summary)
+            audio_chunk_meta = AudioChunkMetadata(
+                sequence_id=0,
+                start_ms=0,
+                duration_ms=1000,
+                sample_rate_hz=16000,
+                channels=1,
+                size_bytes=len(pcm_bytes),
+            )
+            audio_evt = AudioChunkEvent(
+                event_id="event-audio-0",
+                event_type="audio.chunk",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="audio",
+                payload=audio_chunk_meta,
+            )
+            events.append(audio_evt)
+
+            # Use actual W2 transcriber
+            transcriber = FakeTranscriber()
+            transcript_events = transcriber.transcribe(
+                audio_chunks,
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+            )
+            events.extend(transcript_events)
+
+        except ImportError:
+            # Deterministic synthetic baseline matching contracts.md
+            audio_chunk_meta = AudioChunkMetadata(
+                sequence_id=0,
+                start_ms=0,
+                duration_ms=1000,
+                sample_rate_hz=16000,
+                channels=1,
+                size_bytes=32000,
+            )
+            audio_evt = AudioChunkEvent(
+                event_id="event-audio-0",
+                event_type="audio.chunk",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="audio",
+                payload=audio_chunk_meta,
+            )
+            events.append(audio_evt)
+
+            transcript_segment = TranscriptSegment(
+                segment_id=f"{sid}-segment-0",
+                session_id=sid,
+                sequence_id=0,
+                start_ms=0,
+                end_ms=1000,
+                text="Hello from the mock voicebot.",
+                confidence=1.0,
+                language="en",
+                is_final=True,
+            )
+            transcript_evt = TranscriptEvent(
+                event_id="event-transcript-0",
+                event_type="transcript.segment",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="transcription",
+                payload=transcript_segment,
+            )
+            events.append(transcript_evt)
+
+        # 3. Transition active -> completed
+        self.transition(sid, SessionState.completed, now=ts)
+
         return MockSessionResponse(
-            session_id=session_id,
+            session_id=sid,
             state="completed",
             mode="mock",
-            events=[audio_event, transcript_event],
+            events=events,
         )
 
 
