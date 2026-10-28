@@ -1,8 +1,9 @@
 """Week 1 checks using the shared contracts supplied by W5."""
 
 import pytest
-from app.contracts.audio import AudioChunk, AudioError, AudioFormat
 from pydantic import ValidationError
+
+from app.contracts.audio import AudioChunk, AudioError, AudioFormat
 
 
 def valid_chunk(**changes: object) -> AudioChunk:

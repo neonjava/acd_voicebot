@@ -2,8 +2,9 @@
 
 from typing import Literal, Self
 
-from app.contracts.common import ContractModel, ErrorEnvelope
 from pydantic import Field, field_validator, model_validator
+
+from app.contracts.common import ContractModel, ErrorEnvelope
 
 
 class AudioFormat(ContractModel):
