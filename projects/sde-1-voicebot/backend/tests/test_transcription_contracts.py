@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
+
 from app.contracts.common import ErrorEnvelope
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
-from pydantic import ValidationError
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "transcript_event.json"
 

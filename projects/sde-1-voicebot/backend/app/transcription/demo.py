@@ -9,7 +9,38 @@ Demonstrates deterministic mock transcription:
 
 from datetime import datetime, timezone
 
-from app.contracts.audio import AudioChunk, AudioFormat
+try:
+    from app.contracts.audio import AudioChunk, AudioFormat
+except ImportError:
+    from typing import Literal, Self
+
+    from pydantic import Field, model_validator
+
+    from app.contracts.common import ContractModel
+
+    class AudioFormat(ContractModel):
+        sample_rate_hz: Literal[16000] = 16000
+        channels: Literal[1] = 1
+        encoding: Literal["pcm_s16le"] = "pcm_s16le"
+
+    class AudioChunk(ContractModel):
+        session_id: str = Field(min_length=1, pattern=r"\S")
+        sequence_id: int = Field(strict=True, ge=0)
+        start_ms: int = Field(strict=True, ge=0)
+        duration_ms: int = Field(strict=True, gt=0)
+        format: AudioFormat
+        pcm: bytes = Field(strict=True, min_length=1, repr=False)
+
+        @model_validator(mode="after")
+        def require_matching_pcm_length(self) -> Self:
+            expected = self.duration_ms * 32
+            if len(self.pcm) != expected:
+                raise ValueError(
+                    f"expected {expected} PCM bytes, received {len(self.pcm)}"
+                )
+            return self
+
+
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 from app.transcription.accumulator import SegmentAccumulator
 from app.transcription.mock import FakeTranscriber

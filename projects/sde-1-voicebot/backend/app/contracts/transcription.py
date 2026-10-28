@@ -3,8 +3,9 @@
 import math
 from typing import Literal, Self, Union
 
-from app.contracts.common import ContractModel, ErrorEnvelope, EventEnvelope
 from pydantic import Field, field_validator, model_validator
+
+from app.contracts.common import ContractModel, ErrorEnvelope, EventEnvelope
 
 
 class TranscriptSegment(ContractModel):

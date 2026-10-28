@@ -3,7 +3,13 @@
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from app.contracts.audio import AudioChunk
+try:
+    from app.contracts.audio import AudioChunk
+except ImportError:
+    from typing import Any
+
+    AudioChunk = Any  # type: ignore
+
 from app.contracts.common import ErrorEnvelope
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 
