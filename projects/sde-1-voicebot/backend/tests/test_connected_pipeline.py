@@ -3,9 +3,11 @@
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app.contracts.sessions import AudioChunkMetadata, MockSessionResponse
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
-from app.sessions.service import SessionService
+from app.sessions.service import MissingDependencyError, SessionService
 
 
 def test_connected_w1_w2_w5_pipeline_integration():
@@ -46,7 +48,6 @@ def test_connected_w1_w2_w5_pipeline_integration():
     mock_make_pcm = MagicMock(return_value=fake_pcm)
     mock_chunk_pcm = MagicMock(return_value=fake_chunks)
 
-    # Patch modules in app.sessions.service
     mock_modules = {
         "app.audio": MagicMock(),
         "app.audio.source": MagicMock(make_fake_pcm=mock_make_pcm),
@@ -54,7 +55,11 @@ def test_connected_w1_w2_w5_pipeline_integration():
         "app.transcription": MagicMock(),
         "app.transcription.mock": MagicMock(FakeTranscriber=mock_transcriber_cls),
     }
-    with patch.dict("sys.modules", mock_modules):
+
+    with (
+        patch("importlib.util.find_spec", return_value=MagicMock()),
+        patch.dict("sys.modules", mock_modules),
+    ):
         ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
         response = service.run_mock_session(
             session_id="session-connected",
@@ -91,3 +96,14 @@ def test_connected_w1_w2_w5_pipeline_integration():
             correlation_id="corr-connected-1",
             timestamp=ts,
         )
+
+
+def test_missing_dependencies_raise_blocker_not_silent_fallback():
+    """Missing upstream producers raise MissingDependencyError instead of fakes."""
+    service = SessionService()
+    service.clear()
+
+    with patch("importlib.util.find_spec", return_value=None):
+        with pytest.raises(MissingDependencyError) as exc_info:
+            service.run_mock_session(session_id="sess-blocker")
+        assert "W1" in exc_info.value.dependency_name

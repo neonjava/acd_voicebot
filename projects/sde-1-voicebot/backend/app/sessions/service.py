@@ -1,7 +1,9 @@
 """In-memory session repository, state transitions, and mock session runner."""
 
+import importlib.util
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from app.contracts.common import ContractModel, SessionState
 from app.contracts.sessions import (
@@ -55,6 +57,16 @@ class SessionNotFoundError(Exception):
     def __init__(self, session_id: str) -> None:
         super().__init__(f"Session not found: {session_id}")
         self.session_id = session_id
+
+
+class MissingDependencyError(RuntimeError):
+    """Raised when a required upstream producer is unavailable on the branch."""
+
+    def __init__(self, dependency_name: str) -> None:
+        super().__init__(
+            f"Required upstream dependency is unavailable: {dependency_name}"
+        )
+        self.dependency_name = dependency_name
 
 
 class SessionRecord(ContractModel):
@@ -124,17 +136,35 @@ class SessionService:
         self._sessions[session_id] = updated_record
         return updated_record
 
+    def run_synthetic_fixture_session(
+        self,
+        *,
+        session_id: str = "session-demo",
+        correlation_id: str = "correlation-demo",
+        timestamp: datetime | None = None,
+    ) -> MockSessionResponse:
+        """Explicitly generate the deterministic baseline fixture for contract tests."""
+        return self.run_mock_session(
+            session_id=session_id,
+            correlation_id=correlation_id,
+            timestamp=timestamp,
+            use_synthetic_fixture=True,
+        )
+
     def run_mock_session(
         self,
         *,
         session_id: str | None = None,
         correlation_id: str | None = None,
         timestamp: datetime | None = None,
+        injected_events: list[SessionEvent] | None = None,
+        use_synthetic_fixture: bool = False,
     ) -> MockSessionResponse:
         """Execute a complete mock session path: created -> active -> completed.
 
-        Integrates actual W1 and W2 implementations when available, with
-        deterministic fallback matching contracts.md.
+        In production runtime, calls actual W1 audio and W2 transcription mocks.
+        If dependencies are missing, raises MissingDependencyError to report
+        blockers instead of silently inventing fake events.
         """
         sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
         cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
@@ -148,49 +178,10 @@ class SessionService:
 
         events: list[SessionEvent] = []
 
-        # 2. Check for actual W1 and W2 implementations
-        try:
-            from app.audio.chunker import chunk_pcm
-            from app.audio.source import make_fake_pcm
-            from app.transcription.mock import FakeTranscriber
-
-            # Use actual W1 audio source and chunker
-            pcm_bytes = make_fake_pcm(duration_ms=1000)
-            audio_chunks = chunk_pcm(pcm_bytes, session_id=sid, chunk_ms=20)
-
-            # Project first chunk metadata to wire contract (or full stream summary)
-            audio_chunk_meta = AudioChunkMetadata(
-                sequence_id=0,
-                start_ms=0,
-                duration_ms=1000,
-                sample_rate_hz=16000,
-                channels=1,
-                size_bytes=len(pcm_bytes),
-            )
-            audio_evt = AudioChunkEvent(
-                event_id="event-audio-0",
-                event_type="audio.chunk",
-                schema_version="1.0",
-                session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-                producer="audio",
-                payload=audio_chunk_meta,
-            )
-            events.append(audio_evt)
-
-            # Use actual W2 transcriber
-            transcriber = FakeTranscriber()
-            transcript_events = transcriber.transcribe(
-                audio_chunks,
-                session_id=sid,
-                correlation_id=cid,
-                timestamp=ts,
-            )
-            events.extend(transcript_events)
-
-        except ImportError:
-            # Deterministic synthetic baseline matching contracts.md
+        if injected_events is not None:
+            events = list(injected_events)
+        elif use_synthetic_fixture:
+            # Deterministic baseline fixture only used by explicit fixture tests
             audio_chunk_meta = AudioChunkMetadata(
                 sequence_id=0,
                 start_ms=0,
@@ -233,8 +224,55 @@ class SessionService:
                 payload=transcript_segment,
             )
             events.append(transcript_evt)
+        else:
+            # Runtime path: require actual modules or report missing dependency
+            if (
+                importlib.util.find_spec("app.audio.source") is None
+                or importlib.util.find_spec("app.audio.chunker") is None
+            ):
+                raise MissingDependencyError("app.audio (W1)")
 
-        # 3. Transition active -> completed
+            if importlib.util.find_spec("app.transcription.mock") is None:
+                raise MissingDependencyError("app.transcription (W2)")
+
+            # Import directly without broad try-except to avoid masking bugs
+            from app.audio.chunker import chunk_pcm
+            from app.audio.source import make_fake_pcm
+            from app.transcription.mock import FakeTranscriber
+
+            pcm_bytes = make_fake_pcm(duration_ms=1000)
+            audio_chunks = chunk_pcm(pcm_bytes, session_id=sid, chunk_ms=20)
+
+            audio_chunk_meta = AudioChunkMetadata(
+                sequence_id=0,
+                start_ms=0,
+                duration_ms=1000,
+                sample_rate_hz=16000,
+                channels=1,
+                size_bytes=len(pcm_bytes),
+            )
+            audio_evt = AudioChunkEvent(
+                event_id="event-audio-0",
+                event_type="audio.chunk",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="audio",
+                payload=audio_chunk_meta,
+            )
+            events.append(audio_evt)
+
+            transcriber = FakeTranscriber()
+            transcript_events: list[Any] = transcriber.transcribe(
+                audio_chunks,
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+            )
+            events.extend(transcript_events)
+
+        # Transition active -> completed
         self.transition(sid, SessionState.completed, now=ts)
 
         return MockSessionResponse(

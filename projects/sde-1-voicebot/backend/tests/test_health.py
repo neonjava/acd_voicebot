@@ -1,8 +1,9 @@
-"""Tests for /api/health and /api/ready endpoints."""
+"""Tests for /api/health and /api/ready endpoints, plus 404/405 error envelopes."""
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.contracts.common import ErrorEnvelope
 from app.main import app
 
 
@@ -39,14 +40,38 @@ def test_correlation_id_propagated_when_valid(client):
 
 def test_invalid_correlation_id_rejected(client):
     """Invalid supplied X-Correlation-ID returns 422 with a safe ErrorEnvelope."""
-    # invalid character like space or dollar sign
     response = client.get(
         "/api/health", headers={"X-Correlation-ID": "invalid id with spaces"}
     )
     assert response.status_code == 422
     data = response.json()
-    assert data["code"] == "INVALID_CORRELATION_ID"
-    assert data["retryable"] is False
-    assert "correlation_id" in data
-    # Header should return the new safe correlation ID
-    assert response.headers["X-Correlation-ID"] == data["correlation_id"]
+    err = ErrorEnvelope.model_validate(data)
+    assert err.code == "INVALID_CORRELATION_ID"
+    assert err.retryable is False
+    assert response.headers["X-Correlation-ID"] == err.correlation_id
+
+
+def test_unknown_route_returns_404_error_envelope(client):
+    """Accessing an unknown path must return 404 formatted as ErrorEnvelope."""
+    response = client.get("/api/nonexistent-route-path")
+    assert response.status_code == 404
+    data = response.json()
+    err = ErrorEnvelope.model_validate(data)
+    assert err.code == "HTTP_404"
+    assert err.message_safe_for_user == "Not Found"
+    assert err.retryable is False
+    assert "X-Correlation-ID" in response.headers
+    assert "X-Request-ID" in response.headers
+
+
+def test_unsupported_method_returns_405_error_envelope(client):
+    """Accessing an endpoint with unsupported HTTP method returns 405 ErrorEnvelope."""
+    response = client.delete("/api/health")
+    assert response.status_code == 405
+    data = response.json()
+    err = ErrorEnvelope.model_validate(data)
+    assert err.code == "HTTP_405"
+    assert err.message_safe_for_user == "Method Not Allowed"
+    assert err.retryable is False
+    assert "X-Correlation-ID" in response.headers
+    assert "X-Request-ID" in response.headers

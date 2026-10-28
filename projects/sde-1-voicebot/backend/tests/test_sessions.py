@@ -1,12 +1,14 @@
 """Unit tests for SessionService, in-memory repository, and state machine."""
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
 from app.contracts.common import SessionState
 from app.sessions.service import (
     InvalidSessionTransitionError,
+    MissingDependencyError,
     SessionNotFoundError,
     SessionService,
 )
@@ -45,7 +47,6 @@ def test_valid_session_lifecycle(service):
 def test_invalid_transition_rejected(service):
     """Attempting an illegal transition raises InvalidSessionTransitionError."""
     service.create_session("sess-invalid")
-    # created cannot directly transition to completed
     with pytest.raises(InvalidSessionTransitionError) as exc_info:
         service.transition("sess-invalid", SessionState.completed)
     assert exc_info.value.from_state == SessionState.created
@@ -68,10 +69,18 @@ def test_nonexistent_session_raises_not_found(service):
         service.transition("sess-does-not-exist", SessionState.active)
 
 
-def test_run_mock_session_executes_ordered_events(service):
-    """run_mock_session emits audio metadata event before transcript event."""
+def test_run_mock_session_raises_when_dependencies_missing(service):
+    """Runtime run_mock_session raises MissingDependencyError when W1/W2 are absent."""
+    with patch("importlib.util.find_spec", return_value=None):
+        with pytest.raises(MissingDependencyError) as exc_info:
+            service.run_mock_session(session_id="sess-missing")
+        assert "W1" in exc_info.value.dependency_name
+
+
+def test_run_synthetic_fixture_session_executes_ordered_events(service):
+    """Explicit synthetic fixture session emits audio metadata before transcript."""
     ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    resp = service.run_mock_session(
+    resp = service.run_synthetic_fixture_session(
         session_id="session-demo",
         correlation_id="correlation-demo",
         timestamp=ts,

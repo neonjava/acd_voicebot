@@ -8,11 +8,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
 from app.contracts.common import ErrorEnvelope
 from app.contracts.sessions import MockSessionRequest, MockSessionResponse
-from app.sessions.service import session_service
+from app.sessions.service import MissingDependencyError, session_service
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger("voicebot.backend")
@@ -124,12 +125,40 @@ async def validation_exception_handler(
     return response
 
 
-@app.exception_handler(HTTPException)
+@app.exception_handler(MissingDependencyError)
+async def missing_dependency_handler(
+    request: Request,
+    exc: MissingDependencyError,
+) -> JSONResponse:
+    """Report unmerged upstream dependencies as 503 blockers with safe ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="DEPENDENCY_UNAVAILABLE",
+        message_safe_for_user=(
+            f"Required upstream dependency is unavailable: {exc.dependency_name}. "
+            "Waiting for integration PR merge."
+        ),
+        retryable=True,
+        correlation_id=corr_id,
+        details_redacted={"dependency": exc.dependency_name},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(
     request: Request,
-    exc: HTTPException,
+    exc: StarletteHTTPException,
 ) -> JSONResponse:
-    """Format HTTPExceptions into ErrorEnvelope."""
+    """Format all HTTPExceptions (including 404 and 405) into agreed ErrorEnvelope."""
     corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
