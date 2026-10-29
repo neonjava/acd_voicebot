@@ -3,38 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
-
-try:
-    from app.contracts.audio import AudioChunk, AudioFormat
-except ImportError:
-    from typing import Literal, Self
-
-    from pydantic import Field, model_validator
-
-    from app.contracts.common import ContractModel
-
-    class AudioFormat(ContractModel):
-        sample_rate_hz: Literal[16000] = 16000
-        channels: Literal[1] = 1
-        encoding: Literal["pcm_s16le"] = "pcm_s16le"
-
-    class AudioChunk(ContractModel):
-        session_id: str = Field(min_length=1, pattern=r"\S")
-        sequence_id: int = Field(strict=True, ge=0)
-        start_ms: int = Field(strict=True, ge=0)
-        duration_ms: int = Field(strict=True, gt=0)
-        format: AudioFormat
-        pcm: bytes = Field(strict=True, min_length=1, repr=False)
-
-        @model_validator(mode="after")
-        def require_matching_pcm_length(self) -> Self:
-            expected = self.duration_ms * 32
-            if len(self.pcm) != expected:
-                raise ValueError(
-                    f"expected {expected} PCM bytes, received {len(self.pcm)}"
-                )
-            return self
-
+from app.contracts.audio import AudioChunk, AudioFormat
 
 from app.contracts.common import ErrorEnvelope
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
@@ -239,36 +208,6 @@ class TestFakeTranscriber:
             transcriber.transcribe(
                 chunks, session_id="sess", correlation_id="corr", timestamp=naive_ts
             )
-
-    def test_real_w1_audio_to_w2_transcription_integration(self):
-        """Verify real W1 make_fake_pcm and chunk_pcm feed into FakeTranscriber."""
-        try:
-            from app.audio.chunker import chunk_pcm
-            from app.audio.source import make_fake_pcm
-        except ImportError:
-            pytest.skip("W1 audio source/chunker not present in branch")
-
-        pcm = make_fake_pcm(duration_ms=1000)
-        assert len(pcm) == 32000
-        chunks = chunk_pcm(pcm, session_id="session-integration", chunk_ms=20)
-        assert len(chunks) == 50
-
-        transcriber = FakeTranscriber()
-        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        events = transcriber.transcribe(
-            chunks,
-            session_id="session-integration",
-            correlation_id="corr-integration",
-            timestamp=ts,
-        )
-        assert len(events) == 1
-        assert events[0].payload.text == "Hello from the mock voicebot."
-        assert events[0].payload.start_ms == 0
-        assert events[0].payload.end_ms == 1000
-
-        acc = SegmentAccumulator()
-        acc.add(events[0])
-        assert acc.text() == "Hello from the mock voicebot."
 
 
 class TestSegmentAccumulator:

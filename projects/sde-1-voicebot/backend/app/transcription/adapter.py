@@ -4,13 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-try:
-    from app.contracts.audio import AudioChunk
-except ImportError:
-    from typing import Any
-
-    AudioChunk = Any  # type: ignore
-
+from app.contracts.audio import AudioChunk
 from app.contracts.transcription import TranscriptEvent
 
 
