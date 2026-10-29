@@ -161,6 +161,13 @@ export function validateAudioChunkMetadata(val: unknown): AudioChunkMetadata {
     throw new MalformedResponseError('AudioChunkMetadata "size_bytes" must be an integer > 0');
   }
 
+  const expectedBytes = val.duration_ms * 32; // 16000 Hz * 1 channel * 2 bytes per sample / 1000 ms
+  if (val.size_bytes !== expectedBytes) {
+    throw new MalformedResponseError(
+      `AudioChunkMetadata "size_bytes" (${val.size_bytes}) does not match agreed fixed PCM duration bytes (${expectedBytes} for ${val.duration_ms}ms at 16000Hz 16-bit mono)`
+    );
+  }
+
   return {
     sequence_id: val.sequence_id,
     start_ms: val.start_ms,

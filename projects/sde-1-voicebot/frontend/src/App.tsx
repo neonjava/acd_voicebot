@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   AudioChunkMetadata,
+  ErrorEnvelope,
   EventEnvelope,
   MockSessionResponse,
   SimulatedPermissionState,
@@ -56,6 +57,10 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   }, [customClient, clientMode]);
 
   const handleStart = useCallback(async () => {
+    // Clear prior session results and errors immediately
+    setSegments([]);
+    setAudioEvents([]);
+    setSessionId(null);
     setError(null);
 
     // Enforce simulated microphone permissions without calling getUserMedia()
@@ -110,20 +115,38 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       setUiState('active');
       setStatusMessage(`Session ${response.session_id} active. Processing events...`);
 
-      // Accumulate transcript events
+      // Accumulate transcript events and check for transcript errors
       const accumulator = new TranscriptAccumulator(response.session_id);
       const audioChunks: EventEnvelope<AudioChunkMetadata>[] = [];
+      let transcriptErrorEnvelope: ErrorEnvelope | null = null;
 
       for (const evt of response.events) {
         if (evt.event_type === 'transcript.segment') {
           accumulator.add(evt.payload as TranscriptSegment);
         } else if (evt.event_type === 'audio.chunk') {
           audioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
+        } else if (evt.event_type === 'transcript.error') {
+          transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
         }
       }
 
       setSegments(accumulator.getSegments());
       setAudioEvents(audioChunks);
+
+      // If transcript.error was received, surface it and report failure instead of success
+      if (transcriptErrorEnvelope) {
+        setError({
+          type: 'backend',
+          title: 'Transcript Error',
+          message: transcriptErrorEnvelope.message_safe_for_user,
+          code: transcriptErrorEnvelope.code,
+          correlationId: transcriptErrorEnvelope.correlation_id,
+          retryable: transcriptErrorEnvelope.retryable,
+        });
+        setUiState('failed');
+        setStatusMessage(`Session transcription failed: ${transcriptErrorEnvelope.message_safe_for_user}`);
+        return;
+      }
 
       setUiState('completed');
       setStatusMessage(`Session ${response.session_id} completed successfully.`);

@@ -188,4 +188,108 @@ describe('Voicebot App Component', () => {
     expect(within(alertEl).getByText(/Event envelope schema_version must be "1.0"/i)).toBeInTheDocument();
     expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i);
   });
+
+  it('surfaces transcript.error event and transitions to failed state without reporting success', async () => {
+    const errorResponse: MockSessionResponse = {
+      session_id: 'session-error-demo',
+      state: 'completed',
+      mode: 'mock',
+      events: [
+        {
+          event_id: 'event-audio-0',
+          event_type: 'audio.chunk',
+          schema_version: '1.0',
+          session_id: 'session-error-demo',
+          correlation_id: 'correlation-demo',
+          timestamp: '2026-01-01T00:00:00Z',
+          producer: 'audio',
+          payload: {
+            sequence_id: 0,
+            start_ms: 0,
+            duration_ms: 1000,
+            sample_rate_hz: 16000,
+            channels: 1,
+            size_bytes: 32000,
+          },
+        },
+        {
+          event_id: 'event-transcript-err',
+          event_type: 'transcript.error',
+          schema_version: '1.0',
+          session_id: 'session-error-demo',
+          correlation_id: 'correlation-demo',
+          timestamp: '2026-01-01T00:00:00Z',
+          producer: 'transcription',
+          payload: {
+            code: 'TRANSCRIPTION_DECODER_FAILED',
+            message_safe_for_user: 'Synthetic transcriber encountered an invalid audio frame.',
+            retryable: false,
+            correlation_id: 'correlation-demo',
+            details_redacted: { reason: 'frame_corruption' },
+          },
+        },
+      ],
+    };
+
+    const mockClient: SessionClient = {
+      startMockSession: vi.fn().mockResolvedValue(errorResponse),
+    };
+
+    render(<App customClient={mockClient} />);
+
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('error-alert')).toBeInTheDocument();
+    });
+
+    // Error alert is shown with safe message and code
+    const alertEl = screen.getByTestId('error-alert');
+    expect(within(alertEl).getByText('Synthetic transcriber encountered an invalid audio frame.')).toBeInTheDocument();
+    expect(within(alertEl).getByText(/TRANSCRIPTION_DECODER_FAILED/i)).toBeInTheDocument();
+
+    // UI state indicator transitions to failed, NOT completed
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i);
+    expect(screen.queryByText(/completed successfully/i)).not.toBeInTheDocument();
+  });
+
+  it('clears prior session timeline, audio events, and sessionId when a new session starts', async () => {
+    let resolveSession2: (val: MockSessionResponse) => void = () => {};
+    const session2Promise = new Promise<MockSessionResponse>((resolve) => {
+      resolveSession2 = resolve;
+    });
+
+    const mockClient: SessionClient = {
+      startMockSession: vi
+        .fn()
+        .mockResolvedValueOnce(baselineSessionResponse) // Session 1 resolves immediately
+        .mockReturnValueOnce(session2Promise), // Session 2 is pending
+    };
+
+    render(<App customClient={mockClient} />);
+
+    // 1. Run Session 1
+    fireEvent.click(screen.getByTestId('start-button'));
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/completed/i);
+    });
+
+    // Verify session 1 segments and audio events are present
+    expect(screen.getByText('Hello from the mock voicebot.')).toBeInTheDocument();
+    expect(screen.getByText(/event-audio-0/i)).toBeInTheDocument();
+
+    // 2. Start Session 2
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    // As soon as session 2 begins connecting, prior results must be cleared
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/connecting/i);
+    expect(screen.getByTestId('timeline-empty-message')).toBeInTheDocument();
+    expect(screen.queryByText('Hello from the mock voicebot.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/event-audio-0/i)).not.toBeInTheDocument();
+
+    // Clean up pending session 2
+    await act(async () => {
+      resolveSession2(baselineSessionResponse);
+    });
+  });
 });

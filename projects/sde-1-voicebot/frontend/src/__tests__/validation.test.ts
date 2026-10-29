@@ -147,6 +147,27 @@ describe('Runtime Validation', () => {
         validateAudioChunkMetadata({ ...validAudio, size_bytes: -10 })
       ).toThrow(/integer > 0/);
     });
+
+    it('rejects byte size that does not match agreed fixed PCM duration (duration_ms * 32)', () => {
+      // 1000ms should be 32000 bytes. Mismatched 16000 or 100 should be rejected.
+      expect(() =>
+        validateAudioChunkMetadata({ ...validAudio, duration_ms: 1000, size_bytes: 16000 })
+      ).toThrow(/does not match agreed fixed PCM duration bytes/);
+
+      expect(() =>
+        validateAudioChunkMetadata({ ...validAudio, duration_ms: 20, size_bytes: 500 })
+      ).toThrow(/does not match agreed fixed PCM duration bytes/);
+    });
+
+    it('accepts byte size that strictly matches agreed fixed PCM duration (e.g. 20ms -> 640 bytes)', () => {
+      const chunk20ms = validateAudioChunkMetadata({
+        ...validAudio,
+        duration_ms: 20,
+        size_bytes: 640,
+      });
+      expect(chunk20ms.size_bytes).toBe(640);
+      expect(chunk20ms.duration_ms).toBe(20);
+    });
   });
 
   describe('ErrorEnvelope validation', () => {
