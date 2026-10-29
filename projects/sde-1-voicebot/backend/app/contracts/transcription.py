@@ -1,5 +1,6 @@
 """Transcription contracts as specified in contracts.md (W2 baseline)."""
 
+import math
 from typing import Literal, Self, Union
 
 from pydantic import Field, field_validator, model_validator
@@ -17,14 +18,28 @@ class TranscriptSegment(ContractModel):
     end_ms: int = Field(strict=True, ge=0)
     text: str = Field(min_length=1, pattern=r"\S")
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    language: str = Field(default="en", min_length=1)
+    language: str = Field(default="en", min_length=1, pattern=r"\S")
     is_final: bool = Field(default=True)
 
     @field_validator("sequence_id", "start_ms", "end_ms", mode="before")
     @classmethod
     def require_integer(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("sequence and timing fields must be integers")
+            raise ValueError("sequence and timing fields must be strict integers")
+        return value
+
+    @field_validator("is_final", mode="before")
+    @classmethod
+    def require_strict_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("is_final must be a strict boolean")
+        return value
+
+    @field_validator("confidence")
+    @classmethod
+    def require_finite_confidence(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("confidence must be a finite float")
         return value
 
     @model_validator(mode="after")
