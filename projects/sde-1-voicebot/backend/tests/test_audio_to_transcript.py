@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 from app.audio.chunker import chunk_pcm
 from app.audio.source import make_fake_pcm
-
 from app.transcription.accumulator import SegmentAccumulator
 from app.transcription.mock import FakeTranscriber
 

@@ -3,8 +3,8 @@
 from datetime import datetime, timezone
 
 import pytest
-from app.contracts.audio import AudioChunk, AudioFormat
 
+from app.contracts.audio import AudioChunk, AudioFormat
 from app.contracts.common import ErrorEnvelope
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 from app.transcription.accumulator import SegmentAccumulator
