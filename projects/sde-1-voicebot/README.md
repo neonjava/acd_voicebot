@@ -78,3 +78,9 @@ These commands are implementation targets, not currently runnable or verified re
 Official requirements come from the supplied Week 1 tasks and execution-plan PDF (version 1.0, 24 October 2026). Folder layout, precise interfaces, stack and compressed deadline are team decisions; provider approval is not claimed. The official plan asks for a production-code PR and a separate test PR per member; both can belong to the same weekly issue. Keep that issue open until everything is verified.
 
 Work only in this private repository. Do not access the original provider repository without Hemanth's later instruction. No real capture, paid providers, recordings, private screenshots or secrets in Week 1.
+
+## Pull request checks and Codex review
+
+PRs targeting `team/sde-1-voicebot` run backend lint, formatting and pytest. Once W6 adds `frontend/package.json`, CI also runs frontend tests and build; `npm ci` requires a committed lockfile. Backend checks require W5's `pyproject.toml`, `uv.lock`, and shared contracts, so W1-only PRs will show a dependency failure until W5's setup merges.
+
+For Codex review on every PR, connect this repository to Codex and enable **Automatic review** in [Codex code review settings](https://chatgpt.com/settings/code-review). The repository owner must configure that account setting. Until then, a contributor can comment `@codex review` on a PR and confirm Codex reacts and posts its review. CI checks remain required even when Codex reviews a PR.

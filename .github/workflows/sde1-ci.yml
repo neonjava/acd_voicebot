@@ -1,0 +1,55 @@
+name: SDE 1 checks
+
+on:
+  pull_request:
+    branches: [team/sde-1-voicebot]
+  push:
+    branches: [team/sde-1-voicebot]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend lint and tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projects/sde-1-voicebot/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Require backend setup
+        run: |
+          test -f pyproject.toml || { echo 'Missing backend/pyproject.toml: W5 setup must merge before backend tests can pass.'; exit 1; }
+          test -f uv.lock || { echo 'Missing backend/uv.lock: W5 setup must merge before backend tests can pass.'; exit 1; }
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run python -m pytest
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projects/sde-1-voicebot/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect frontend package
+        id: frontend
+        run: echo "present=$([ -f package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.frontend.outputs.present == 'true'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: projects/sde-1-voicebot/frontend/package-lock.json
+      - run: npm ci
+        if: steps.frontend.outputs.present == 'true'
+      - run: npm test -- --run
+        if: steps.frontend.outputs.present == 'true'
+      - run: npm run build
+        if: steps.frontend.outputs.present == 'true'
