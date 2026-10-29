@@ -25,7 +25,7 @@ jobs:
         run: |
           test -f pyproject.toml || { echo 'Missing backend/pyproject.toml: W5 setup must merge before backend tests can pass.'; exit 1; }
           test -f uv.lock || { echo 'Missing backend/uv.lock: W5 setup must merge before backend tests can pass.'; exit 1; }
-      - run: uv sync --locked
+      - run: uv sync --locked --extra dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python -m pytest
