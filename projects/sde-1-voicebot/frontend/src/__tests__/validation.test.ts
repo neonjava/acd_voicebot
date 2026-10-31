@@ -64,6 +64,21 @@ describe('Runtime Validation', () => {
     expect(() => validateMockSessionResponse(invalid)).toThrow(/session_id/);
   });
 
+  it('rejects unsupported event types instead of silently accepting their payload', () => {
+    const invalid = {
+      ...baselineSessionResponse,
+      events: [
+        {
+          ...baselineSessionResponse.events[0],
+          event_type: 'transcript.failed',
+          payload: null,
+        },
+      ],
+    };
+    expect(() => validateMockSessionResponse(invalid)).toThrow(MalformedResponseError);
+    expect(() => validateMockSessionResponse(invalid)).toThrow(/Unsupported event_type/);
+  });
+
   describe('TranscriptSegment validation', () => {
     const validSegment = {
       segment_id: 'seg-1',

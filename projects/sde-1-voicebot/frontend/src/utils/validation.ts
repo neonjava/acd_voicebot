@@ -220,6 +220,8 @@ export function validateEventEnvelope(val: unknown, expectedSessionId: string): 
     payload = validateAudioChunkMetadata(val.payload);
   } else if (val.event_type === 'transcript.error') {
     payload = validateErrorEnvelope(val.payload);
+  } else {
+    throw new MalformedResponseError(`Unsupported event_type "${val.event_type}"`);
   }
 
   return {
