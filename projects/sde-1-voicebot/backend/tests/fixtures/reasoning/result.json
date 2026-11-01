@@ -1,0 +1,8 @@
+{
+  "request_id": "reasoning-demo-0",
+  "session_id": "session-demo",
+  "answer": "Mock grounded response based on the supplied source IDs.",
+  "source_ids": ["screen-status"],
+  "insufficient_evidence": false,
+  "prompt_version": "v1"
+}
