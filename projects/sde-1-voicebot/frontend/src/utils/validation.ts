@@ -1,8 +1,13 @@
 import {
   AudioChunkMetadata,
+  ContextItem,
   ErrorEnvelope,
   EventEnvelope,
   MockSessionResponse,
+  ReasoningResult,
+  ScreenContext,
+  SessionLifecycleState,
+  SourceReference,
   TranscriptSegment,
 } from '../types/contracts';
 
@@ -23,6 +28,25 @@ function isNonEmptyString(val: unknown): val is string {
 
 function isInteger(val: unknown): val is number {
   return typeof val === 'number' && Number.isInteger(val);
+}
+
+export const VALID_SESSION_STATES: ReadonlySet<SessionLifecycleState> = new Set([
+  'created',
+  'active',
+  'paused',
+  'stopping',
+  'completed',
+  'failed',
+  'expired',
+]);
+
+export function validateSessionLifecycleState(val: unknown): SessionLifecycleState {
+  if (typeof val !== 'string' || !VALID_SESSION_STATES.has(val as SessionLifecycleState)) {
+    throw new MalformedResponseError(
+      `Invalid session lifecycle state "${String(val)}". Expected one of: ${Array.from(VALID_SESSION_STATES).join(', ')}`
+    );
+  }
+  return val as SessionLifecycleState;
 }
 
 export function validateErrorEnvelope(val: unknown): ErrorEnvelope {
@@ -245,9 +269,7 @@ export function validateMockSessionResponse(data: unknown): MockSessionResponse 
     throw new MalformedResponseError('Session response missing non-empty "session_id"');
   }
 
-  if (data.state !== 'completed') {
-    throw new MalformedResponseError(`Session response state must be "completed", got "${data.state}"`);
-  }
+  const validatedState = validateSessionLifecycleState(data.state);
 
   if (data.mode !== 'mock') {
     throw new MalformedResponseError(`Session response mode must be "mock", got "${data.mode}"`);
@@ -261,8 +283,150 @@ export function validateMockSessionResponse(data: unknown): MockSessionResponse 
 
   return {
     session_id: data.session_id,
-    state: 'completed',
+    state: validatedState,
     mode: 'mock',
     events,
+  };
+}
+
+/**
+ * Validation for Screen Context & Reasoning models.
+ */
+export function validateSourceReference(val: unknown): SourceReference {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('SourceReference must be an object');
+  }
+
+  if (!isNonEmptyString(val.source_id)) {
+    throw new MalformedResponseError('SourceReference missing non-empty "source_id"');
+  }
+
+  if (!isNonEmptyString(val.locator)) {
+    throw new MalformedResponseError('SourceReference missing non-empty "locator"');
+  }
+
+  if (val.kind !== 'synthetic_screen' && val.kind !== 'transcript') {
+    throw new MalformedResponseError(
+      `SourceReference "kind" must be "synthetic_screen" or "transcript", got "${val.kind}"`
+    );
+  }
+
+  return {
+    source_id: val.source_id,
+    locator: val.locator,
+    kind: val.kind,
+  };
+}
+
+export function validateContextItem(val: unknown): ContextItem {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('ContextItem must be an object');
+  }
+
+  if (!isNonEmptyString(val.item_id)) {
+    throw new MalformedResponseError('ContextItem missing non-empty "item_id"');
+  }
+
+  if (!isNonEmptyString(val.text)) {
+    throw new MalformedResponseError('ContextItem missing non-empty "text"');
+  }
+
+  const source = validateSourceReference(val.source);
+
+  return {
+    item_id: val.item_id,
+    text: val.text,
+    source,
+  };
+}
+
+export function validateScreenContext(val: unknown): ScreenContext {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('ScreenContext must be an object');
+  }
+
+  if (!isNonEmptyString(val.frame_id)) {
+    throw new MalformedResponseError('ScreenContext missing non-empty "frame_id"');
+  }
+
+  if (!isNonEmptyString(val.captured_at)) {
+    throw new MalformedResponseError('ScreenContext missing non-empty "captured_at"');
+  }
+
+  if (typeof val.capture_enabled !== 'boolean') {
+    throw new MalformedResponseError('ScreenContext "capture_enabled" must be a boolean');
+  }
+
+  if (!Array.isArray(val.items)) {
+    throw new MalformedResponseError('ScreenContext "items" must be an array');
+  }
+
+  const items = val.items.map((item) => validateContextItem(item));
+
+  return {
+    frame_id: val.frame_id,
+    captured_at: val.captured_at,
+    capture_enabled: val.capture_enabled,
+    items,
+  };
+}
+
+export function validateReasoningResult(val: unknown): ReasoningResult {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('ReasoningResult must be an object');
+  }
+
+  if (!isNonEmptyString(val.request_id)) {
+    throw new MalformedResponseError('ReasoningResult missing non-empty "request_id"');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('ReasoningResult missing non-empty "session_id"');
+  }
+
+  if (!isNonEmptyString(val.answer)) {
+    throw new MalformedResponseError('ReasoningResult missing non-empty "answer"');
+  }
+
+  if (val.prompt_version !== 'v1') {
+    throw new MalformedResponseError(`ReasoningResult "prompt_version" must be "v1", got "${val.prompt_version}"`);
+  }
+
+  if (typeof val.insufficient_evidence !== 'boolean') {
+    throw new MalformedResponseError('ReasoningResult "insufficient_evidence" must be a boolean');
+  }
+
+  if (!Array.isArray(val.source_ids)) {
+    throw new MalformedResponseError('ReasoningResult "source_ids" must be an array');
+  }
+
+  const sourceIds: string[] = [];
+  for (const s of val.source_ids) {
+    if (!isNonEmptyString(s)) {
+      throw new MalformedResponseError('ReasoningResult source_ids contains non-string or blank ID');
+    }
+    sourceIds.push(s);
+  }
+
+  const uniqueSourceIds = Array.from(new Set(sourceIds));
+  if (uniqueSourceIds.length !== sourceIds.length) {
+    throw new MalformedResponseError('ReasoningResult source_ids must be unique');
+  }
+
+  if (val.insufficient_evidence && sourceIds.length > 0) {
+    throw new MalformedResponseError('ReasoningResult with insufficient_evidence cannot cite sources');
+  }
+
+  if (!val.insufficient_evidence && sourceIds.length === 0) {
+    throw new MalformedResponseError('ReasoningResult with grounded answer must cite at least one source');
+  }
+
+  return {
+    request_id: val.request_id,
+    session_id: val.session_id,
+    answer: val.answer,
+    source_ids: sourceIds,
+    insufficient_evidence: val.insufficient_evidence,
+    prompt_version: 'v1',
   };
 }
