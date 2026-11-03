@@ -132,6 +132,19 @@ class TestAudioPreprocessor:
         assert all(isinstance(c, AudioChunk) for c in chunks)
         assert all(c.duration_ms == 20 for c in chunks)
         assert all(c.format.sample_rate_hz == 16000 for c in chunks)
+        for i, c in enumerate(chunks):
+            assert c.sequence_id == i
+            assert c.start_ms == i * 20
+            assert len(c.pcm) == 20 * 32  # 640 bytes for 20ms at 16kHz
+
+    def test_convert_external_audio_rejects_unsupported_target_rate(self) -> None:
+        """Reject non-16000 target rate to prevent mislabeled AudioChunks."""
+        preprocessor = AudioPreprocessor(target_rate_hz=8000)
+        pcm_8k = struct.pack("<8000h", *([500] * 8000))
+        with pytest.raises(ValueError, match="canonical AudioChunk requires 16000 Hz"):
+            preprocessor.convert_external_audio(
+                pcm_8k, from_rate_hz=8000, session_id="sess-ext"
+            )
 
     def test_preprocessor_invalid_config(self) -> None:
         with pytest.raises(ValueError, match="normalize must be a boolean"):

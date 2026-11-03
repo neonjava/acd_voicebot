@@ -118,22 +118,24 @@ class RetryPolicy:
                     attempts,
                 )
 
-            # Check if returned events contain an error payload
-            has_error = False
-            for evt in events:
-                if evt.event_type == "transcript.error" and isinstance(
-                    evt.payload, ErrorEnvelope
-                ):
-                    has_error = True
-                    last_error_event = evt
-                    if not self.is_retryable(evt.payload):
-                        # Non-retryable error fails immediately
-                        return events, attempts
-                    break
-
-            if not has_error:
-                # Success
+            # Inspect all error events before retrying.
+            error_events = [
+                evt
+                for evt in events
+                if evt.event_type == "transcript.error"
+                and isinstance(evt.payload, ErrorEnvelope)
+            ]
+            if not error_events:
+                # Success: no errors in batch
                 return events, attempts
+
+            # A permanent error anywhere in the batch stops retries immediately
+            for err_evt in error_events:
+                if not self.is_retryable(err_evt.payload):
+                    return events, attempts
+
+            # All errors in the batch are retryable; record last error event
+            last_error_event = error_events[-1]
 
         # If exhausted all attempts with retryable errors
         exhausted_envelope = ErrorEnvelope(
