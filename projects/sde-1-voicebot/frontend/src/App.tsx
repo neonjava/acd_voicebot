@@ -67,6 +67,13 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   const currentSessionTokenRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Stable client instances maintained across Start -> Pause -> Resume
+  const defaultClientsRef = useRef<{
+    http?: HttpSessionClient;
+    'fixture-week2'?: FixtureSessionClient;
+    'fixture-canonical'?: FixtureSessionClient;
+  }>({});
+
   // Listen to browser online/offline events
   useEffect(() => {
     const handleOnline = () => {
@@ -90,13 +97,16 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
     if (customClient) {
       return customClient;
     }
-    if (clientMode === 'fixture-week2') {
-      return new FixtureSessionClient(week2StreamingSessionResponse);
+    if (!defaultClientsRef.current[clientMode]) {
+      if (clientMode === 'fixture-week2') {
+        defaultClientsRef.current[clientMode] = new FixtureSessionClient(week2StreamingSessionResponse);
+      } else if (clientMode === 'fixture-canonical') {
+        defaultClientsRef.current[clientMode] = new FixtureSessionClient(baselineSessionResponse);
+      } else {
+        defaultClientsRef.current[clientMode] = new HttpSessionClient();
+      }
     }
-    if (clientMode === 'fixture-canonical') {
-      return new FixtureSessionClient(baselineSessionResponse);
-    }
-    return new HttpSessionClient();
+    return defaultClientsRef.current[clientMode]!;
   }, [customClient, clientMode]);
 
   const handleStart = useCallback(async () => {
@@ -236,22 +246,39 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       return;
     }
 
+    const requestToken = currentSessionTokenRef.current;
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     setIsTransitioning(true);
     setStatusMessage(`Requesting backend pause for session ${sessionId}...`);
     try {
-      const verifiedState = await client.pauseSession(sessionId);
+      const verifiedState = await client.pauseSession(sessionId, abortController.signal);
+      // Strictly ignore delayed responses if session was stopped or superseded
+      if (requestToken !== currentSessionTokenRef.current) {
+        return;
+      }
       // Strictly update backend state only from verified return value
       setBackendSessionState(verifiedState);
       setUiState('paused');
       setStatusMessage(`Session ${sessionId} successfully paused.`);
       setError(null);
     } catch (err) {
+      // Strictly ignore delayed error if session was stopped or superseded
+      if (requestToken !== currentSessionTokenRef.current) {
+        return;
+      }
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
       // Do NOT optimistically update backend state
       const formatted = formatErrorToState(err);
       setError(formatted);
       setStatusMessage(`Pause request failed: ${formatted.message}`);
     } finally {
-      setIsTransitioning(false);
+      if (requestToken === currentSessionTokenRef.current) {
+        setIsTransitioning(false);
+      }
     }
   }, [sessionId, getClient]);
 
@@ -270,27 +297,44 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       return;
     }
 
+    const requestToken = currentSessionTokenRef.current;
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     setIsTransitioning(true);
     setStatusMessage(`Requesting backend resume for session ${sessionId}...`);
     try {
-      const verifiedState = await client.resumeSession(sessionId);
+      const verifiedState = await client.resumeSession(sessionId, abortController.signal);
+      // Strictly ignore delayed responses if session was stopped or superseded
+      if (requestToken !== currentSessionTokenRef.current) {
+        return;
+      }
       // Strictly update backend state only from verified return value
       setBackendSessionState(verifiedState);
       setUiState('active');
       setStatusMessage(`Session ${sessionId} successfully resumed.`);
       setError(null);
     } catch (err) {
+      // Strictly ignore delayed error if session was stopped or superseded
+      if (requestToken !== currentSessionTokenRef.current) {
+        return;
+      }
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
       // Do NOT optimistically update backend state
       const formatted = formatErrorToState(err);
       setError(formatted);
       setStatusMessage(`Resume request failed: ${formatted.message}`);
     } finally {
-      setIsTransitioning(false);
+      if (requestToken === currentSessionTokenRef.current) {
+        setIsTransitioning(false);
+      }
     }
   }, [sessionId, getClient]);
 
   const handleStop = useCallback(() => {
-    // Invalidate the session token so in-flight requests are ignored
+    // Invalidate the session token so in-flight requests (start, pause, resume) are ignored
     currentSessionTokenRef.current++;
 
     if (abortControllerRef.current) {
@@ -298,8 +342,10 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       abortControllerRef.current = null;
     }
 
-    setBackendSessionState('completed');
+    // Do NOT show Backend: completed on local Stop — reset backend state on client abort
+    setBackendSessionState(null);
     setUiState('idle');
+    setIsTransitioning(false);
     setStatusMessage('Session stopped by user. Late events ignored.');
   }, []);
 
@@ -363,9 +409,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   const isStopDisabled =
     uiState !== 'connecting' &&
     uiState !== 'active' &&
-    uiState !== 'paused' &&
-    backendSessionState !== 'active' &&
-    backendSessionState !== 'paused';
+    uiState !== 'paused';
 
   return (
     <div
