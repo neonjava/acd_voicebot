@@ -102,7 +102,7 @@ describe('Voicebot App Component', () => {
     fireEvent.click(pauseBtn);
 
     await waitFor(() => {
-      expect(mockClient.pauseSession).toHaveBeenCalledWith('session-week2-stream');
+      expect(mockClient.pauseSession).toHaveBeenCalledWith('session-week2-stream', expect.any(AbortSignal));
     });
 
     expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: paused/i);
@@ -114,11 +114,53 @@ describe('Voicebot App Component', () => {
     fireEvent.click(resumeBtn);
 
     await waitFor(() => {
-      expect(mockClient.resumeSession).toHaveBeenCalledWith('session-week2-stream');
+      expect(mockClient.resumeSession).toHaveBeenCalledWith('session-week2-stream', expect.any(AbortSignal));
     });
 
     expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
     expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    expect(pauseBtn).toBeEnabled();
+    expect(resumeBtn).toBeDisabled();
+  });
+
+  it('keeps one fixture client instance across Start -> Pause -> Resume in built-in fixture mode', async () => {
+    // Render without customClient to exercise the exact built-in mode
+    render(<App />);
+
+    // Select Week 2 active streaming fixture
+    const week2Radio = screen.getByLabelText(/Synthetic Fixture \(Week 2 Active Streaming\)/i);
+    fireEvent.click(week2Radio);
+
+    // 1. Start Session
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+      expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
+    });
+
+    // 2. Pause Session on the built-in client instance
+    const pauseBtn = screen.getByTestId('pause-button');
+    const resumeBtn = screen.getByTestId('resume-button');
+    expect(pauseBtn).toBeEnabled();
+    expect(resumeBtn).toBeDisabled();
+
+    fireEvent.click(pauseBtn);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: paused/i);
+      expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: paused/i);
+    });
+    expect(pauseBtn).toBeDisabled();
+    expect(resumeBtn).toBeEnabled();
+
+    // 3. Resume Session on the EXACT same fixture client instance
+    fireEvent.click(resumeBtn);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+      expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
+    });
     expect(pauseBtn).toBeEnabled();
     expect(resumeBtn).toBeDisabled();
   });
@@ -161,7 +203,7 @@ describe('Voicebot App Component', () => {
     expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
   });
 
-  it('supports keyboard shortcuts: Alt+P for pause, Alt+R for resume, and Esc for stop', async () => {
+  it('supports keyboard shortcuts: Alt+P for pause, Alt+R for resume, and Esc for stop without showing completed', async () => {
     const mockClient: SessionClient = {
       startMockSession: vi.fn().mockResolvedValue(week2StreamingSessionResponse),
       pauseSession: vi.fn().mockResolvedValue('paused'),
@@ -197,13 +239,180 @@ describe('Voicebot App Component', () => {
       expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
     });
 
-    // Esc to stop
+    // Esc to stop locally
     act(() => {
       fireEvent.keyDown(window, { key: 'Escape' });
     });
 
-    expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: completed/i);
+    // Must NOT show Backend: completed on local Stop
+    expect(screen.getByTestId('backend-state-indicator')).not.toHaveTextContent(/completed/i);
+    expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: not_started/i);
     expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+  });
+
+  it('ignores delayed in-flight pause success response after Stop', async () => {
+    let resolvePause: (val: any) => void = () => {};
+    const deferredPause = new Promise<any>((resolve) => {
+      resolvePause = resolve;
+    });
+
+    const mockClient: SessionClient = {
+      startMockSession: vi.fn().mockResolvedValue(week2StreamingSessionResponse),
+      pauseSession: vi.fn().mockReturnValue(deferredPause),
+    };
+
+    render(<App customClient={mockClient} />);
+
+    // Start active session
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+
+    // Trigger pause (remains in-flight)
+    fireEvent.click(screen.getByTestId('pause-button'));
+    expect(screen.getByTestId('live-status-message')).toHaveTextContent(/Requesting backend pause/i);
+
+    // Click Stop while pause request is in-flight
+    fireEvent.click(screen.getByTestId('stop-button'));
+
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+    expect(screen.getByTestId('backend-state-indicator')).not.toHaveTextContent(/completed/i);
+    expect(screen.getByTestId('live-status-message')).toHaveTextContent(/Session stopped by user/i);
+
+    // Now late pause request resolves
+    await act(async () => {
+      resolvePause('paused');
+    });
+
+    // Verify late pause response did NOT overwrite stopped state
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+    expect(screen.getByTestId('backend-state-indicator')).not.toHaveTextContent(/paused/i);
+    expect(screen.getByTestId('live-status-message')).toHaveTextContent(/Session stopped by user/i);
+  });
+
+  it('ignores delayed in-flight pause error response after Stop', async () => {
+    let rejectPause: (err: any) => void = () => {};
+    const deferredPause = new Promise<any>((_, reject) => {
+      rejectPause = reject;
+    });
+
+    const mockClient: SessionClient = {
+      startMockSession: vi.fn().mockResolvedValue(week2StreamingSessionResponse),
+      pauseSession: vi.fn().mockReturnValue(deferredPause),
+    };
+
+    render(<App customClient={mockClient} />);
+
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+
+    // Trigger pause
+    fireEvent.click(screen.getByTestId('pause-button'));
+
+    // Click Stop while pause is in-flight
+    fireEvent.click(screen.getByTestId('stop-button'));
+
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+
+    // Now late pause fails
+    await act(async () => {
+      rejectPause(new Error('Network drop during pause'));
+    });
+
+    // Error must NOT be shown for stopped session
+    expect(screen.queryByTestId('error-alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+  });
+
+  it('ignores delayed in-flight resume response after Stop', async () => {
+    let resolveResume: (val: any) => void = () => {};
+    const deferredResume = new Promise<any>((resolve) => {
+      resolveResume = resolve;
+    });
+
+    const mockClient: SessionClient = {
+      startMockSession: vi.fn().mockResolvedValue(week2StreamingSessionResponse),
+      pauseSession: vi.fn().mockResolvedValue('paused'),
+      resumeSession: vi.fn().mockReturnValue(deferredResume),
+    };
+
+    render(<App customClient={mockClient} />);
+
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+
+    // Pause first
+    fireEvent.click(screen.getByTestId('pause-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: paused/i);
+    });
+
+    // Trigger resume (remains in-flight)
+    fireEvent.click(screen.getByTestId('resume-button'));
+
+    // Stop while resume is in-flight
+    fireEvent.click(screen.getByTestId('stop-button'));
+
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+
+    // Late resume resolves
+    await act(async () => {
+      resolveResume('active');
+    });
+
+    // Verify late resume did NOT restore active state
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+    expect(screen.getByTestId('backend-state-indicator')).not.toHaveTextContent(/Backend: active/i);
+  });
+
+  it('ignores in-flight pause response if a new session starts while request was pending', async () => {
+    let resolvePause: (val: any) => void = () => {};
+    const deferredPause = new Promise<any>((resolve) => {
+      resolvePause = resolve;
+    });
+
+    const mockClient: SessionClient = {
+      startMockSession: vi.fn().mockResolvedValue(week2StreamingSessionResponse),
+      pauseSession: vi.fn().mockReturnValue(deferredPause),
+    };
+
+    render(<App customClient={mockClient} />);
+
+    // 1. Session 1 starts
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+
+    // Trigger pause (in-flight)
+    fireEvent.click(screen.getByTestId('pause-button'));
+
+    // 2. Before pause finishes, user stops session 1 and starts session 2
+    fireEvent.click(screen.getByTestId('stop-button'));
+    fireEvent.click(screen.getByTestId('start-button'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+
+    // Now late pause from session 1 resolves
+    await act(async () => {
+      resolvePause('paused');
+    });
+
+    // Session 2 should remain active and not be corrupted by session 1's late pause
+    expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
   });
 
   it('renders Screen Context Panel OFF by default and shows synthetic sources when toggled ON', () => {
