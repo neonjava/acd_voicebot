@@ -270,3 +270,65 @@ class TestTranscriptionOrchestrator:
         orchestrator.reset()
         assert orchestrator.get_segments() == []
         assert orchestrator.get_transcript_text() == ""
+
+    def test_orchestrator_preserves_segments_when_mixed_batch_fails_retries(
+        self, sample_chunks, fixed_timestamp
+    ) -> None:
+        """Segments in mixed batch are added to accumulator despite error."""
+
+        class MixedBatchAdapter:
+            def transcribe(
+                self, chunks, *, session_id, correlation_id, timestamp
+            ) -> list[TranscriptEvent]:
+                seg = TranscriptSegment(
+                    segment_id="seg-mixed",
+                    session_id=session_id,
+                    sequence_id=0,
+                    start_ms=0,
+                    end_ms=200,
+                    text="Mixed segment",
+                    is_final=True,
+                )
+                seg_evt = TranscriptEvent(
+                    event_id="evt-seg-mixed",
+                    event_type="transcript.segment",
+                    schema_version="1.0",
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    producer="transcription",
+                    payload=seg,
+                )
+                err_evt = TranscriptEvent(
+                    event_id="evt-err-mixed",
+                    event_type="transcript.error",
+                    schema_version="1.0",
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    producer="transcription",
+                    payload=ErrorEnvelope(
+                        code="TRANSCRIPTION_TEMPORARY_ERROR",
+                        message_safe_for_user="Transient glitch",
+                        retryable=True,
+                        correlation_id=correlation_id,
+                    ),
+                )
+                return [seg_evt, err_evt]
+
+        orchestrator = TranscriptionOrchestrator(
+            adapter=MixedBatchAdapter(),
+            retry_policy=RetryPolicy(max_retries=0),
+        )
+        events = orchestrator.process_chunks(
+            sample_chunks,
+            session_id="session-orch",
+            correlation_id="corr-orch",
+            timestamp=fixed_timestamp,
+        )
+
+        assert len(events) == 2
+        assert events[0].event_type == "transcript.segment"
+        assert events[1].event_type == "transcript.error"
+        assert orchestrator.get_transcript_text() == "Mixed segment"
+        assert len(orchestrator.get_segments()) == 1

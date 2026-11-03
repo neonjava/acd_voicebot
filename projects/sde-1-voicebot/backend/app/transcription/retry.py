@@ -62,12 +62,15 @@ class RetryPolicy:
         attempts = 0
         max_attempts = self.max_retries + 1
         last_error_event: TranscriptEvent | None = None
+        last_batch_events: list[TranscriptEvent] = []
 
         while attempts < max_attempts:
             attempts += 1
             try:
                 events = action()
+                last_batch_events = events
             except TimeoutError:
+                last_batch_events = []
                 err_envelope = ErrorEnvelope(
                     code="TRANSCRIPTION_TIMEOUT",
                     message_safe_for_user="Transcription request timed out.",
@@ -153,18 +156,18 @@ class RetryPolicy:
                 ),
             },
         )
-        return (
-            [
-                TranscriptEvent(
-                    event_id=f"event-transcript-err-{session_id}-exhausted",
-                    event_type="transcript.error",
-                    schema_version="1.0",
-                    session_id=session_id,
-                    correlation_id=correlation_id,
-                    timestamp=timestamp,
-                    producer="transcription",
-                    payload=exhausted_envelope,
-                )
-            ],
-            attempts,
+        exhausted_event = TranscriptEvent(
+            event_id=f"event-transcript-err-{session_id}-exhausted",
+            event_type="transcript.error",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id=correlation_id,
+            timestamp=timestamp,
+            producer="transcription",
+            payload=exhausted_envelope,
         )
+        # Preserve successful segments from the final attempt if it was a mixed batch
+        successful_segments = [
+            evt for evt in last_batch_events if evt.event_type != "transcript.error"
+        ]
+        return [*successful_segments, exhausted_event], attempts
