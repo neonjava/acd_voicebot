@@ -188,6 +188,60 @@ class TestRetryPolicy:
             for e in events
         )
 
+    def test_retry_policy_preserves_successful_segments_when_exhausted(self) -> None:
+        """Exhausting retries preserves valid segments from final mixed batch."""
+        policy = RetryPolicy(max_retries=1)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            return [
+                _make_success_event(),
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+            ]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 2
+        assert call_count == 2
+        assert len(events) == 2
+        assert events[0].event_type == "transcript.segment"
+        assert events[1].event_type == "transcript.error"
+        err = events[1].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_RETRY_EXHAUSTED"
+
+    def test_retry_policy_mixed_batch_with_zero_retries_preserves_segments(
+        self,
+    ) -> None:
+        """With max_retries=0, valid segments in mixed batch are preserved."""
+        policy = RetryPolicy(max_retries=0)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            return [
+                _make_success_event(),
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+            ]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 1
+        assert call_count == 1
+        assert len(events) == 2
+        assert events[0].event_type == "transcript.segment"
+        assert events[1].event_type == "transcript.error"
+        err = events[1].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_RETRY_EXHAUSTED"
+
     def test_timeout_exception_handled_and_retried(self) -> None:
         policy = RetryPolicy(max_retries=1)
         call_count = 0
