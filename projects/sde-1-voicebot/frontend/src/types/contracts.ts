@@ -59,7 +59,38 @@ export interface EventEnvelope<T = unknown> {
 
 export interface MockSessionResponse {
   session_id: string;
-  state: 'completed';
+  state: SessionLifecycleState;
   mode: 'mock';
   events: EventEnvelope<AudioChunkMetadata | TranscriptSegment | ErrorEnvelope | unknown>[];
+}
+
+/**
+ * Screen Context & Reasoning models owned by W3 (backend/app/contracts/reasoning.py).
+ */
+export interface SourceReference {
+  source_id: string;
+  locator: string;
+  kind: 'synthetic_screen' | 'transcript';
+}
+
+export interface ContextItem {
+  item_id: string;
+  text: string;
+  source: SourceReference;
+}
+
+export interface ScreenContext {
+  frame_id: string;
+  captured_at: string;
+  capture_enabled: boolean;
+  items: ContextItem[];
+}
+
+export interface ReasoningResult {
+  request_id: string;
+  session_id: string;
+  answer: string;
+  source_ids: string[];
+  insufficient_evidence: boolean;
+  prompt_version: 'v1';
 }
