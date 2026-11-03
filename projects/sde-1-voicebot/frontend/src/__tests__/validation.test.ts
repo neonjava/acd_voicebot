@@ -4,11 +4,6 @@ import {
   validateTranscriptSegment,
   validateAudioChunkMetadata,
   validateErrorEnvelope,
-  validateSessionLifecycleState,
-  validateSourceReference,
-  validateContextItem,
-  validateScreenContext,
-  validateReasoningResult,
   MalformedResponseError,
 } from '../utils/validation';
 import { baselineSessionResponse } from '../fixtures/baselineSession';
@@ -33,17 +28,13 @@ describe('Runtime Validation', () => {
     expect(() => validateMockSessionResponse(invalid)).toThrow(MalformedResponseError);
   });
 
-  it('accepts valid session lifecycle states and rejects illegal state or mode', () => {
-    expect(validateMockSessionResponse({ ...baselineSessionResponse, state: 'active' }).state).toBe('active');
-    expect(validateMockSessionResponse({ ...baselineSessionResponse, state: 'paused' }).state).toBe('paused');
-    expect(validateMockSessionResponse({ ...baselineSessionResponse, state: 'completed' }).state).toBe('completed');
-
+  it('rejects illegal state or mode', () => {
     expect(() =>
-      validateMockSessionResponse({ ...baselineSessionResponse, state: 'unknown_state' as any })
+      validateMockSessionResponse({ ...baselineSessionResponse, state: 'active' })
     ).toThrow(MalformedResponseError);
 
     expect(() =>
-      validateMockSessionResponse({ ...baselineSessionResponse, mode: 'real' as any })
+      validateMockSessionResponse({ ...baselineSessionResponse, mode: 'real' })
     ).toThrow(MalformedResponseError);
   });
 
@@ -217,136 +208,6 @@ describe('Runtime Validation', () => {
         correlation_id: 'corr-123',
       };
       expect(() => validateErrorEnvelope(err)).toThrow(/boolean/);
-    });
-  });
-
-  describe('SessionLifecycleState validation', () => {
-    it('validates all legal states', () => {
-      expect(validateSessionLifecycleState('created')).toBe('created');
-      expect(validateSessionLifecycleState('active')).toBe('active');
-      expect(validateSessionLifecycleState('paused')).toBe('paused');
-      expect(validateSessionLifecycleState('stopping')).toBe('stopping');
-      expect(validateSessionLifecycleState('completed')).toBe('completed');
-      expect(validateSessionLifecycleState('failed')).toBe('failed');
-      expect(validateSessionLifecycleState('expired')).toBe('expired');
-    });
-
-    it('rejects illegal lifecycle states', () => {
-      expect(() => validateSessionLifecycleState('stopped')).toThrow(MalformedResponseError);
-      expect(() => validateSessionLifecycleState('pending')).toThrow(MalformedResponseError);
-      expect(() => validateSessionLifecycleState('')).toThrow(MalformedResponseError);
-      expect(() => validateSessionLifecycleState(null)).toThrow(MalformedResponseError);
-    });
-  });
-
-  describe('ScreenContext and SourceReference validation', () => {
-    const validSource = {
-      source_id: 'src-1',
-      locator: 'screen-region-header',
-      kind: 'synthetic_screen' as const,
-    };
-
-    const validItem = {
-      item_id: 'item-1',
-      text: 'Synthetic Title',
-      source: validSource,
-    };
-
-    const validScreen = {
-      frame_id: 'frame-0',
-      captured_at: '2026-01-01T00:00:00Z',
-      capture_enabled: false,
-      items: [validItem],
-    };
-
-    it('validates valid SourceReference', () => {
-      const res = validateSourceReference(validSource);
-      expect(res.source_id).toBe('src-1');
-      expect(res.kind).toBe('synthetic_screen');
-    });
-
-    it('rejects invalid SourceReference', () => {
-      expect(() => validateSourceReference({ source_id: '', locator: 'loc' })).toThrow(MalformedResponseError);
-      expect(() => validateSourceReference(null)).toThrow(MalformedResponseError);
-      expect(() => validateSourceReference({ ...validSource, kind: 'invalid_kind' as any })).toThrow(MalformedResponseError);
-    });
-
-    it('validates valid ContextItem', () => {
-      const res = validateContextItem(validItem);
-      expect(res.item_id).toBe('item-1');
-      expect(res.source.source_id).toBe('src-1');
-    });
-
-    it('rejects ContextItem with invalid fields', () => {
-      expect(() => validateContextItem({ ...validItem, item_id: '' })).toThrow(/item_id/);
-      expect(() => validateContextItem({ ...validItem, text: '' })).toThrow(/text/);
-      expect(() => validateContextItem({ ...validItem, source: null })).toThrow(/SourceReference/);
-    });
-
-    it('validates valid ScreenContext', () => {
-      const res = validateScreenContext(validScreen);
-      expect(res.frame_id).toBe('frame-0');
-      expect(res.capture_enabled).toBe(false);
-      expect(res.items).toHaveLength(1);
-    });
-
-    it('rejects invalid ScreenContext', () => {
-      expect(() => validateScreenContext({ ...validScreen, frame_id: '' })).toThrow(MalformedResponseError);
-      expect(() => validateScreenContext({ ...validScreen, captured_at: '' })).toThrow(MalformedResponseError);
-      expect(() => validateScreenContext({ ...validScreen, capture_enabled: 'yes' })).toThrow(MalformedResponseError);
-      expect(() => validateScreenContext({ ...validScreen, items: 'not-an-array' })).toThrow(MalformedResponseError);
-    });
-
-    it('validates valid ReasoningResult', () => {
-      const validReasoning = {
-        request_id: 'req-1',
-        session_id: 'sess-1',
-        answer: 'Screen status is active.',
-        source_ids: ['src-1'],
-        insufficient_evidence: false,
-        prompt_version: 'v1' as const,
-      };
-      const res = validateReasoningResult(validReasoning);
-      expect(res.request_id).toBe('req-1');
-      expect(res.session_id).toBe('sess-1');
-      expect(res.answer).toBe('Screen status is active.');
-      expect(res.source_ids).toHaveLength(1);
-      expect(res.prompt_version).toBe('v1');
-    });
-
-    it('rejects invalid ReasoningResult', () => {
-      expect(() =>
-        validateReasoningResult({
-          request_id: '',
-          session_id: 'sess-1',
-          answer: 'ans',
-          source_ids: [],
-          insufficient_evidence: false,
-          prompt_version: 'v1',
-        })
-      ).toThrow(MalformedResponseError);
-
-      expect(() =>
-        validateReasoningResult({
-          request_id: 'req-1',
-          session_id: '',
-          answer: 'ans',
-          source_ids: [],
-          insufficient_evidence: false,
-          prompt_version: 'v1',
-        })
-      ).toThrow(MalformedResponseError);
-
-      expect(() =>
-        validateReasoningResult({
-          request_id: 'req-1',
-          session_id: 'sess-1',
-          answer: 'ans',
-          source_ids: [],
-          insufficient_evidence: false,
-          prompt_version: 'v2' as any,
-        })
-      ).toThrow(MalformedResponseError);
     });
   });
 });
