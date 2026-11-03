@@ -242,6 +242,83 @@ class TestRetryPolicy:
         assert isinstance(err, ErrorEnvelope)
         assert err.code == "TRANSCRIPTION_RETRY_EXHAUSTED"
 
+    def test_retry_policy_accumulates_segments_when_retry_times_out(self) -> None:
+        """Attempt 1 returns valid segment + retryable error; attempt 2 times out.
+
+        Valid segment from attempt 1 must be preserved when retries are exhausted.
+        """
+        policy = RetryPolicy(max_retries=1)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [
+                    _make_success_event(),
+                    _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+                ]
+            raise TimeoutError("connection dropped on retry")
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 2
+        assert call_count == 2
+        assert len(events) == 2
+        assert events[0].event_type == "transcript.segment"
+        assert events[0].payload.text == "Success"
+        assert events[1].event_type == "transcript.error"
+        err = events[1].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_RETRY_EXHAUSTED"
+
+    def test_retry_policy_deduplicates_segments_by_segment_id(self) -> None:
+        """Updated versions of segments with same segment_id are deduplicated."""
+        policy = RetryPolicy(max_retries=1)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            is_final = call_count == 2
+            seg = TranscriptSegment(
+                segment_id="seg-dedup",
+                session_id="sess",
+                sequence_id=call_count,
+                start_ms=0,
+                end_ms=1000,
+                text=f"Draft v{call_count}",
+                is_final=is_final,
+            )
+            evt = TranscriptEvent(
+                event_id=f"evt-{call_count}",
+                event_type="transcript.segment",
+                schema_version="1.0",
+                session_id="sess",
+                correlation_id="corr",
+                timestamp=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+                producer="transcription",
+                payload=seg,
+            )
+            return [
+                evt,
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+            ]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 2
+        assert len(events) == 2
+        assert events[0].event_type == "transcript.segment"
+        assert events[0].payload.segment_id == "seg-dedup"
+        assert events[0].payload.text == "Draft v2"
+        assert events[0].payload.is_final is True
+        assert events[1].event_type == "transcript.error"
+
     def test_timeout_exception_handled_and_retried(self) -> None:
         policy = RetryPolicy(max_retries=1)
         call_count = 0

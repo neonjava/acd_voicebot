@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from app.contracts.common import ErrorEnvelope
-from app.contracts.transcription import TranscriptEvent
+from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 
 
 class RetryPolicy:
@@ -62,15 +62,13 @@ class RetryPolicy:
         attempts = 0
         max_attempts = self.max_retries + 1
         last_error_event: TranscriptEvent | None = None
-        last_batch_events: list[TranscriptEvent] = []
+        accumulated_success_events: dict[str, TranscriptEvent] = {}
 
         while attempts < max_attempts:
             attempts += 1
             try:
                 events = action()
-                last_batch_events = events
             except TimeoutError:
-                last_batch_events = []
                 err_envelope = ErrorEnvelope(
                     code="TRANSCRIPTION_TIMEOUT",
                     message_safe_for_user="Transcription request timed out.",
@@ -105,21 +103,40 @@ class RetryPolicy:
                         "exception_type": type(exc).__name__,
                     },
                 )
-                return (
-                    [
-                        TranscriptEvent(
-                            event_id=f"event-transcript-err-{session_id}-{attempts}",
-                            event_type="transcript.error",
-                            schema_version="1.0",
-                            session_id=session_id,
-                            correlation_id=correlation_id,
-                            timestamp=timestamp,
-                            producer="transcription",
-                            payload=err_envelope,
-                        )
-                    ],
-                    attempts,
+                err_event = TranscriptEvent(
+                    event_id=f"event-transcript-err-{session_id}-{attempts}",
+                    event_type="transcript.error",
+                    schema_version="1.0",
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    producer="transcription",
+                    payload=err_envelope,
                 )
+                return [*accumulated_success_events.values(), err_event], attempts
+
+            # Accumulate successful segments across attempts by stable segment/event ID
+            for evt in events:
+                if evt.event_type != "transcript.error":
+                    key = (
+                        evt.payload.segment_id
+                        if isinstance(evt.payload, TranscriptSegment)
+                        else evt.event_id
+                    )
+                    if key in accumulated_success_events:
+                        existing = accumulated_success_events[key]
+                        if isinstance(
+                            existing.payload, TranscriptSegment
+                        ) and isinstance(evt.payload, TranscriptSegment):
+                            if (
+                                evt.payload.sequence_id >= existing.payload.sequence_id
+                                or evt.payload.is_final
+                            ):
+                                accumulated_success_events[key] = evt
+                        else:
+                            accumulated_success_events[key] = evt
+                    else:
+                        accumulated_success_events[key] = evt
 
             # Inspect all error events before retrying.
             error_events = [
@@ -130,12 +147,15 @@ class RetryPolicy:
             ]
             if not error_events:
                 # Success: no errors in batch
-                return events, attempts
+                return [*accumulated_success_events.values()], attempts
 
             # A permanent error anywhere in the batch stops retries immediately
             for err_evt in error_events:
                 if not self.is_retryable(err_evt.payload):
-                    return events, attempts
+                    return [
+                        *accumulated_success_events.values(),
+                        *error_events,
+                    ], attempts
 
             # All errors in the batch are retryable; record last error event
             last_error_event = error_events[-1]
@@ -166,8 +186,5 @@ class RetryPolicy:
             producer="transcription",
             payload=exhausted_envelope,
         )
-        # Preserve successful segments from the final attempt if it was a mixed batch
-        successful_segments = [
-            evt for evt in last_batch_events if evt.event_type != "transcript.error"
-        ]
-        return [*successful_segments, exhausted_event], attempts
+        # Preserve successful segments accumulated across all attempts
+        return [*accumulated_success_events.values(), exhausted_event], attempts
