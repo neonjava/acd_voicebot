@@ -233,6 +233,16 @@ class TestAccumulatorWeek2:
         with pytest.raises(ValueError, match="nonnegative"):
             acc.gaps(min_gap_ms=-10)
 
+    def test_gaps_with_nested_and_overlapping_segments(self) -> None:
+        acc = SegmentAccumulator()
+        s1 = _make_segment("seg-1", sequence_id=0, start_ms=0, end_ms=3000, text="A")
+        s2 = _make_segment("seg-2", sequence_id=1, start_ms=500, end_ms=1000, text="B")
+        s3 = _make_segment("seg-3", sequence_id=2, start_ms=2000, end_ms=2500, text="C")
+        acc.add(s1)
+        acc.add(s2)
+        acc.add(s3)
+        assert acc.gaps() == []
+
     def test_accepts_both_event_and_segment(self) -> None:
         acc = SegmentAccumulator()
         seg1 = _make_segment(

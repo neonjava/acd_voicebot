@@ -134,6 +134,60 @@ class TestRetryPolicy:
         assert isinstance(err, ErrorEnvelope)
         assert err.code == "TRANSCRIPTION_INVALID_PAYLOAD"
 
+    def test_retry_policy_batch_with_temporary_then_permanent_fails_immediately(
+        self,
+    ) -> None:
+        """Batch with temporary then permanent error must fail immediately."""
+        policy = RetryPolicy(max_retries=3)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            return [
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+                _make_error_event("TRANSCRIPTION_INVALID_PAYLOAD", retryable=False),
+            ]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 1
+        assert call_count == 1
+        assert len(events) == 2
+        assert any(
+            isinstance(e.payload, ErrorEnvelope) and e.payload.retryable is False
+            for e in events
+        )
+
+    def test_retry_policy_batch_with_permanent_then_temporary_fails_immediately(
+        self,
+    ) -> None:
+        """Batch with permanent then temporary error must fail immediately."""
+        policy = RetryPolicy(max_retries=3)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            return [
+                _make_error_event("TRANSCRIPTION_INVALID_PAYLOAD", retryable=False),
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+            ]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 1
+        assert call_count == 1
+        assert len(events) == 2
+        assert any(
+            isinstance(e.payload, ErrorEnvelope) and e.payload.retryable is False
+            for e in events
+        )
+
     def test_timeout_exception_handled_and_retried(self) -> None:
         policy = RetryPolicy(max_retries=1)
         call_count = 0

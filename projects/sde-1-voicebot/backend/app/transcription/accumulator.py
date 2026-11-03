@@ -124,12 +124,17 @@ class SegmentAccumulator:
             raise ValueError("min_gap_ms must be nonnegative")
 
         ordered = self.segments()
+        if not ordered:
+            return []
+
         detected_gaps: list[tuple[int, int]] = []
-        for i in range(len(ordered) - 1):
-            curr_end = ordered[i].end_ms
-            next_start = ordered[i + 1].start_ms
-            if next_start > curr_end + min_gap_ms:
-                detected_gaps.append((curr_end, next_start))
+        max_covered_end = ordered[0].end_ms
+
+        for seg in ordered[1:]:
+            if seg.start_ms > max_covered_end + min_gap_ms:
+                detected_gaps.append((max_covered_end, seg.start_ms))
+            max_covered_end = max(max_covered_end, seg.end_ms)
+
         return detected_gaps
 
     def clear(self) -> None:

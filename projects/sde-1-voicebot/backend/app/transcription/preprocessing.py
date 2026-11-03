@@ -160,6 +160,12 @@ class AudioPreprocessor:
         chunk_ms: int = 20,
     ) -> list[AudioChunk]:
         """Convert arbitrary sample rate PCM into validated 16kHz chunks."""
+        if self.target_rate_hz != 16000:
+            raise ValueError(
+                "canonical AudioChunk requires 16000 Hz, but target_rate_hz is "
+                f"{self.target_rate_hz}"
+            )
+
         if from_rate_hz != self.target_rate_hz:
             pcm = resample_pcm(
                 pcm, from_rate_hz=from_rate_hz, to_rate_hz=self.target_rate_hz
