@@ -1,10 +1,11 @@
 """Session contracts and wire projections owned by W5 (Backend)."""
 
-from typing import Literal, Self, Union
+from datetime import datetime
+from typing import Any, Literal, Self, Union
 
 from pydantic import Field, field_validator, model_validator
 
-from app.contracts.common import ContractModel, EventEnvelope
+from app.contracts.common import ContractModel, EventEnvelope, SessionState
 from app.contracts.transcription import TranscriptEvent
 
 
@@ -79,3 +80,52 @@ class MockSessionResponse(ContractModel):
                 raise ValueError("audio.chunk events must precede transcript events")
 
         return self
+
+
+# --- Week 2 Full Lifecycle Models ---
+
+
+class SessionCreateRequest(ContractModel):
+    """Request payload for creating a new voicebot session."""
+
+    session_id: str | None = Field(default=None, min_length=1, pattern=r"\S")
+    mode: Literal["mock"] = "mock"
+    initial_state: Literal["created", "active"] = "created"
+
+
+class SessionActionRequest(ContractModel):
+    """Generic payload for lifecycle action commands (pause/resume/stop)."""
+
+    reason: str | None = Field(default=None, max_length=256)
+
+
+class SessionStateResponse(ContractModel):
+    """Normalized wire representation of a session's current lifecycle state."""
+
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    state: SessionState
+    mode: Literal["mock"] = "mock"
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+
+
+class SessionEventStreamResponse(ContractModel):
+    """Batch of ordered session events returned by replay / polling."""
+
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    events: list[SessionEvent] = Field(default_factory=list)
+    from_sequence: int = Field(ge=0, default=0)
+    total_events: int = Field(ge=0, default=0)
+    has_more: bool = False
+
+
+class IdempotencyRecord(ContractModel):
+    """Cached response for an idempotent operation."""
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    action: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    status_code: int = Field(ge=200, le=599)
+    response_body: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
