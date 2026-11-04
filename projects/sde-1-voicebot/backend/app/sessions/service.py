@@ -2,15 +2,18 @@
 
 import importlib.util
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.config import settings
 from app.contracts.common import ContractModel, SessionState
 from app.contracts.sessions import (
     AudioChunkEvent,
     AudioChunkMetadata,
+    IdempotencyRecord,
     MockSessionResponse,
     SessionEvent,
+    SessionStateResponse,
 )
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 
@@ -26,10 +29,12 @@ LEGAL_TRANSITIONS: dict[SessionState, set[SessionState]] = {
         SessionState.stopping,
         SessionState.completed,
         SessionState.failed,
+        SessionState.expired,
     },
     SessionState.paused: {
         SessionState.active,
         SessionState.stopping,
+        SessionState.completed,
         SessionState.failed,
         SessionState.expired,
     },
@@ -59,6 +64,14 @@ class SessionNotFoundError(Exception):
         self.session_id = session_id
 
 
+class SessionExpiredError(Exception):
+    """Raised when performing an action on an expired session."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Session has expired: {session_id}")
+        self.session_id = session_id
+
+
 class MissingDependencyError(RuntimeError):
     """Raised when a required upstream producer is unavailable on the branch."""
 
@@ -70,12 +83,14 @@ class MissingDependencyError(RuntimeError):
 
 
 class SessionRecord(ContractModel):
-    """In-memory representation of an active or completed session."""
+    """In-memory representation of an active, paused, or completed session."""
 
     session_id: str
     state: SessionState
+    mode: str = "mock"
     created_at: datetime
     updated_at: datetime
+    expires_at: datetime | None = None
 
 
 class SessionService:
@@ -83,32 +98,81 @@ class SessionService:
 
     def __init__(self) -> None:
         self._sessions: dict[str, SessionRecord] = {}
+        self._session_events: dict[str, list[SessionEvent]] = {}
+        self._idempotency_cache: dict[tuple[str, str], IdempotencyRecord] = {}
 
     def clear(self) -> None:
-        """Clear all sessions (primarily for tests)."""
+        """Clear all sessions and caches (primarily for test isolation)."""
         self._sessions.clear()
+        self._session_events.clear()
+        self._idempotency_cache.clear()
 
     def create_session(
         self,
         session_id: str | None = None,
         *,
+        initial_state: SessionState = SessionState.created,
         now: datetime | None = None,
+        ttl_seconds: int | None = None,
     ) -> SessionRecord:
-        """Create a new session in the 'created' state."""
+        """Create a new session in 'created' or 'active' state with TTL expiry."""
         sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
         timestamp = now or datetime.now(timezone.utc)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        effective_ttl = (
+            ttl_seconds if ttl_seconds is not None else settings.session_ttl_seconds
+        )
+        expires_at = timestamp + timedelta(seconds=effective_ttl)
+
         record = SessionRecord(
             session_id=sid,
-            state=SessionState.created,
+            state=initial_state,
+            mode="mock",
             created_at=timestamp,
             updated_at=timestamp,
+            expires_at=expires_at,
         )
         self._sessions[sid] = record
+        self._session_events[sid] = []
         return record
 
-    def get_session(self, session_id: str) -> SessionRecord | None:
-        """Retrieve a session by ID."""
-        return self._sessions.get(session_id)
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        check_expiry: bool = True,
+        now: datetime | None = None,
+    ) -> SessionRecord | None:
+        """Retrieve a session by ID, automatically evaluating TTL expiry."""
+        record = self._sessions.get(session_id)
+        if not record:
+            return None
+
+        if check_expiry and record.expires_at is not None:
+            current_time = now or datetime.now(timezone.utc)
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+
+            # Check if active/paused/created session has exceeded TTL
+            if current_time >= record.expires_at and record.state in (
+                SessionState.created,
+                SessionState.active,
+                SessionState.paused,
+            ):
+                updated_record = SessionRecord(
+                    session_id=record.session_id,
+                    state=SessionState.expired,
+                    mode=record.mode,
+                    created_at=record.created_at,
+                    updated_at=current_time,
+                    expires_at=record.expires_at,
+                )
+                self._sessions[session_id] = updated_record
+                return updated_record
+
+        return record
 
     def transition(
         self,
@@ -118,23 +182,180 @@ class SessionService:
         now: datetime | None = None,
     ) -> SessionRecord:
         """Transition a session to a target state, enforcing transition rules."""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, check_expiry=False)
         if not session:
             raise SessionNotFoundError(session_id)
+
+        # Re-check expiry before executing transition
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+
+        if (
+            session.expires_at is not None
+            and current_time >= session.expires_at
+            and target_state != SessionState.expired
+            and session.state
+            in (
+                SessionState.created,
+                SessionState.active,
+                SessionState.paused,
+            )
+        ):
+            # Session expired
+            self.transition(session_id, SessionState.expired, now=current_time)
+            raise SessionExpiredError(session_id)
 
         allowed = LEGAL_TRANSITIONS.get(session.state, set())
         if target_state not in allowed:
             raise InvalidSessionTransitionError(session.state, target_state)
 
-        updated_time = now or datetime.now(timezone.utc)
         updated_record = SessionRecord(
             session_id=session.session_id,
             state=target_state,
+            mode=session.mode,
             created_at=session.created_at,
-            updated_at=updated_time,
+            updated_at=current_time,
+            expires_at=session.expires_at,
         )
         self._sessions[session_id] = updated_record
         return updated_record
+
+    def pause_session(
+        self, session_id: str, *, now: datetime | None = None
+    ) -> SessionRecord:
+        """Pause an active session. Idempotent if already paused."""
+        session = self.get_session(session_id, now=now)
+        if not session:
+            raise SessionNotFoundError(session_id)
+        if session.state == SessionState.paused:
+            # Idempotent no-op
+            return session
+        if session.state == SessionState.expired:
+            raise SessionExpiredError(session_id)
+        return self.transition(session_id, SessionState.paused, now=now)
+
+    def resume_session(
+        self, session_id: str, *, now: datetime | None = None
+    ) -> SessionRecord:
+        """Resume a paused session to active. Idempotent if already active."""
+        session = self.get_session(session_id, now=now)
+        if not session:
+            raise SessionNotFoundError(session_id)
+        if session.state == SessionState.active:
+            # Idempotent no-op
+            return session
+        if session.state == SessionState.expired:
+            raise SessionExpiredError(session_id)
+        return self.transition(session_id, SessionState.active, now=now)
+
+    def stop_session(
+        self, session_id: str, *, now: datetime | None = None
+    ) -> SessionRecord:
+        """Stop a session and mark it completed. Idempotent if already completed."""
+        session = self.get_session(session_id, now=now)
+        if not session:
+            raise SessionNotFoundError(session_id)
+        if session.state == SessionState.completed:
+            # Idempotent no-op
+            return session
+        if session.state == SessionState.expired:
+            raise SessionExpiredError(session_id)
+
+        current_time = now or datetime.now(timezone.utc)
+        # Direct active/paused -> completed
+        return self.transition(session_id, SessionState.completed, now=current_time)
+
+    def expire_session(
+        self, session_id: str, *, now: datetime | None = None
+    ) -> SessionRecord:
+        """Explicitly transition a non-terminal session to expired."""
+        session = self.get_session(session_id, check_expiry=False)
+        if not session:
+            raise SessionNotFoundError(session_id)
+        if session.state == SessionState.expired:
+            return session
+        return self.transition(session_id, SessionState.expired, now=now)
+
+    def add_event(self, session_id: str, event: SessionEvent) -> None:
+        """Append an event to the session's ordered event buffer."""
+        if event.session_id != session_id:
+            raise ValueError(
+                f"Event session_id '{event.session_id}' does not match "
+                f"target session '{session_id}'"
+            )
+        if session_id not in self._session_events:
+            self._session_events[session_id] = []
+
+        events = self._session_events[session_id]
+        if len(events) >= settings.max_events_per_session:
+            raise ValueError(
+                f"Session event limit ({settings.max_events_per_session}) reached"
+            )
+        events.append(event)
+
+    def get_events(
+        self,
+        session_id: str,
+        *,
+        from_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[SessionEvent]:
+        """Retrieve ordered events for a session with sequence offset and limit."""
+        if session_id not in self._sessions:
+            raise SessionNotFoundError(session_id)
+
+        all_events = self._session_events.get(session_id, [])
+        filtered = [
+            evt
+            for evt in all_events
+            if getattr(evt.payload, "sequence_id", 0) >= from_sequence
+        ]
+        return filtered[:limit]
+
+    # --- Idempotency helpers ---
+
+    def get_idempotent_result(
+        self, idempotency_key: str, action: str
+    ) -> IdempotencyRecord | None:
+        """Look up cached response for an idempotency key and action."""
+        return self._idempotency_cache.get((idempotency_key, action))
+
+    def record_idempotent_result(
+        self,
+        idempotency_key: str,
+        action: str,
+        session_id: str,
+        status_code: int,
+        response_body: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> IdempotencyRecord:
+        """Cache response data for a given idempotency key."""
+        timestamp = now or datetime.now(timezone.utc)
+        record = IdempotencyRecord(
+            idempotency_key=idempotency_key,
+            action=action,
+            session_id=session_id,
+            status_code=status_code,
+            response_body=response_body,
+            created_at=timestamp,
+        )
+        self._idempotency_cache[(idempotency_key, action)] = record
+        return record
+
+    def to_state_response(self, record: SessionRecord) -> SessionStateResponse:
+        """Convert in-memory SessionRecord to standard SessionStateResponse."""
+        return SessionStateResponse(
+            session_id=record.session_id,
+            state=record.state,
+            mode="mock",
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            expires_at=record.expires_at,
+        )
+
+    # --- Week 1 Compatibility Run Mock Session ---
 
     def run_synthetic_fixture_session(
         self,
@@ -280,6 +501,9 @@ class SessionService:
                 mode="mock",
                 events=events,
             )
+
+            # Store events into buffer
+            self._session_events[sid] = list(events)
 
             # Only mark it completed after response validation succeeds
             self.transition(sid, SessionState.completed, now=ts)
