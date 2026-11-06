@@ -128,9 +128,14 @@ class RetryPolicy:
                         if isinstance(
                             existing.payload, TranscriptSegment
                         ) and isinstance(evt.payload, TranscriptSegment):
-                            if (
+                            if existing.payload.is_final and not evt.payload.is_final:
+                                # Keep existing final segment when later result
+                                # is interim regardless of sequence_id
+                                pass
+                            elif (
+                                evt.payload.is_final and not existing.payload.is_final
+                            ) or (
                                 evt.payload.sequence_id >= existing.payload.sequence_id
-                                or evt.payload.is_final
                             ):
                                 accumulated_success_events[key] = evt
                         else:

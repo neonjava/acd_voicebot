@@ -319,6 +319,56 @@ class TestRetryPolicy:
         assert events[0].payload.is_final is True
         assert events[1].event_type == "transcript.error"
 
+    def test_retry_policy_preserves_final_segment_over_subsequent_interim(self) -> None:
+        """Attempt 1 returns final segment + retryable error; attempt 2 returns interim.
+
+        An interim segment on retry with higher sequence_id must not
+        overwrite an existing final segment.
+        """
+        policy = RetryPolicy(max_retries=1)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            is_final = call_count == 1
+            seg = TranscriptSegment(
+                segment_id="seg-final-preserved",
+                session_id="sess",
+                sequence_id=call_count,
+                start_ms=0,
+                end_ms=1000,
+                text=f"Version {call_count}",
+                is_final=is_final,
+            )
+            evt = TranscriptEvent(
+                event_id=f"evt-{call_count}",
+                event_type="transcript.segment",
+                schema_version="1.0",
+                session_id="sess",
+                correlation_id="corr",
+                timestamp=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+                producer="transcription",
+                payload=seg,
+            )
+            if call_count == 1:
+                return [
+                    evt,
+                    _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+                ]
+            return [evt]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 2
+        assert len(events) == 1
+        assert events[0].event_type == "transcript.segment"
+        assert events[0].payload.segment_id == "seg-final-preserved"
+        assert events[0].payload.text == "Version 1"
+        assert events[0].payload.is_final is True
+
     def test_timeout_exception_handled_and_retried(self) -> None:
         policy = RetryPolicy(max_retries=1)
         call_count = 0
