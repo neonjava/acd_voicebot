@@ -571,6 +571,130 @@ def _fixture_result():  # noqa: ANN202 - test helper
     return execute(work, approvals=[approval("save", "rejected")])
 
 
+def test_cancel_interrupts_a_running_tool_without_a_timeout(
+    blocking_tool: BlockingTool,
+) -> None:
+    token = CancellationToken()
+    timer = threading.Timer(0.02, token.cancel)
+    timer.start()
+    result = execute(plan(step("echo")), cancellation=token, invoker=blocking_tool)
+    timer.join()
+    assert not blocking_tool.finished.is_set()  # The caller did not wait for it.
+    assert result.state is WorkflowState.cancelled
+    assert result.outputs == {}
+    assert [e.kind for e in result.audit_events] == ["workflow_cancelled"]
+
+
+def test_cancel_beats_a_long_timeout_and_keeps_earlier_outputs() -> None:
+    token = CancellationToken()
+    release = threading.Event()
+
+    def invoker(name: str, arguments: Mapping[str, str]) -> str:
+        if arguments["text"] == "slow":
+            token.cancel()
+            release.wait(timeout=2)
+        return tools.invoke_tool(name, arguments)
+
+    try:
+        result = execute(
+            plan(step("a"), step("b", text="slow", depends_on=["a"])),
+            clock=FakeClock(),
+            step_timeout_ms=5000,
+            cancellation=token,
+            invoker=invoker,
+        )
+    finally:
+        release.set()
+    assert result.state is WorkflowState.cancelled
+    assert result.outputs == {"a": "hello"}
+
+
+def test_blocked_consequential_tool_is_not_replayed_after_cancel(
+    blocking_tool: BlockingTool,
+) -> None:
+    token = CancellationToken()
+    timer = threading.Timer(0.02, token.cancel)
+    timer.start()
+    result = execute(
+        plan(step("save", "mock_save_note", requires_approval=True)),
+        approvals=[approval("save")],
+        max_retries=3,
+        cancellation=token,
+        invoker=blocking_tool,
+    )
+    timer.join()
+    assert result.state is WorkflowState.cancelled
+    assert blocking_tool.calls == ["mock_save_note"]
+
+
+# --- Approval expiry during a run --------------------------------------------
+
+
+def test_approval_expiring_during_run_stops_the_later_step() -> None:
+    clock = FakeClock()
+    recorder = Recorder([lambda: clock.advance(150)])
+    expires_at = T0 + timedelta(milliseconds=100)
+    result = execute(
+        plan(
+            step("a"),
+            step("save", "mock_save_note", requires_approval=True, depends_on=["a"]),
+        ),
+        approvals=[approval("save", expires_at=expires_at)],
+        clock=clock,
+        invoker=recorder,
+    )
+    assert result.state is WorkflowState.cancelled
+    assert result.outputs == {"a": "hello"}
+    assert recorder.calls == ["echo_text"]
+    assert [e.kind for e in result.audit_events] == [
+        "approval_granted",
+        "step_succeeded",
+        "approval_expired",
+        "workflow_cancelled",
+    ]
+    assert result.audit_events[2].step_id == "save"
+    assert result.audit_events[2].approval_id == "approval-save"
+
+
+def test_approval_still_valid_one_ms_before_expiry_during_run() -> None:
+    clock = FakeClock()
+    recorder = Recorder([lambda: clock.advance(99)])
+    result = execute(
+        plan(
+            step("a"),
+            step("save", "mock_save_note", requires_approval=True, depends_on=["a"]),
+        ),
+        approvals=[approval("save", expires_at=T0 + timedelta(milliseconds=100))],
+        clock=clock,
+        invoker=recorder,
+    )
+    assert result.state is WorkflowState.succeeded
+    assert recorder.calls == ["echo_text", "mock_save_note"]
+
+
+def test_approval_expiring_before_a_retry_stops_the_retry() -> None:
+    clock = FakeClock()
+
+    def time_out_after_expiry() -> None:
+        clock.advance(150)
+        raise TimeoutError
+
+    recorder = Recorder([time_out_after_expiry])
+    result = execute(
+        plan(step("echo", requires_approval=True)),
+        approvals=[approval("echo", expires_at=T0 + timedelta(milliseconds=100))],
+        clock=clock,
+        max_retries=3,
+        invoker=recorder,
+    )
+    assert result.state is WorkflowState.cancelled
+    assert recorder.calls == ["echo_text"]
+    assert [e.kind for e in result.audit_events][-2:] == [
+        "approval_expired",
+        "workflow_cancelled",
+    ]
+
+
 def test_published_rejected_result_fixture_matches_executor() -> None:
     from pathlib import Path
 
