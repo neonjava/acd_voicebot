@@ -332,3 +332,37 @@ class TestTranscriptionOrchestrator:
         assert events[1].event_type == "transcript.error"
         assert orchestrator.get_transcript_text() == "Mixed segment"
         assert len(orchestrator.get_segments()) == 1
+
+    def test_orchestrator_multiple_failing_batches_emit_unique_error_event_ids(
+        self, sample_chunks, fixed_timestamp
+    ) -> None:
+        """Two separate failing batches in one session emit distinct event_ids."""
+        fake = FakeTranscriber(failure_mode="temporary_error")
+        orchestrator = TranscriptionOrchestrator(
+            adapter=fake,
+            retry_policy=RetryPolicy(max_retries=1),
+        )
+
+        events_batch1 = orchestrator.process_chunks(
+            sample_chunks,
+            session_id="session-failing",
+            correlation_id="corr-batch-1",
+            timestamp=fixed_timestamp,
+        )
+        events_batch2 = orchestrator.process_chunks(
+            sample_chunks,
+            session_id="session-failing",
+            correlation_id="corr-batch-2",
+            timestamp=fixed_timestamp,
+        )
+
+        assert len(events_batch1) == 1
+        assert events_batch1[0].event_type == "transcript.error"
+        assert len(events_batch2) == 1
+        assert events_batch2[0].event_type == "transcript.error"
+
+        err1 = events_batch1[0]
+        err2 = events_batch2[0]
+        assert err1.event_id != err2.event_id
+        assert err1.event_id == "event-transcript-err-session-failing-1-exhausted"
+        assert err2.event_id == "event-transcript-err-session-failing-2-exhausted"

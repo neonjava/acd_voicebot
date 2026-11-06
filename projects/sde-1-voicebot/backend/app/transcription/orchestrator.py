@@ -38,6 +38,7 @@ class TranscriptionOrchestrator:
         self.accumulator = (
             accumulator if accumulator is not None else SegmentAccumulator()
         )
+        self._batch_counter = 0
 
     def health(self) -> str:
         """Return transcription provider health."""
@@ -77,6 +78,8 @@ class TranscriptionOrchestrator:
         if preprocess and self.preprocessor is not None:
             effective_chunks = self.preprocessor.process_chunks(chunks)
 
+        self._batch_counter += 1
+
         # Invoke adapter with retry policy
         events, _ = self.retry_policy.execute_with_retry(
             lambda: self.adapter.transcribe(
@@ -88,6 +91,7 @@ class TranscriptionOrchestrator:
             session_id=session_id,
             correlation_id=correlation_id,
             timestamp=timestamp,
+            batch_id=self._batch_counter,
         )
 
         # Ingest successful segment events into accumulator
@@ -124,3 +128,4 @@ class TranscriptionOrchestrator:
     def reset(self) -> None:
         """Clear the accumulator and reset session state."""
         self.accumulator.clear()
+        self._batch_counter = 0
