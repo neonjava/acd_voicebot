@@ -1,6 +1,7 @@
 """W4 Week 2 policy matrix: dependencies, scopes, expiry, timeouts, retries, cancel."""
 
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -327,6 +328,122 @@ def test_step_finishing_exactly_at_timeout_is_accepted() -> None:
     )
     assert result.state is WorkflowState.succeeded
     assert recorder.calls == ["echo_text"]
+
+
+class BlockingTool:
+    """Tool whose first ``block_calls`` calls hang until the test releases them."""
+
+    def __init__(self, block_calls: int = 1) -> None:
+        self.block_calls = block_calls
+        self.calls: list[str] = []
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def __call__(self, name: str, arguments: Mapping[str, str]) -> str:
+        self.calls.append(name)
+        if len(self.calls) <= self.block_calls:
+            self.release.wait(timeout=2)  # Bounded so a regression cannot hang CI.
+            self.finished.set()
+        return tools.invoke_tool(name, arguments)
+
+
+@pytest.fixture
+def blocking_tool() -> Iterator[BlockingTool]:
+    tool = BlockingTool()
+    yield tool
+    tool.release.set()
+
+
+def test_blocked_tool_times_out_and_returns_control(
+    blocking_tool: BlockingTool,
+) -> None:
+    result = execute(
+        plan(step("echo")),
+        clock=FakeClock(),
+        step_timeout_ms=20,
+        invoker=blocking_tool,
+    )
+    assert not blocking_tool.finished.is_set()  # The caller did not wait for it.
+    assert result.state is WorkflowState.failed
+    assert result.outputs == {}
+    assert result.error is not None
+    assert result.error.code == "WORKFLOW_STEP_TIMEOUT"
+    assert [e.kind for e in result.audit_events] == ["step_timed_out"]
+
+
+def test_blocked_idempotent_tool_is_retried_within_the_cap(
+    blocking_tool: BlockingTool,
+) -> None:
+    result = execute(
+        plan(step("echo")),
+        clock=FakeClock(),
+        step_timeout_ms=20,
+        max_retries=1,
+        invoker=blocking_tool,
+    )
+    assert not blocking_tool.finished.is_set()
+    assert result.state is WorkflowState.succeeded
+    assert result.outputs == {"echo": "hello"}
+    assert blocking_tool.calls == ["echo_text", "echo_text"]
+
+
+def test_blocked_consequential_tool_is_never_replayed(
+    blocking_tool: BlockingTool,
+) -> None:
+    result = execute(
+        plan(step("save", "mock_save_note", requires_approval=True)),
+        approvals=[approval("save")],
+        clock=FakeClock(),
+        step_timeout_ms=20,
+        max_retries=3,
+        invoker=blocking_tool,
+    )
+    assert not blocking_tool.finished.is_set()
+    assert result.state is WorkflowState.failed
+    assert blocking_tool.calls == ["mock_save_note"]
+
+
+def test_blocked_step_stops_later_steps(blocking_tool: BlockingTool) -> None:
+    result = execute(
+        plan(step("a"), step("b", depends_on=["a"])),
+        clock=FakeClock(),
+        step_timeout_ms=20,
+        invoker=blocking_tool,
+    )
+    assert result.state is WorkflowState.failed
+    assert blocking_tool.calls == ["echo_text"]
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [
+        (TimeoutError(), "WORKFLOW_STEP_TIMEOUT"),
+        (RuntimeError(SECRET), "WORKFLOW_TOOL_FAILED"),
+    ],
+)
+def test_tool_errors_keep_their_meaning_under_a_deadline(
+    raised: Exception, code: str
+) -> None:
+    result = execute(
+        plan(step("echo")),
+        clock=FakeClock(),
+        step_timeout_ms=1000,
+        invoker=Recorder([raised]),
+    )
+    assert result.error is not None
+    assert result.error.code == code
+    assert SECRET not in result.model_dump_json()
+
+
+def test_tool_stays_on_the_calling_thread_without_a_timeout() -> None:
+    seen: list[threading.Thread] = []
+
+    def invoker(name: str, arguments: Mapping[str, str]) -> str:
+        seen.append(threading.current_thread())
+        return tools.invoke_tool(name, arguments)
+
+    execute(plan(step("echo")), invoker=invoker)
+    assert seen == [threading.current_thread()]
 
 
 def test_retry_cap_bounds_attempts_and_fails_with_timeout_code() -> None:
