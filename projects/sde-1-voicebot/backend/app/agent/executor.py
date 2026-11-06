@@ -7,9 +7,10 @@ behavior is the same as Week 1: one in-memory run, no durable history.
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from datetime import datetime
 from threading import Thread
+from time import monotonic
 from typing import Literal
 
 from app.agent import tools
@@ -28,13 +29,14 @@ from app.contracts.workflow import (
 
 Clock = Callable[[], datetime]
 ToolInvoker = Callable[[str, Mapping[str, str]], str]
-StepStatus = Literal["ok", "timeout", "failed", "cancelled"]
+StepStatus = Literal["ok", "timeout", "failed", "cancelled", "expired"]
 
 _TERMINAL = {WorkflowState.succeeded, WorkflowState.failed, WorkflowState.cancelled}
+_POLL_SECONDS = 0.02
 
 
 class CancellationToken:
-    """Set by the caller; checked before every step and every retry."""
+    """Set by the caller; also stops waiting for a tool that is running."""
 
     def __init__(self) -> None:
         self._cancelled = False
@@ -45,6 +47,10 @@ class CancellationToken:
     @property
     def cancelled(self) -> bool:
         return self._cancelled
+
+
+class _StepCancelled(Exception):
+    """Cancellation arrived while a tool was still running."""
 
 
 class _Audit:
@@ -113,6 +119,12 @@ def _match_approvals(
     return approval_by_step
 
 
+def _approval_expired(approval: ApprovalRequest | None, clock: Clock | None) -> bool:
+    if approval is None or approval.expires_at is None or clock is None:
+        return False
+    return approval.expires_at <= clock()
+
+
 def _cancel(
     plan: WorkflowPlan,
     current: WorkflowState,
@@ -144,10 +156,12 @@ def execute(
     - Invalid plans (unknown tool, bad arguments, missing scope, missing
       dependency, cycle) raise ``WorkflowPolicyError`` before any tool runs.
     - A rejected or expired approval cancels the run with zero tool calls.
+    - Expiry is checked again before every step and retry, so an approval that
+      runs out mid-run stops the remaining work.
     - Retries apply only to idempotent tools and are bounded by ``max_retries``.
     - Timeouts need ``clock``. A step that passes ``step_timeout_ms`` counts as
       timed out and its output is discarded, even if the tool is still blocked.
-      A timed-out tool cannot be killed; see ``_call_with_deadline``.
+      A timed-out tool cannot be killed; see ``_call_supervised``.
     - A consequential tool is never called a second time.
 
     This call has no durable history. Calling it again may run the same steps again.
@@ -255,22 +269,41 @@ def execute(
             return _cancel(
                 plan, running, audit, reason="cancelled_during_run", outputs=outputs
             )
-        outcome = _run_step(
-            step,
-            audit=audit,
-            clock=clock,
-            step_timeout_ms=step_timeout_ms,
-            max_retries=max_retries,
-            cancellation=cancellation,
-            invoker=invoker,
-        )
-        status, output = outcome
+        approval = approval_by_step.get(step.step_id)
+        status: StepStatus
+        output = ""
+        if _approval_expired(approval, clock):
+            status = "expired"
+        else:
+            status, output = _run_step(
+                step,
+                audit=audit,
+                approval=approval,
+                clock=clock,
+                step_timeout_ms=step_timeout_ms,
+                max_retries=max_retries,
+                cancellation=cancellation,
+                invoker=invoker,
+            )
         if status == "ok":
             outputs[step.step_id] = output
             continue
         if status == "cancelled":
             return _cancel(
                 plan, running, audit, reason="cancelled_during_run", outputs=outputs
+            )
+        if status == "expired":
+            audit.record(
+                "approval_expired",
+                step_id=step.step_id,
+                approval_id=approval.approval_id if approval else None,
+            )
+            return _cancel(
+                plan,
+                running,
+                audit,
+                reason="approval_expired_during_run",
+                outputs=outputs,
             )
         timed_out = status == "timeout"
         return _result(
@@ -295,18 +328,19 @@ def execute(
     )
 
 
-def _call_with_deadline(
+def _call_supervised(
     call: ToolInvoker,
     tool_name: str,
     arguments: Mapping[str, str],
-    timeout_ms: int,
+    timeout_ms: int | None,
+    cancellation: CancellationToken | None,
 ) -> str:
-    """Run a tool on a daemon thread and stop waiting at the deadline.
+    """Run a tool on a daemon thread; stop waiting at a deadline or on cancel.
 
-    Raises ``TimeoutError`` at the deadline. Python cannot kill a thread, so a
-    blocked tool keeps running in the background and any late result is ignored.
-    The caller must treat a timed-out call's effect as unknown: that is why only
-    idempotent tools are retried.
+    Raises ``TimeoutError`` at the deadline and ``_StepCancelled`` on cancel.
+    Python cannot kill a thread, so a blocked tool keeps running in the
+    background and any late result is ignored. The caller must treat that
+    call's effect as unknown: that is why only idempotent tools are retried.
     """
     outcome: Future[str] = Future()
 
@@ -317,13 +351,26 @@ def _call_with_deadline(
             outcome.set_exception(error)
 
     Thread(target=run, name=f"workflow-{tool_name}", daemon=True).start()
-    return outcome.result(timeout=timeout_ms / 1000)
+    deadline = None if timeout_ms is None else monotonic() + timeout_ms / 1000
+    while True:
+        remaining = _POLL_SECONDS if deadline is None else deadline - monotonic()
+        wait([outcome], timeout=max(0.0, min(_POLL_SECONDS, remaining)))
+        if outcome.done():
+            return outcome.result()
+        if cancellation is not None and cancellation.cancelled:
+            wait([outcome], timeout=_POLL_SECONDS)  # Keep a result landing now.
+            if outcome.done():
+                return outcome.result()
+            raise _StepCancelled
+        if deadline is not None and monotonic() >= deadline:
+            raise TimeoutError
 
 
 def _run_step(
     step: WorkflowStep,
     *,
     audit: _Audit,
+    approval: ApprovalRequest | None,
     clock: Clock | None,
     step_timeout_ms: int | None,
     max_retries: int,
@@ -339,12 +386,18 @@ def _run_step(
         started = clock() if clock is not None else None
         failure: str | None = None
         try:
-            if step_timeout_ms is None:
+            if step_timeout_ms is None and cancellation is None:
                 output = call(step.tool_name, step.arguments)
             else:
-                output = _call_with_deadline(
-                    call, step.tool_name, step.arguments, step_timeout_ms
+                output = _call_supervised(
+                    call,
+                    step.tool_name,
+                    step.arguments,
+                    step_timeout_ms,
+                    cancellation,
                 )
+        except _StepCancelled:
+            return "cancelled", ""
         except TimeoutError:
             failure = "timeout"
         except TransientToolError:
@@ -372,6 +425,8 @@ def _run_step(
             return ("timeout" if failure == "timeout" else "failed"), ""
         if cancellation is not None and cancellation.cancelled:
             return "cancelled", ""
+        if _approval_expired(approval, clock):
+            return "expired", ""
         audit.record("step_retried", step_id=step.step_id, attempt=str(attempt + 1))
 
 
