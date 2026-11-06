@@ -1,0 +1,29 @@
+{
+  "plan_id": "plan-1",
+  "session_id": "session-1",
+  "state": "cancelled",
+  "outputs": {},
+  "error": null,
+  "audit_events": [
+    {
+      "sequence": 0,
+      "kind": "approval_rejected",
+      "plan_id": "plan-1",
+      "session_id": "session-1",
+      "step_id": "save",
+      "approval_id": "approval-save",
+      "details_redacted": {}
+    },
+    {
+      "sequence": 1,
+      "kind": "workflow_cancelled",
+      "plan_id": "plan-1",
+      "session_id": "session-1",
+      "step_id": null,
+      "approval_id": null,
+      "details_redacted": {
+        "reason": "approval_not_granted"
+      }
+    }
+  ]
+}
