@@ -406,6 +406,25 @@ class TestRetryPolicy:
         assert err.code == "TRANSCRIPTION_INTERNAL_ERROR"
         assert err.retryable is False
 
+    def test_retry_policy_emits_unique_error_event_ids_across_calls(self) -> None:
+        """Successive failing calls to execute_with_retry emit distinct event_ids."""
+        policy = RetryPolicy(max_retries=1)
+
+        def action() -> list[TranscriptEvent]:
+            return [_make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True)]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events1, _ = policy.execute_with_retry(
+            action, session_id="s1", correlation_id="c1", timestamp=ts
+        )
+        events2, _ = policy.execute_with_retry(
+            action, session_id="s1", correlation_id="c2", timestamp=ts
+        )
+
+        assert events1[0].event_id != events2[0].event_id
+        assert events1[0].event_id == "event-transcript-err-s1-1-exhausted"
+        assert events2[0].event_id == "event-transcript-err-s1-2-exhausted"
+
     def test_invalid_max_retries_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="nonnegative integer"):
             RetryPolicy(max_retries=-1)

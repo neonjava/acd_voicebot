@@ -40,6 +40,7 @@ class RetryPolicy:
             if retryable_codes is not None
             else self.DEFAULT_RETRYABLE_CODES
         )
+        self._call_count = 0
 
     def is_retryable(self, error: ErrorEnvelope) -> bool:
         """Determine if an ErrorEnvelope represents a transient, retryable failure."""
@@ -54,11 +55,14 @@ class RetryPolicy:
         session_id: str,
         correlation_id: str,
         timestamp: datetime,
+        batch_id: int | str | None = None,
     ) -> tuple[list[TranscriptEvent], int]:
         """Execute an action with bounded retries.
 
         Returns (events, attempts_count).
         """
+        self._call_count += 1
+        batch_key = str(batch_id) if batch_id is not None else str(self._call_count)
         attempts = 0
         max_attempts = self.max_retries + 1
         last_error_event: TranscriptEvent | None = None
@@ -77,7 +81,9 @@ class RetryPolicy:
                     details_redacted={"attempt": str(attempts)},
                 )
                 last_error_event = TranscriptEvent(
-                    event_id=f"event-transcript-err-{session_id}-{attempts}",
+                    event_id=(
+                        f"event-transcript-err-{session_id}-{batch_key}-{attempts}"
+                    ),
                     event_type="transcript.error",
                     schema_version="1.0",
                     session_id=session_id,
@@ -104,7 +110,9 @@ class RetryPolicy:
                     },
                 )
                 err_event = TranscriptEvent(
-                    event_id=f"event-transcript-err-{session_id}-{attempts}",
+                    event_id=(
+                        f"event-transcript-err-{session_id}-{batch_key}-{attempts}"
+                    ),
                     event_type="transcript.error",
                     schema_version="1.0",
                     session_id=session_id,
@@ -182,7 +190,7 @@ class RetryPolicy:
             },
         )
         exhausted_event = TranscriptEvent(
-            event_id=f"event-transcript-err-{session_id}-exhausted",
+            event_id=f"event-transcript-err-{session_id}-{batch_key}-exhausted",
             event_type="transcript.error",
             schema_version="1.0",
             session_id=session_id,
