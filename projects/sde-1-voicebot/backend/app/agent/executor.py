@@ -7,7 +7,9 @@ behavior is the same as Week 1: one in-memory run, no durable history.
 """
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future
 from datetime import datetime
+from threading import Thread
 from typing import Literal
 
 from app.agent import tools
@@ -143,8 +145,10 @@ def execute(
       dependency, cycle) raise ``WorkflowPolicyError`` before any tool runs.
     - A rejected or expired approval cancels the run with zero tool calls.
     - Retries apply only to idempotent tools and are bounded by ``max_retries``.
-    - Timeouts need ``clock``; a step that overruns ``step_timeout_ms`` has its
-      output discarded. A consequential tool is never called a second time.
+    - Timeouts need ``clock``. A step that passes ``step_timeout_ms`` counts as
+      timed out and its output is discarded, even if the tool is still blocked.
+      A timed-out tool cannot be killed; see ``_call_with_deadline``.
+    - A consequential tool is never called a second time.
 
     This call has no durable history. Calling it again may run the same steps again.
     """
@@ -291,6 +295,31 @@ def execute(
     )
 
 
+def _call_with_deadline(
+    call: ToolInvoker,
+    tool_name: str,
+    arguments: Mapping[str, str],
+    timeout_ms: int,
+) -> str:
+    """Run a tool on a daemon thread and stop waiting at the deadline.
+
+    Raises ``TimeoutError`` at the deadline. Python cannot kill a thread, so a
+    blocked tool keeps running in the background and any late result is ignored.
+    The caller must treat a timed-out call's effect as unknown: that is why only
+    idempotent tools are retried.
+    """
+    outcome: Future[str] = Future()
+
+    def run() -> None:
+        try:
+            outcome.set_result(call(tool_name, arguments))
+        except Exception as error:
+            outcome.set_exception(error)
+
+    Thread(target=run, name=f"workflow-{tool_name}", daemon=True).start()
+    return outcome.result(timeout=timeout_ms / 1000)
+
+
 def _run_step(
     step: WorkflowStep,
     *,
@@ -310,7 +339,12 @@ def _run_step(
         started = clock() if clock is not None else None
         failure: str | None = None
         try:
-            output = call(step.tool_name, step.arguments)
+            if step_timeout_ms is None:
+                output = call(step.tool_name, step.arguments)
+            else:
+                output = _call_with_deadline(
+                    call, step.tool_name, step.arguments, step_timeout_ms
+                )
         except TimeoutError:
             failure = "timeout"
         except TransientToolError:
