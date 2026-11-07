@@ -455,6 +455,24 @@ def test_transient_error_retries_and_zero_retries_means_one_call() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("behavior", "last_code"),
+    [
+        ("timeout", "REASONING_TIMEOUT"),
+        ("transient", "REASONING_PROVIDER_UNAVAILABLE"),
+    ],
+)
+def test_retry_exhausted_message_does_not_claim_a_cause(
+    behavior: str, last_code: str
+) -> None:
+    provider = MockLLMProvider([behavior, behavior])
+    outcome = LLMReasoningAdapter(provider).reason(request())
+    assert outcome.error is not None
+    assert outcome.error.code == "REASONING_RETRY_EXHAUSTED"
+    assert "in time" not in outcome.error.message_safe_for_user
+    assert outcome.error.details_redacted["last_error_code"] == last_code
+
+
 def test_provider_crash_is_not_retried_or_leaked() -> None:
     provider = MockLLMProvider(["crash"])
     outcome = LLMReasoningAdapter(provider, max_retries=3).reason(request())
