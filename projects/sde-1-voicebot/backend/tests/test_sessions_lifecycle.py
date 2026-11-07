@@ -37,6 +37,48 @@ def test_create_session_active_state(client):
     assert model.state == "active"
 
 
+def test_create_session_with_existing_id_returns_409(client):
+    """Attempting to create a session with an existing session_id returns 409."""
+    # First creation succeeds
+    resp1 = client.post(
+        "/api/sessions",
+        json={"session_id": "session-unique-abc", "initial_state": "active"},
+    )
+    assert resp1.status_code == 201
+
+    # Second creation without idempotency key returns 409 SESSION_ALREADY_EXISTS
+    resp2 = client.post(
+        "/api/sessions",
+        json={"session_id": "session-unique-abc", "initial_state": "created"},
+    )
+    assert resp2.status_code == 409
+    err = ErrorEnvelope.model_validate(resp2.json())
+    assert err.code == "SESSION_ALREADY_EXISTS"
+    assert err.details_redacted["session_id"] == "session-unique-abc"
+
+
+def test_create_session_existing_id_with_matching_idempotency_key(client):
+    """Re-creating with matching Idempotency-Key returns cached 201."""
+    key = "idem-key-create-existing-123"
+    headers = {"Idempotency-Key": key}
+
+    resp1 = client.post(
+        "/api/sessions",
+        json={"session_id": "session-idem-dup", "initial_state": "active"},
+        headers=headers,
+    )
+    assert resp1.status_code == 201
+
+    # Replay with same key and same session_id returns cached 201 response
+    resp2 = client.post(
+        "/api/sessions",
+        json={"session_id": "session-idem-dup", "initial_state": "active"},
+        headers=headers,
+    )
+    assert resp2.status_code == 201
+    assert resp2.json()["session_id"] == "session-idem-dup"
+
+
 def test_get_session_endpoint(client):
     """GET /api/sessions/{session_id} returns the current session state."""
     created = client.post("/api/sessions", json={"initial_state": "active"}).json()
@@ -83,7 +125,6 @@ def test_stop_session_lifecycle(client):
 
 def test_illegal_transition_returns_409(client):
     """Attempting illegal transition returns 409 INVALID_STATE_TRANSITION."""
-    # Pausing a session that is only in 'created' state is illegal
     created = client.post("/api/sessions", json={"initial_state": "created"}).json()
     sid = created["session_id"]
 
@@ -122,11 +163,9 @@ def test_explicit_expire_session(client):
 def test_automatic_ttl_expiry(client):
     """Session past TTL automatically transitions to expired on access."""
     now = datetime.now(timezone.utc)
-    # Create session with 10 second TTL
     record = session_service.create_session("sess-ttl", now=now, ttl_seconds=10)
     assert record.state == "created"
 
-    # Access after 15 seconds
     future_time = now + timedelta(seconds=15)
     expired_record = session_service.get_session("sess-ttl", now=future_time)
     assert expired_record is not None
