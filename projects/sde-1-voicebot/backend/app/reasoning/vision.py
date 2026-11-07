@@ -5,11 +5,17 @@ processing, downloads no model and calls no service.
 """
 
 from typing import Protocol
+from urllib.parse import quote
 
 from app.contracts.reasoning import ContextItem, ScreenContext, SourceReference
 from app.reasoning.capture import SyntheticFrame
 
 MAX_REGIONS = 50
+
+
+def _region_ref(frame_id: str, region_id: str) -> str:
+    """Join both IDs with ``#``, percent-encoding each so pairs cannot collide."""
+    return f"{quote(frame_id, safe='')}#{quote(region_id, safe='')}"
 
 
 class VisionAdapter(Protocol):
@@ -35,15 +41,15 @@ class MockVisionAdapter:
         for region_id, text in frame.text_regions[: self.max_regions]:
             if not region_id.strip() or not text.strip():
                 continue
-            item_id = f"{frame.frame_id}-{region_id}"
+            ref = _region_ref(frame.frame_id, region_id)
             items.append(
                 ContextItem(
-                    item_id=item_id,
+                    item_id=ref,
                     text=text,
                     source=SourceReference(
-                        source_id=item_id,
+                        source_id=ref,
                         kind="synthetic_screen",
-                        locator=f"{frame.frame_id}#{region_id}",
+                        locator=ref,
                     ),
                 )
             )
