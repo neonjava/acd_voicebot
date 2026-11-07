@@ -139,6 +139,25 @@ class TestTranscriptionOrchestrator:
         assert err.code == "TRANSCRIPTION_PERMANENT_ERROR"
         assert err.retryable is False
 
+    def test_orchestrator_returns_safe_error_for_malformed_provider_output(
+        self, sample_chunks, fixed_timestamp
+    ) -> None:
+        class MalformedAdapter(FakeTranscriber):
+            def transcribe(self, *args: object, **kwargs: object) -> object:
+                return None
+
+        orchestrator = TranscriptionOrchestrator(adapter=MalformedAdapter())
+        events = orchestrator.process_chunks(
+            sample_chunks,
+            session_id="session-orch",
+            correlation_id="corr-orch",
+            timestamp=fixed_timestamp,
+        )
+        assert [e.event_type for e in events] == ["transcript.error"]
+        assert isinstance(events[0].payload, ErrorEnvelope)
+        assert events[0].payload.code == "TRANSCRIPTION_MALFORMED_OUTPUT"
+        assert orchestrator.get_segments() == []
+
     def test_orchestrator_timeout_handling(
         self, sample_chunks, fixed_timestamp
     ) -> None:

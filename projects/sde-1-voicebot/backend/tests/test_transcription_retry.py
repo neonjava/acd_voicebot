@@ -406,6 +406,81 @@ class TestRetryPolicy:
         assert err.code == "TRANSCRIPTION_INTERNAL_ERROR"
         assert err.retryable is False
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            None,
+            7,
+            "provider secret text",
+            ["provider secret text"],
+            [{"event_type": "transcript.segment"}],
+            {"events": []},
+        ],
+    )
+    def test_malformed_provider_output_is_safe_and_not_retried(
+        self, raw: object
+    ) -> None:
+        policy = RetryPolicy(max_retries=2)
+        call_count = 0
+
+        def action() -> list[TranscriptEvent]:
+            nonlocal call_count
+            call_count += 1
+            return raw  # type: ignore[return-value]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess", correlation_id="corr", timestamp=ts
+        )
+        assert call_count == 1
+        assert attempts == 1
+        assert len(events) == 1
+        assert events[0].event_type == "transcript.error"
+        err = events[0].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_MALFORMED_OUTPUT"
+        assert err.retryable is False
+        assert "secret" not in events[0].model_dump_json()
+
+    def test_malformed_batch_with_one_valid_event_is_rejected_whole(self) -> None:
+        policy = RetryPolicy(max_retries=2)
+
+        def action() -> list[TranscriptEvent]:
+            return [_make_success_event(), "bad"]  # type: ignore[list-item]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess-retry", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 1
+        assert [e.event_type for e in events] == ["transcript.error"]
+
+    def test_malformed_output_keeps_segments_from_earlier_attempts(self) -> None:
+        policy = RetryPolicy(max_retries=2)
+        results: list[object] = [
+            [
+                _make_success_event(),
+                _make_error_event("TRANSCRIPTION_TEMPORARY_ERROR", retryable=True),
+            ],
+            None,
+        ]
+
+        def action() -> list[TranscriptEvent]:
+            return results.pop(0)  # type: ignore[return-value]
+
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        events, attempts = policy.execute_with_retry(
+            action, session_id="sess-retry", correlation_id="corr", timestamp=ts
+        )
+        assert attempts == 2
+        assert [e.event_type for e in events] == [
+            "transcript.segment",
+            "transcript.error",
+        ]
+        err = events[1].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_MALFORMED_OUTPUT"
+
     def test_retry_policy_emits_unique_error_event_ids_across_calls(self) -> None:
         """Successive failing calls to execute_with_retry emit distinct event_ids."""
         policy = RetryPolicy(max_retries=1)
