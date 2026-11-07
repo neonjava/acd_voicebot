@@ -39,12 +39,41 @@ def test_redact_transcript_text():
     assert "[REDACTED_TEXT]" in sanitized
 
 
+def test_redact_transcript_text_with_escaped_quotes():
+    """Transcript text with escaped quotes must not leak any content."""
+    raw = '{"text": "my password is \\"hunter2\\" and card 4111"}'
+    sanitized = redact_sensitive_data(raw)
+    assert sanitized == '{"text": "[REDACTED_TEXT]"}'
+    assert "hunter2" not in sanitized
+    assert "4111" not in sanitized
+    assert "password" not in sanitized
+
+
+def test_redact_transcript_text_with_backslashes():
+    """Transcript text with backslashes must not leak any content."""
+    raw = r'{"transcript": "system path C:\\Users\\secret\\notes.txt and trailing \\"}'
+    sanitized = redact_sensitive_data(raw)
+    assert sanitized == '{"transcript": "[REDACTED_TEXT]"}'
+    assert "secret" not in sanitized
+    assert "notes" not in sanitized
+    assert "Users" not in sanitized
+
+
 def test_redact_screen_context():
     """Screen context details must be redacted."""
     raw = '{"screen_context": "Financial bank account statement"}'
     sanitized = redact_sensitive_data(raw)
     assert "Financial bank account" not in sanitized
     assert "[REDACTED_SCREEN]" in sanitized
+
+
+def test_redact_screen_context_with_escaped_quotes_and_backslashes():
+    """Screen data with escaped quotes and backslashes must be redacted completely."""
+    raw = r'{"screen_context": "captured window \"C:\\confidential\\doc.pdf\" end"}'
+    sanitized = redact_sensitive_data(raw)
+    assert sanitized == '{"screen_context": "[REDACTED_SCREEN]"}'
+    assert "confidential" not in sanitized
+    assert "doc.pdf" not in sanitized
 
 
 def test_structured_formatter_output():
