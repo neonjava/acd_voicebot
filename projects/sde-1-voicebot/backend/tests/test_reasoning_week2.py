@@ -170,7 +170,7 @@ def test_mock_vision_maps_regions_to_source_linked_items() -> None:
     assert captured is not None
     context = MockVisionAdapter().extract(captured, capture_enabled=True)
     assert context.capture_enabled is True
-    assert [i.item_id for i in context.items] == ["frame-1-title", "frame-1-st"]
+    assert [i.item_id for i in context.items] == ["frame-1#title", "frame-1#st"]
     assert context.items[0].source.locator == "frame-1#title"
     assert context.items[0].source.kind == "synthetic_screen"
 
@@ -189,6 +189,36 @@ def test_mock_vision_needs_a_captured_frame_and_caps_regions() -> None:
     )
     context = MockVisionAdapter(max_regions=2).extract(stamped, capture_enabled=False)
     assert len(context.items) == 2
+
+
+def stamped_frame(frame_id: str, region_id: str) -> SyntheticFrame:
+    return SyntheticFrame(
+        frame_id=frame_id,
+        width=1,
+        height=1,
+        image_bytes=b"",
+        text_regions=((region_id, "text"),),
+        captured_at=T0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (("a", "b-c"), ("a-b", "c")),
+        (("a", "b#c"), ("a#b", "c")),
+        (("a%23b", "c"), ("a#b", "c")),
+    ],
+)
+def test_mock_vision_ids_do_not_collide(
+    first: tuple[str, str], second: tuple[str, str]
+) -> None:
+    adapter = MockVisionAdapter()
+    one = adapter.extract(stamped_frame(*first), capture_enabled=True).items[0]
+    two = adapter.extract(stamped_frame(*second), capture_enabled=True).items[0]
+    assert one.item_id != two.item_id
+    assert one.source.source_id != two.source.source_id
+    assert one.source.locator != two.source.locator
 
 
 @pytest.mark.parametrize("bad", [0, MAX_REGIONS + 1, True])
