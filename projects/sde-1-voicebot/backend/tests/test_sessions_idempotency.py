@@ -93,9 +93,38 @@ def test_idempotency_key_deduplication_pause(client):
     assert resp2.json() == resp1.json()
 
 
+def test_idempotency_key_cross_session_reuse_rejected(client):
+    """Reusing an Idempotency-Key across two different sessions returns 409."""
+    sa = client.post("/api/sessions", json={"initial_state": "active"}).json()[
+        "session_id"
+    ]
+    sb = client.post("/api/sessions", json={"initial_state": "active"}).json()[
+        "session_id"
+    ]
+
+    key = "shared-idem-key-999"
+    headers = {"Idempotency-Key": key}
+
+    # Pause session sa with key
+    resp_a = client.post(f"/api/sessions/{sa}/pause", headers=headers)
+    assert resp_a.status_code == 200
+    assert resp_a.json()["session_id"] == sa
+    assert resp_a.json()["state"] == "paused"
+
+    # Pause session sb with the SAME key -> must return 409 conflict
+    resp_b = client.post(f"/api/sessions/{sb}/pause", headers=headers)
+    assert resp_b.status_code == 409
+    err = ErrorEnvelope.model_validate(resp_b.json())
+    assert err.code == "IDEMPOTENCY_CONFLICT"
+    assert err.details_redacted["cached_session_id"] == sa
+
+    # sb must remain active, not mutated
+    sb_record = client.get(f"/api/sessions/{sb}").json()
+    assert sb_record["state"] == "active"
+
+
 def test_invalid_idempotency_key_rejected(client):
     """Invalid Idempotency-Key format returns 422 error envelope."""
-    # Key with invalid characters (spaces)
     headers = {"Idempotency-Key": "invalid key with spaces"}
     resp = client.post("/api/sessions", headers=headers)
     assert resp.status_code == 422

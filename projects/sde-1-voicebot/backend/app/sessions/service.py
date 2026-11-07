@@ -64,12 +64,42 @@ class SessionNotFoundError(Exception):
         self.session_id = session_id
 
 
+class SessionAlreadyExistsError(Exception):
+    """Raised when creating a session with an ID that already exists."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Session already exists: {session_id}")
+        self.session_id = session_id
+
+
 class SessionExpiredError(Exception):
     """Raised when performing an action on an expired session."""
 
     def __init__(self, session_id: str) -> None:
         super().__init__(f"Session has expired: {session_id}")
         self.session_id = session_id
+
+
+class IdempotencyConflictError(Exception):
+    """Raised when an idempotency key is reused for a different session or action."""
+
+    def __init__(
+        self,
+        key: str,
+        cached_action: str,
+        cached_session_id: str,
+        requested_action: str,
+        requested_session_id: str,
+    ) -> None:
+        super().__init__(
+            f"Idempotency key '{key}' was already used for action '{cached_action}' "
+            f"and session '{cached_session_id}'"
+        )
+        self.key = key
+        self.cached_action = cached_action
+        self.cached_session_id = cached_session_id
+        self.requested_action = requested_action
+        self.requested_session_id = requested_session_id
 
 
 class MissingDependencyError(RuntimeError):
@@ -99,7 +129,7 @@ class SessionService:
     def __init__(self) -> None:
         self._sessions: dict[str, SessionRecord] = {}
         self._session_events: dict[str, list[SessionEvent]] = {}
-        self._idempotency_cache: dict[tuple[str, str], IdempotencyRecord] = {}
+        self._idempotency_cache: dict[str, IdempotencyRecord] = {}
 
     def clear(self) -> None:
         """Clear all sessions and caches (primarily for test isolation)."""
@@ -117,6 +147,9 @@ class SessionService:
     ) -> SessionRecord:
         """Create a new session in 'created' or 'active' state with TTL expiry."""
         sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
+        if sid in self._sessions:
+            raise SessionAlreadyExistsError(sid)
+
         timestamp = now or datetime.now(timezone.utc)
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -202,7 +235,6 @@ class SessionService:
                 SessionState.paused,
             )
         ):
-            # Session expired
             self.transition(session_id, SessionState.expired, now=current_time)
             raise SessionExpiredError(session_id)
 
@@ -229,7 +261,6 @@ class SessionService:
         if not session:
             raise SessionNotFoundError(session_id)
         if session.state == SessionState.paused:
-            # Idempotent no-op
             return session
         if session.state == SessionState.expired:
             raise SessionExpiredError(session_id)
@@ -243,7 +274,6 @@ class SessionService:
         if not session:
             raise SessionNotFoundError(session_id)
         if session.state == SessionState.active:
-            # Idempotent no-op
             return session
         if session.state == SessionState.expired:
             raise SessionExpiredError(session_id)
@@ -257,13 +287,11 @@ class SessionService:
         if not session:
             raise SessionNotFoundError(session_id)
         if session.state == SessionState.completed:
-            # Idempotent no-op
             return session
         if session.state == SessionState.expired:
             raise SessionExpiredError(session_id)
 
         current_time = now or datetime.now(timezone.utc)
-        # Direct active/paused -> completed
         return self.transition(session_id, SessionState.completed, now=current_time)
 
     def expire_session(
@@ -301,25 +329,45 @@ class SessionService:
         from_sequence: int = 0,
         limit: int = 100,
     ) -> list[SessionEvent]:
-        """Retrieve ordered events for a session with sequence offset and limit."""
+        """Retrieve ordered events for a session using session-wide index and limit."""
         if session_id not in self._sessions:
             raise SessionNotFoundError(session_id)
 
         all_events = self._session_events.get(session_id, [])
-        filtered = [
-            evt
-            for evt in all_events
-            if getattr(evt.payload, "sequence_id", 0) >= from_sequence
-        ]
-        return filtered[:limit]
+        return all_events[from_sequence : from_sequence + limit]
 
     # --- Idempotency helpers ---
 
     def get_idempotent_result(
-        self, idempotency_key: str, action: str
+        self,
+        idempotency_key: str,
+        action: str,
+        session_id: str | None = None,
     ) -> IdempotencyRecord | None:
-        """Look up cached response for an idempotency key and action."""
-        return self._idempotency_cache.get((idempotency_key, action))
+        """Look up cached response and verify action and session_id match."""
+        cached = self._idempotency_cache.get(idempotency_key)
+        if not cached:
+            return None
+
+        if session_id is not None and cached.session_id != session_id:
+            raise IdempotencyConflictError(
+                idempotency_key,
+                cached.action,
+                cached.session_id,
+                action,
+                session_id,
+            )
+
+        if cached.action != action:
+            raise IdempotencyConflictError(
+                idempotency_key,
+                cached.action,
+                cached.session_id,
+                action,
+                session_id or "",
+            )
+
+        return cached
 
     def record_idempotent_result(
         self,
@@ -341,7 +389,7 @@ class SessionService:
             response_body=response_body,
             created_at=timestamp,
         )
-        self._idempotency_cache[(idempotency_key, action)] = record
+        self._idempotency_cache[idempotency_key] = record
         return record
 
     def to_state_response(self, record: SessionRecord) -> SessionStateResponse:
@@ -381,12 +429,7 @@ class SessionService:
         injected_events: list[SessionEvent] | None = None,
         use_synthetic_fixture: bool = False,
     ) -> MockSessionResponse:
-        """Execute a complete mock session path: created -> active -> completed.
-
-        In production runtime, calls actual W1 audio and W2 transcription mocks.
-        If dependencies are missing, raises MissingDependencyError to report
-        blockers instead of silently inventing fake events.
-        """
+        """Execute a complete mock session path: created -> active -> completed."""
         sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
         cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
         ts = timestamp or datetime.now(timezone.utc)
@@ -403,7 +446,6 @@ class SessionService:
             if injected_events is not None:
                 events = list(injected_events)
             elif use_synthetic_fixture:
-                # Deterministic baseline fixture only used by explicit fixture tests
                 audio_chunk_meta = AudioChunkMetadata(
                     sequence_id=0,
                     start_ms=0,
@@ -447,7 +489,6 @@ class SessionService:
                 )
                 events.append(transcript_evt)
             else:
-                # Runtime path: require actual modules or report missing dependency
                 if (
                     importlib.util.find_spec("app.audio.source") is None
                     or importlib.util.find_spec("app.audio.chunker") is None
@@ -457,7 +498,6 @@ class SessionService:
                 if importlib.util.find_spec("app.transcription.mock") is None:
                     raise MissingDependencyError("app.transcription (W2)")
 
-                # Import directly without broad try-except to avoid masking bugs
                 from app.audio.chunker import chunk_pcm
                 from app.audio.source import make_fake_pcm
                 from app.transcription.mock import FakeTranscriber
@@ -505,12 +545,9 @@ class SessionService:
             # Store events into buffer
             self._session_events[sid] = list(events)
 
-            # Only mark it completed after response validation succeeds
             self.transition(sid, SessionState.completed, now=ts)
             return response
         except Exception:
-            # Transition stored session to failed on dependency, producer,
-            # or validation failure.
             self.transition(sid, SessionState.failed, now=ts)
             raise
 
