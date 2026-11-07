@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.contracts.common import ContractModel, ErrorEnvelope
 
@@ -93,7 +93,12 @@ class ReasoningResult(ContractModel):
 
 
 class CaptureSettings(ContractModel):
-    """Opt-in screen-context capture settings. Capture is off unless enabled."""
+    """Opt-in screen-context capture settings. Capture is off unless enabled.
+
+    Frozen so the opt-in and limits cannot be changed without validation.
+    """
+
+    model_config = ConfigDict(frozen=True)
 
     enabled: bool = False
     sampling_interval_ms: int = Field(default=2000, ge=500, le=60_000, strict=True)
