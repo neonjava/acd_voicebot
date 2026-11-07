@@ -21,7 +21,7 @@ REDACTION_PATTERNS = [
     # Token / secret / password query params or JSON keys
     (
         re.compile(
-            r'("(?:token|secret|password|api_key|access_token|key)"\s*:\s*")[^"]+(")',
+            r'("(?:token|secret|password|api_key|access_token|key)"\s*:\s*")(?:[^"\\]|\\.)*(")',
             re.IGNORECASE,
         ),
         r"\1[REDACTED]\2",
@@ -40,13 +40,16 @@ REDACTION_PATTERNS = [
     ),
     # Raw transcript content leak patterns
     (
-        re.compile(r'("(?:transcript|text)"\s*:\s*")[^"]+(")', re.IGNORECASE),
+        re.compile(
+            r'("(?:transcript|text)"\s*:\s*")(?:[^"\\]|\\.)*(")',
+            re.IGNORECASE,
+        ),
         r"\1[REDACTED_TEXT]\2",
     ),
     # Screen capture content patterns
     (
         re.compile(
-            r'("(?:screen_context|image_bytes|frame_data)"\s*:\s*")[^"]+(")',
+            r'("(?:screen_context|image_bytes|frame_data)"\s*:\s*")(?:[^"\\]|\\.)*(")',
             re.IGNORECASE,
         ),
         r"\1[REDACTED_SCREEN]\2",
