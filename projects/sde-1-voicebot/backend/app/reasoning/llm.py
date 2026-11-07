@@ -170,7 +170,7 @@ class LLMReasoningAdapter:
             self.max_retries + 1,
             error=self._error(
                 "REASONING_RETRY_EXHAUSTED",
-                "The reasoning provider did not respond in time.",
+                "The reasoning provider could not complete the request.",
                 retryable=False,
                 last_error_code=last_code,
                 attempts=str(self.max_retries + 1),
