@@ -146,6 +146,16 @@ def test_capture_settings_are_bounded(bad: dict[str, object]) -> None:
         CaptureSettings(**bad)
 
 
+@pytest.mark.parametrize(("name", "value"), [("enabled", True), ("max_width", 99_999)])
+def test_capture_settings_cannot_be_changed_in_place(name: str, value: object) -> None:
+    settings = CaptureSettings()
+    adapter = SyntheticCaptureAdapter([frame()], settings=settings)
+    for target in (settings, adapter.settings):
+        with pytest.raises(ValidationError):
+            setattr(target, name, value)
+    assert adapter.capture(T0).status == "disabled"
+
+
 @pytest.mark.parametrize("bad", ["", "   ", None])
 def test_capture_rejects_blank_correlation_id(bad: object) -> None:
     with pytest.raises(ValueError, match="correlation_id"):
