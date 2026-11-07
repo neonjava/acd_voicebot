@@ -25,7 +25,7 @@ from app.reasoning.context_builder import (
     candidates_from_transcript,
 )
 from app.reasoning.llm import LLMReasoningAdapter, MockLLMProvider, load_prompt
-from app.reasoning.vision import MockVisionAdapter
+from app.reasoning.vision import MAX_REGIONS, MockVisionAdapter
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -146,6 +146,12 @@ def test_capture_settings_are_bounded(bad: dict[str, object]) -> None:
         CaptureSettings(**bad)
 
 
+@pytest.mark.parametrize("bad", ["", "   ", None])
+def test_capture_rejects_blank_correlation_id(bad: object) -> None:
+    with pytest.raises(ValueError, match="correlation_id"):
+        SyntheticCaptureAdapter([], correlation_id=bad)  # type: ignore[arg-type]
+
+
 def test_capture_rejects_naive_time() -> None:
     adapter = SyntheticCaptureAdapter([frame()])
     with pytest.raises(ValueError, match="UTC"):
@@ -185,6 +191,16 @@ def test_mock_vision_needs_a_captured_frame_and_caps_regions() -> None:
     assert len(context.items) == 2
 
 
+@pytest.mark.parametrize("bad", [0, MAX_REGIONS + 1, True])
+def test_mock_vision_rejects_region_cap_outside_limit(bad: int) -> None:
+    with pytest.raises(ValueError, match="max_regions"):
+        MockVisionAdapter(max_regions=bad)
+
+
+def test_mock_vision_accepts_region_cap_at_limit() -> None:
+    assert MockVisionAdapter(max_regions=MAX_REGIONS).max_regions == MAX_REGIONS
+
+
 # --- Context builder ---------------------------------------------------------
 
 
@@ -208,6 +224,26 @@ def test_relevant_items_win_and_output_is_chronological() -> None:
     assert [i.item_id for i in built.items] == ["billing", "status"]
     assert built.dropped_over_budget == ["weather"]
     assert built.used_tokens <= built.token_budget
+
+
+@pytest.mark.parametrize(
+    ("relevant", "unrelated", "question"),
+    [
+        ("ಬಿಲ್ ಸ್ಥಿತಿ ಬಾಕಿ", "ಹವಾಮಾನ ಚೆನ್ನಾಗಿದೆ", "ಬಿಲ್ ಸ್ಥಿತಿ ಏನು?"),
+        ("बिल की स्थिति बाकी", "मौसम अच्छा है", "बिल की स्थिति क्या है?"),
+        ("Café fermé demain", "Météo agréable ici", "Le café est fermé?"),
+    ],
+)
+def test_non_english_keywords_rank_relevant_items_first(
+    relevant: str, unrelated: str, question: str
+) -> None:
+    built = build_context(
+        [candidate("relevant", relevant, 1000), candidate("newer", unrelated, 2000)],
+        question=question,
+        now=at(3000),
+        token_budget=max(approx_tokens(relevant), approx_tokens(unrelated)),
+    )
+    assert [i.item_id for i in built.items] == ["relevant"]
 
 
 def test_recency_breaks_relevance_ties() -> None:
@@ -431,6 +467,8 @@ def test_malformed_output_is_rejected(raw: str) -> None:
         (_raw(source_ids=["invented"]), "unknown_source"),
         (_raw(answer="a" * 2001), "answer_too_long"),
         (_raw(answer="bell\x07"), "control_characters"),
+        (_raw(answer="delete\x7f"), "control_characters"),
+        (_raw(answer="next-line\x85"), "control_characters"),
     ],
 )
 def test_unsafe_output_is_rejected(raw: str, reason: str) -> None:

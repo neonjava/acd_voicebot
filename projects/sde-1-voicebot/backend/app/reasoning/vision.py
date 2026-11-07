@@ -22,8 +22,8 @@ class MockVisionAdapter:
     """Turn synthetic text regions into source-linked context items."""
 
     def __init__(self, *, max_regions: int = MAX_REGIONS) -> None:
-        if type(max_regions) is not int or max_regions <= 0:
-            raise ValueError("max_regions must be a positive integer")
+        if type(max_regions) is not int or not 0 < max_regions <= MAX_REGIONS:
+            raise ValueError(f"max_regions must be an integer from 1 to {MAX_REGIONS}")
         self.max_regions = max_regions
 
     def extract(self, frame: SyntheticFrame, *, capture_enabled: bool) -> ScreenContext:

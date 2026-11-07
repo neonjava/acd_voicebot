@@ -72,6 +72,8 @@ class SyntheticCaptureAdapter:
         settings: CaptureSettings | None = None,
         correlation_id: str = "capture-mock",
     ) -> None:
+        if not isinstance(correlation_id, str) or not correlation_id.strip():
+            raise ValueError("correlation_id must be a nonblank string")
         self._frames = list(frames)
         self._settings = settings if settings is not None else CaptureSettings()
         self._correlation_id = correlation_id

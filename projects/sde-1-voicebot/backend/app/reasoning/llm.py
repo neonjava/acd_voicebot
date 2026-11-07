@@ -8,6 +8,7 @@ network, model download or API key.
 """
 
 import math
+import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, Protocol
@@ -216,6 +217,9 @@ class LLMReasoningAdapter:
             return "unknown_source"
         if len(result.answer) > self.max_answer_chars:
             return "answer_too_long"
-        if any(ord(ch) < 32 and ch not in "\n\t" for ch in result.answer):
+        if any(
+            unicodedata.category(ch) == "Cc" and ch not in "\n\t"
+            for ch in result.answer
+        ):
             return "control_characters"
         return None

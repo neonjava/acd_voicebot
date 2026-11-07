@@ -4,10 +4,14 @@ Token count is approximated as ceil(characters / 4), at least 1 per item. This
 is a documented estimate, not a real tokenizer. Item text is never rewritten or
 truncated, so source references stay exact; an item that does not fit is left
 out instead.
+
+Keywords work for any script that separates words with spaces. Scripts without
+spaces, such as Chinese, Japanese and Thai, are not segmented, so those items
+rarely match and rank by recency instead.
 """
 
 import math
-import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -16,7 +20,6 @@ from app.contracts.reasoning import ContextItem, ScreenContext
 from app.contracts.transcription import TranscriptSegment
 from app.reasoning.context import context_item_from_transcript
 
-_WORD = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
     {"the", "and", "for", "are", "was", "what", "with", "this", "that", "does"}
 )
@@ -32,10 +35,19 @@ def approx_tokens(text: str) -> int:
 
 
 def _keywords(text: str) -> set[str]:
+    """Split on anything but letters, combining marks and digits.
+
+    Marks are kept because Indic vowel signs are part of a word, and Python's
+    ``\\w`` does not match them. Non-ASCII words may be two characters long.
+    """
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    spaced = "".join(
+        ch if unicodedata.category(ch)[0] in "LMN" else " " for ch in normalized
+    )
     return {
         word
-        for word in _WORD.findall(text.lower())
-        if len(word) >= 3 and word not in _STOPWORDS
+        for word in spaced.split()
+        if len(word) >= (3 if word.isascii() else 2) and word not in _STOPWORDS
     }
 
 
