@@ -13,6 +13,8 @@ class RetryPolicy:
     - Retries only when error is marked retryable or has a recognized retryable code.
     - Non-retryable errors return immediately without retry.
     - If retries are exhausted, emits a normalized TRANSCRIPTION_RETRY_EXHAUSTED error.
+    - Output that is not a list of TranscriptEvent values is not retried and becomes
+      a safe TRANSCRIPTION_MALFORMED_OUTPUT error.
     - Enforces max_retries >= 0.
     """
 
@@ -108,6 +110,32 @@ class RetryPolicy:
                         "attempt": str(attempts),
                         "exception_type": type(exc).__name__,
                     },
+                )
+                err_event = TranscriptEvent(
+                    event_id=(
+                        f"event-transcript-err-{session_id}-{batch_key}-{attempts}"
+                    ),
+                    event_type="transcript.error",
+                    schema_version="1.0",
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    producer="transcription",
+                    payload=err_envelope,
+                )
+                return [*accumulated_success_events.values(), err_event], attempts
+
+            if not isinstance(events, list) or not all(
+                isinstance(evt, TranscriptEvent) for evt in events
+            ):
+                err_envelope = ErrorEnvelope(
+                    code="TRANSCRIPTION_MALFORMED_OUTPUT",
+                    message_safe_for_user=(
+                        "The transcription provider returned an invalid response."
+                    ),
+                    retryable=False,
+                    correlation_id=correlation_id,
+                    details_redacted={"attempt": str(attempts)},
                 )
                 err_event = TranscriptEvent(
                     event_id=(
