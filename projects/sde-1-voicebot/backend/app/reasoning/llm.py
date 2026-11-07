@@ -7,6 +7,7 @@ a safe ``ErrorEnvelope``. The default provider is a deterministic mock: no
 network, model download or API key.
 """
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, Protocol
@@ -32,7 +33,9 @@ class ProviderTransientError(Exception):
 class LLMProvider(Protocol):
     def complete(
         self, *, system_prompt: str, request_json: str, timeout_seconds: float
-    ) -> str: ...
+    ) -> str:
+        """Return a ``ReasoningResult`` JSON object, as the system prompt requires."""
+        ...
 
 
 MockBehavior = Literal["ok", "timeout", "transient", "crash"]
@@ -88,16 +91,16 @@ class LLMReasoningAdapter:
         max_answer_chars: int = 2000,
         correlation_id: str = "reasoning-mock",
     ) -> None:
-        if (
-            type(timeout_seconds) not in (int, float)
-            or timeout_seconds <= 0
-            or timeout_seconds != timeout_seconds
+        if type(timeout_seconds) not in (int, float) or not (
+            0 < timeout_seconds < math.inf
         ):
-            raise ValueError("timeout_seconds must be a positive number")
+            raise ValueError("timeout_seconds must be a positive finite number")
         if type(max_retries) is not int or max_retries < 0:
             raise ValueError("max_retries must be a nonnegative integer")
         if type(max_answer_chars) is not int or max_answer_chars <= 0:
             raise ValueError("max_answer_chars must be a positive integer")
+        if not isinstance(correlation_id, str) or not correlation_id.strip():
+            raise ValueError("correlation_id must be a nonblank string")
         self.provider = provider if provider is not None else MockLLMProvider()
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = max_retries
