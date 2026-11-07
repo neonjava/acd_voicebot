@@ -11,6 +11,7 @@ from app.contracts.reasoning import (
     ContextItem,
     ReasoningOutcome,
     ReasoningRequest,
+    ReasoningResult,
     ScreenContext,
     SourceReference,
 )
@@ -454,14 +455,35 @@ def test_answer_at_length_limit_with_newline_is_accepted() -> None:
     [
         {"timeout_seconds": 0},
         {"timeout_seconds": float("nan")},
+        {"timeout_seconds": float("inf")},
+        {"timeout_seconds": float("-inf")},
         {"max_retries": -1},
         {"max_retries": True},
         {"max_answer_chars": 0},
+        {"correlation_id": ""},
+        {"correlation_id": "   "},
+        {"correlation_id": None},
     ],
 )
 def test_adapter_rejects_bad_settings(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         LLMReasoningAdapter(**kwargs)  # type: ignore[arg-type]
+
+
+def test_custom_correlation_id_reaches_the_error_outcome() -> None:
+    adapter = LLMReasoningAdapter(
+        MockLLMProvider(["crash"]), correlation_id="corr-custom"
+    )
+    outcome = adapter.reason(request())
+    assert outcome.error is not None
+    assert outcome.error.correlation_id == "corr-custom"
+
+
+def test_prompt_tells_providers_the_required_result_shape() -> None:
+    prompt = load_prompt("v1")
+    assert "exactly one JSON object" in prompt
+    for field in ReasoningResult.model_fields:
+        assert field in prompt
 
 
 def test_outcome_contract_requires_exactly_one_branch() -> None:
