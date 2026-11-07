@@ -36,6 +36,10 @@ class BoundedAudioBuffer:
             self.late_chunks += 1
             return False
 
+        if len(self._chunks) >= self.capacity_chunks:
+            self.dropped_chunks += 1
+            return False
+
         if self._last_sequence is not None:
             self.sequence_gaps += chunk.sequence_id - self._last_sequence - 1
             if chunk.start_ms > self._last_end_ms:
@@ -43,9 +47,6 @@ class BoundedAudioBuffer:
         self._session_id = chunk.session_id
         self._last_sequence = chunk.sequence_id
         self._last_end_ms = chunk.start_ms + chunk.duration_ms
-        if len(self._chunks) >= self.capacity_chunks:
-            self.dropped_chunks += 1
-            return False
         self._chunks.append(chunk)
         return True
 
