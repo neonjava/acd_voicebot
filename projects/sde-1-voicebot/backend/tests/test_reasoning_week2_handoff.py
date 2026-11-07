@@ -59,4 +59,4 @@ def test_w1_w2_final_segment_reaches_grounded_w3_result() -> None:
     )
     assert outcome.result is not None
     assert segments[0].segment_id in outcome.result.source_ids
-    assert "frame-0-status" in outcome.result.source_ids
+    assert "frame-0#status" in outcome.result.source_ids
