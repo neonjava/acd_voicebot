@@ -1,11 +1,11 @@
-"""Week 1 context and reasoning contracts owned by W3."""
+"""Context and reasoning contracts owned by W3."""
 
 from datetime import datetime, timezone
 from typing import Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
-from app.contracts.common import ContractModel
+from app.contracts.common import ContractModel, ErrorEnvelope
 
 
 class SourceReference(ContractModel):
@@ -89,4 +89,47 @@ class ReasoningResult(ContractModel):
             raise ValueError("insufficient evidence cannot cite sources")
         if not self.insufficient_evidence and not self.source_ids:
             raise ValueError("a grounded result must cite a source")
+        return self
+
+
+class CaptureSettings(ContractModel):
+    """Opt-in screen-context capture settings. Capture is off unless enabled.
+
+    Frozen so the opt-in and limits cannot be changed without validation.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    sampling_interval_ms: int = Field(default=2000, ge=500, le=60_000, strict=True)
+    max_frame_bytes: int = Field(default=2_000_000, gt=0, le=10_000_000, strict=True)
+    max_width: int = Field(default=1920, gt=0, le=7680, strict=True)
+    max_height: int = Field(default=1080, gt=0, le=4320, strict=True)
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def require_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("enabled must be a boolean")
+        return value
+
+
+class ReasoningOutcome(ContractModel):
+    """Either a validated result or a safe error, never both."""
+
+    request_id: str = Field(min_length=1, pattern=r"\S")
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    result: ReasoningResult | None = None
+    error: ErrorEnvelope | None = None
+    attempts: int = Field(ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def exactly_one(self) -> Self:
+        if (self.result is None) == (self.error is None):
+            raise ValueError("outcome needs exactly one of result or error")
+        if self.result is not None and (
+            self.result.request_id != self.request_id
+            or self.result.session_id != self.session_id
+        ):
+            raise ValueError("result must match the outcome request and session")
         return self
