@@ -29,7 +29,8 @@ export type SessionUiState =
   | 'paused'
   | 'stopping'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  | 'expired';
 
 export type ClientSourceMode = 'http' | 'fixture-week2' | 'fixture-canonical';
 
@@ -60,6 +61,15 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   const [isTransitioning, setIsTransitioning] = useState<boolean>(false);
 
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+
+  // A session is in progress until it reaches a terminal or idle state. 'stopping' counts:
+  // it can still become completed or failed, so Start stays disabled while local Stop
+  // remains available to reset the view.
+  const isSessionInProgress =
+    uiState === 'connecting' ||
+    uiState === 'active' ||
+    uiState === 'paused' ||
+    uiState === 'stopping';
   const [revisionCounts, setRevisionCounts] = useState<Map<string, number>>(new Map());
   const [audioEvents, setAudioEvents] = useState<EventEnvelope<AudioChunkMetadata>[]>([]);
 
@@ -206,12 +216,41 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      if (response.state === 'active') {
-        setUiState('active');
-        setStatusMessage(`Session ${response.session_id} active. Processing events...`);
-      } else {
-        setUiState('completed');
-        setStatusMessage(`Session ${response.session_id} completed successfully.`);
+      // Map every backend lifecycle state explicitly; only 'completed' reports success
+      const sid = response.session_id;
+      switch (response.state) {
+        case 'active':
+          setUiState('active');
+          setStatusMessage(`Session ${sid} active. Processing events...`);
+          break;
+        case 'paused':
+          setUiState('paused');
+          setStatusMessage(`Session ${sid} is paused. Resume to continue.`);
+          break;
+        case 'completed':
+          setUiState('completed');
+          setStatusMessage(`Session ${sid} completed successfully.`);
+          break;
+        case 'failed':
+          setUiState('failed');
+          setStatusMessage(`Session ${sid} failed on the backend.`);
+          break;
+        case 'expired':
+          setUiState('expired');
+          setStatusMessage(`Session ${sid} expired before it could complete. Start a new session.`);
+          break;
+        case 'stopping':
+          setUiState('stopping');
+          setStatusMessage(`Session ${sid} is stopping. It has not completed yet; Start stays disabled until it ends.`);
+          break;
+        case 'created':
+          setUiState('idle');
+          setStatusMessage(`Session ${sid} was created but has not started yet.`);
+          break;
+        default: {
+          const unhandled: never = response.state;
+          throw new Error(`Unhandled session state: ${String(unhandled)}`);
+        }
       }
     } catch (err) {
       if (sessionToken !== currentSessionTokenRef.current) {
@@ -355,7 +394,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Escape stops active or paused session
       if (e.key === 'Escape') {
-        if (uiState === 'connecting' || uiState === 'active' || uiState === 'paused') {
+        if (isSessionInProgress) {
           e.preventDefault();
           handleStop();
         }
@@ -365,7 +404,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       // Alt+S triggers Start
       if (e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
-        if (uiState !== 'connecting' && uiState !== 'active' && uiState !== 'paused') {
+        if (!isSessionInProgress) {
           handleStart();
         }
         return;
@@ -392,7 +431,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       // Alt+X triggers Stop
       if (e.altKey && (e.key === 'x' || e.key === 'X')) {
         e.preventDefault();
-        if (uiState === 'connecting' || uiState === 'active' || uiState === 'paused') {
+        if (isSessionInProgress) {
           handleStop();
         }
         return;
@@ -403,13 +442,10 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [uiState, backendSessionState, isTransitioning, handleStart, handlePause, handleResume, handleStop]);
 
-  const isStartDisabled = uiState === 'connecting' || uiState === 'active' || uiState === 'paused';
+  const isStartDisabled = isSessionInProgress;
   const isPauseDisabled = backendSessionState !== 'active' || isTransitioning;
   const isResumeDisabled = backendSessionState !== 'paused' || isTransitioning;
-  const isStopDisabled =
-    uiState !== 'connecting' &&
-    uiState !== 'active' &&
-    uiState !== 'paused';
+  const isStopDisabled = !isSessionInProgress;
 
   return (
     <div
@@ -460,7 +496,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
               setPermission(newPerm);
               setError(null);
             }}
-            disabled={uiState === 'connecting' || uiState === 'active' || uiState === 'paused'}
+            disabled={isSessionInProgress}
           />
 
           {/* Client Mode Selector */}
@@ -487,7 +523,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     value="http"
                     checked={clientMode === 'http'}
                     onChange={() => setClientMode('http')}
-                    disabled={uiState === 'connecting' || uiState === 'active' || uiState === 'paused'}
+                    disabled={isSessionInProgress}
                   />
                   <span>HTTP API (Vite proxy to :8000)</span>
                 </label>
@@ -498,7 +534,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     value="fixture-week2"
                     checked={clientMode === 'fixture-week2'}
                     onChange={() => setClientMode('fixture-week2')}
-                    disabled={uiState === 'connecting' || uiState === 'active' || uiState === 'paused'}
+                    disabled={isSessionInProgress}
                   />
                   <span>Synthetic Fixture (Week 2 Active Streaming)</span>
                 </label>
@@ -509,7 +545,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     value="fixture-canonical"
                     checked={clientMode === 'fixture-canonical'}
                     onChange={() => setClientMode('fixture-canonical')}
-                    disabled={uiState === 'connecting' || uiState === 'active' || uiState === 'paused'}
+                    disabled={isSessionInProgress}
                   />
                   <span>Canonical Fixture (Week 1 Completed Run)</span>
                 </label>
@@ -631,7 +667,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                 backgroundColor:
                   uiState === 'completed'
                     ? '#d4edda'
-                    : uiState === 'failed'
+                    : uiState === 'failed' || uiState === 'expired'
                     ? '#f8d7da'
                     : uiState === 'connecting' || uiState === 'active'
                     ? '#cce5ff'
@@ -641,7 +677,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                 color:
                   uiState === 'completed'
                     ? '#155724'
-                    : uiState === 'failed'
+                    : uiState === 'failed' || uiState === 'expired'
                     ? '#721c24'
                     : uiState === 'connecting' || uiState === 'active'
                     ? '#004085'
@@ -670,7 +706,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     ? '#fff3cd'
                     : backendSessionState === 'completed'
                     ? '#e2e3e5'
-                    : backendSessionState === 'failed'
+                    : backendSessionState === 'failed' || backendSessionState === 'expired'
                     ? '#f8d7da'
                     : '#ffffff',
                 color:
@@ -680,7 +716,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     ? '#664d03'
                     : backendSessionState === 'completed'
                     ? '#41464b'
-                    : backendSessionState === 'failed'
+                    : backendSessionState === 'failed' || backendSessionState === 'expired'
                     ? '#842029'
                     : '#6c757d',
                 fontWeight: 600,
