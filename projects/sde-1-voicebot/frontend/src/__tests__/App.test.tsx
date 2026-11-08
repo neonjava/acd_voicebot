@@ -621,6 +621,121 @@ describe('Voicebot App Component', () => {
     expect(screen.queryByText(/completed successfully/i)).not.toBeInTheDocument();
   });
 
+  describe('maps every initial backend lifecycle state explicitly', () => {
+    type Controls = { start: boolean; pause: boolean; resume: boolean; stop: boolean };
+    const cases: Array<{
+      state: MockSessionResponse['state'];
+      ui: string;
+      message: RegExp;
+      enabled: Controls;
+    }> = [
+      {
+        state: 'active',
+        ui: 'active',
+        message: /active\. Processing events/i,
+        enabled: { start: false, pause: true, resume: false, stop: true },
+      },
+      {
+        state: 'paused',
+        ui: 'paused',
+        message: /is paused\. Resume to continue/i,
+        enabled: { start: false, pause: false, resume: true, stop: true },
+      },
+      {
+        state: 'completed',
+        ui: 'completed',
+        message: /completed successfully/i,
+        enabled: { start: true, pause: false, resume: false, stop: false },
+      },
+      {
+        state: 'failed',
+        ui: 'failed',
+        message: /failed on the backend/i,
+        enabled: { start: true, pause: false, resume: false, stop: false },
+      },
+      {
+        state: 'expired',
+        ui: 'expired',
+        message: /expired before it could complete/i,
+        enabled: { start: true, pause: false, resume: false, stop: false },
+      },
+      {
+        state: 'stopping',
+        ui: 'stopping',
+        message: /is stopping\. It has not completed yet/i,
+        enabled: { start: true, pause: false, resume: false, stop: false },
+      },
+      {
+        state: 'created',
+        ui: 'idle',
+        message: /was created but has not started yet/i,
+        enabled: { start: true, pause: false, resume: false, stop: false },
+      },
+    ];
+
+    it.each(cases)('$state response shows UI $ui with matching status and controls', async (c) => {
+      const response: MockSessionResponse = {
+        ...baselineSessionResponse,
+        state: c.state,
+      };
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue(response),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(
+          new RegExp(`Backend: ${c.state}`, 'i')
+        );
+      });
+
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(new RegExp(`UI: ${c.ui}$`, 'i'));
+      expect(screen.getByText(c.message)).toBeInTheDocument();
+
+      const check = (id: string, enabled: boolean) => {
+        const el = screen.getByTestId(id);
+        if (enabled) {
+          expect(el).toBeEnabled();
+        } else {
+          expect(el).toBeDisabled();
+        }
+      };
+      check('start-button', c.enabled.start);
+      check('pause-button', c.enabled.pause);
+      check('resume-button', c.enabled.resume);
+      check('stop-button', c.enabled.stop);
+
+      if (c.state !== 'completed') {
+        expect(screen.queryByText(/completed successfully/i)).not.toBeInTheDocument();
+      }
+    });
+
+    it('resumes a session that started paused using the verified backend state', async () => {
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          ...baselineSessionResponse,
+          state: 'paused',
+        }),
+        resumeSession: vi.fn().mockResolvedValue('active'),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+      await waitFor(() => {
+        expect(screen.getByTestId('resume-button')).toBeEnabled();
+      });
+
+      fireEvent.click(screen.getByTestId('resume-button'));
+      await waitFor(() => {
+        expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: active/i);
+      });
+      expect(mockClient.resumeSession).toHaveBeenCalledWith(baselineSessionResponse.session_id, expect.anything());
+      expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: active/i);
+    });
+  });
+
   it('clears prior session timeline, audio events, and sessionId when a new session starts', async () => {
     let resolveSession2: (val: MockSessionResponse) => void = () => {};
     const session2Promise = new Promise<MockSessionResponse>((resolve) => {

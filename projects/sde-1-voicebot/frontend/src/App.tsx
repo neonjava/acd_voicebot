@@ -29,7 +29,8 @@ export type SessionUiState =
   | 'paused'
   | 'stopping'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  | 'expired';
 
 export type ClientSourceMode = 'http' | 'fixture-week2' | 'fixture-canonical';
 
@@ -206,12 +207,41 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      if (response.state === 'active') {
-        setUiState('active');
-        setStatusMessage(`Session ${response.session_id} active. Processing events...`);
-      } else {
-        setUiState('completed');
-        setStatusMessage(`Session ${response.session_id} completed successfully.`);
+      // Map every backend lifecycle state explicitly; only 'completed' reports success
+      const sid = response.session_id;
+      switch (response.state) {
+        case 'active':
+          setUiState('active');
+          setStatusMessage(`Session ${sid} active. Processing events...`);
+          break;
+        case 'paused':
+          setUiState('paused');
+          setStatusMessage(`Session ${sid} is paused. Resume to continue.`);
+          break;
+        case 'completed':
+          setUiState('completed');
+          setStatusMessage(`Session ${sid} completed successfully.`);
+          break;
+        case 'failed':
+          setUiState('failed');
+          setStatusMessage(`Session ${sid} failed on the backend. No results were completed.`);
+          break;
+        case 'expired':
+          setUiState('expired');
+          setStatusMessage(`Session ${sid} expired before it could complete. Start a new session.`);
+          break;
+        case 'stopping':
+          setUiState('stopping');
+          setStatusMessage(`Session ${sid} is stopping. It has not completed yet.`);
+          break;
+        case 'created':
+          setUiState('idle');
+          setStatusMessage(`Session ${sid} was created but has not started yet.`);
+          break;
+        default: {
+          const unhandled: never = response.state;
+          throw new Error(`Unhandled session state: ${String(unhandled)}`);
+        }
       }
     } catch (err) {
       if (sessionToken !== currentSessionTokenRef.current) {
@@ -631,7 +661,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                 backgroundColor:
                   uiState === 'completed'
                     ? '#d4edda'
-                    : uiState === 'failed'
+                    : uiState === 'failed' || uiState === 'expired'
                     ? '#f8d7da'
                     : uiState === 'connecting' || uiState === 'active'
                     ? '#cce5ff'
@@ -641,7 +671,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                 color:
                   uiState === 'completed'
                     ? '#155724'
-                    : uiState === 'failed'
+                    : uiState === 'failed' || uiState === 'expired'
                     ? '#721c24'
                     : uiState === 'connecting' || uiState === 'active'
                     ? '#004085'
@@ -670,7 +700,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     ? '#fff3cd'
                     : backendSessionState === 'completed'
                     ? '#e2e3e5'
-                    : backendSessionState === 'failed'
+                    : backendSessionState === 'failed' || backendSessionState === 'expired'
                     ? '#f8d7da'
                     : '#ffffff',
                 color:
@@ -680,7 +710,7 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
                     ? '#664d03'
                     : backendSessionState === 'completed'
                     ? '#41464b'
-                    : backendSessionState === 'failed'
+                    : backendSessionState === 'failed' || backendSessionState === 'expired'
                     ? '#842029'
                     : '#6c757d',
                 fontWeight: 600,
