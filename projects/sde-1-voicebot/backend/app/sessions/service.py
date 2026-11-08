@@ -534,6 +534,12 @@ class SessionService:
                 )
                 events.extend(transcript_events)
 
+            # Apply the same per-session cap that add_event enforces
+            if len(events) > settings.max_events_per_session:
+                raise ValueError(
+                    f"Session event limit ({settings.max_events_per_session}) reached"
+                )
+
             # Build and validate response FIRST before marking completed
             response = MockSessionResponse(
                 session_id=sid,

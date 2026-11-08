@@ -196,3 +196,61 @@ def test_run_mock_session_marks_completed_only_after_validation_succeeds(service
     record = service.get_session("session-completed-check")
     assert record is not None
     assert record.state == SessionState.completed
+
+
+def _mock_run_events(session_id: str, count: int) -> list[TranscriptEvent]:
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        TranscriptEvent(
+            event_id=f"evt-cap-{i}",
+            event_type="transcript.segment",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id="corr-cap",
+            timestamp=ts,
+            producer="transcription",
+            payload=TranscriptSegment(
+                segment_id=f"seg-{i}",
+                session_id=session_id,
+                sequence_id=i,
+                start_ms=i * 100,
+                end_ms=i * 100 + 100,
+                text=f"segment {i}",
+                is_final=True,
+            ),
+        )
+        for i in range(count)
+    ]
+
+
+def test_run_mock_session_rejects_events_over_session_cap(service, monkeypatch):
+    """A mock run producing more events than the cap fails and stores none."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "max_events_per_session", 2)
+    sid = "session-over-cap"
+
+    with pytest.raises(ValueError, match="event limit"):
+        service.run_mock_session(
+            session_id=sid, injected_events=_mock_run_events(sid, 3)
+        )
+
+    record = service.get_session(sid)
+    assert record is not None
+    assert record.state == SessionState.failed
+    assert service.get_events(sid) == []
+
+
+def test_run_mock_session_accepts_events_at_session_cap(service, monkeypatch):
+    """Exactly the cap is allowed, matching add_event."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "max_events_per_session", 2)
+    sid = "session-at-cap"
+
+    resp = service.run_mock_session(
+        session_id=sid, injected_events=_mock_run_events(sid, 2)
+    )
+
+    assert resp.state == "completed"
+    assert len(service.get_events(sid)) == 2
