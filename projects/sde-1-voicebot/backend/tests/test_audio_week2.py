@@ -99,7 +99,7 @@ def test_buffer_overflow_backpressure_gaps_and_late_chunk() -> None:
     assert buffer.dropped_chunks == 1
     assert [c.sequence_id for c in buffer.drain()] == [0, 1]
     assert buffer.push(chunk(4, 80))
-    assert buffer.sequence_gaps == 1
+    assert buffer.sequence_gaps == 2  # 2 was dropped and 3 has not arrived
     assert buffer.time_gaps == 1
     assert not buffer.push(chunk(3, 60))
     assert buffer.late_chunks == 1
@@ -110,6 +110,28 @@ def test_buffer_overflow_backpressure_gaps_and_late_chunk() -> None:
     buffer.release()
     assert len(buffer) == 0
     assert buffer.push(chunk(0, 0))
+
+
+def test_chunk_rejected_when_full_can_be_retried_after_drain() -> None:
+    buffer = BoundedAudioBuffer(capacity_chunks=1)
+    assert buffer.push(chunk(0, 0))
+    assert not buffer.push(chunk(1, 20))
+    assert buffer.dropped_chunks == 1
+    assert [c.sequence_id for c in buffer.drain()] == [0]
+
+    assert buffer.push(chunk(1, 20))
+    assert buffer.late_chunks == 0
+    assert buffer.sequence_gaps == 0
+    assert buffer.time_gaps == 0
+    assert [c.sequence_id for c in buffer.drain()] == [1]
+
+
+def test_gap_is_not_counted_for_a_rejected_chunk() -> None:
+    buffer = BoundedAudioBuffer(capacity_chunks=1)
+    assert buffer.push(chunk(0, 0))
+    assert not buffer.push(chunk(5, 100))
+    assert buffer.sequence_gaps == 0
+    assert buffer.time_gaps == 0
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True, 1.5])
