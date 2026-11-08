@@ -3,6 +3,8 @@
 import json
 import logging
 
+import pytest
+
 from app.sessions.logging import (
     StructuredRedactingFormatter,
     current_correlation_id,
@@ -130,3 +132,27 @@ def test_structured_formatter_hides_raw_stack_trace():
     assert data["exception_class"] == "ValueError"
     # Ensure raw trace is not dumped into message
     assert "Traceback" not in formatted
+
+
+@pytest.mark.parametrize(
+    ("message", "leaked"),
+    [
+        ("auth Bearer abc/secret== done", "/secret"),
+        ("auth Bearer abc+def.ghi done", "+def.ghi"),
+        ("auth Bearer abc~def_ghi-jkl done", "~def"),
+    ],
+)
+def test_redact_bearer_tokens_with_punctuation(message, leaked):
+    """The whole bearer token is redacted, including '/', '+', '=' and '~'."""
+    sanitized = redact_sensitive_data(message)
+    assert sanitized == "auth Bearer [REDACTED] done"
+    assert leaked not in sanitized
+
+
+def test_redact_bearer_token_stops_at_json_quote_and_separators():
+    """Redaction ends at a closing quote, comma or semicolon, keeping the rest."""
+    sanitized = redact_sensitive_data(
+        '{"authorization": "Bearer abc/def==", "path": "/x"}; next'
+    )
+    assert sanitized == '{"authorization": "Bearer [REDACTED]", "path": "/x"}; next'
+    assert redact_sensitive_data("Bearer abc/def,rest") == "Bearer [REDACTED],rest"

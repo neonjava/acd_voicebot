@@ -17,7 +17,7 @@ current_session_id: ContextVar[str] = ContextVar("current_session_id", default="
 # Redaction patterns
 REDACTION_PATTERNS = [
     # Authorization header / Bearer tokens
-    (re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]+", re.IGNORECASE), "Bearer [REDACTED]"),
+    (re.compile(r"Bearer\s+[^\s\"',;]+", re.IGNORECASE), "Bearer [REDACTED]"),
     # Token / secret / password query params or JSON keys
     (
         re.compile(

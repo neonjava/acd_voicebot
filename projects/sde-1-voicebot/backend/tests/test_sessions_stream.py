@@ -174,6 +174,88 @@ def test_stream_session_events_sse(client):
     assert '"state": "completed"' in text
 
 
+def test_stream_drains_all_events_after_terminal_state(client):
+    """A completed session with more than 200 events streams every event in order."""
+    sid = "sess-stream-drain"
+    session_service.create_session(sid, initial_state="active")
+    ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    total = 260
+    for i in range(total):
+        session_service.add_event(
+            sid,
+            TranscriptEvent(
+                event_id=f"evt-drain-{i}",
+                event_type="transcript.segment",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id="corr-drain",
+                timestamp=ts,
+                producer="transcription",
+                payload=TranscriptSegment(
+                    segment_id=f"seg-{i}",
+                    session_id=sid,
+                    sequence_id=i,
+                    start_ms=i * 10,
+                    end_ms=i * 10 + 10,
+                    text=f"segment {i}",
+                    confidence=1.0,
+                    language="en",
+                    is_final=True,
+                ),
+            ),
+        )
+    session_service.stop_session(sid)
+
+    resp = client.get(f"/api/sessions/{sid}/events/stream")
+    assert resp.status_code == 200
+    text = resp.text
+    assert text.count("event: session.event") == total
+    assert text.count("event: session.status") == 1
+    assert text.rstrip().endswith('"state": "completed"}')
+    ids = [f'"event_id": "evt-drain-{i}"' for i in range(total)]
+    positions = [text.index(event_id) for event_id in ids]
+    assert positions == sorted(positions)
+
+
+def test_stream_from_sequence_drains_rest_after_terminal_state(client):
+    """Starting mid-history still returns every later event before the status."""
+    sid = "sess-stream-drain-cursor"
+    session_service.create_session(sid, initial_state="active")
+    ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(230):
+        session_service.add_event(
+            sid,
+            TranscriptEvent(
+                event_id=f"evt-cur-{i}",
+                event_type="transcript.segment",
+                schema_version="1.0",
+                session_id=sid,
+                correlation_id="corr-drain",
+                timestamp=ts,
+                producer="transcription",
+                payload=TranscriptSegment(
+                    segment_id=f"seg-{i}",
+                    session_id=sid,
+                    sequence_id=i,
+                    start_ms=i * 10,
+                    end_ms=i * 10 + 10,
+                    text=f"segment {i}",
+                    confidence=1.0,
+                    language="en",
+                    is_final=True,
+                ),
+            ),
+        )
+    session_service.stop_session(sid)
+
+    resp = client.get(f"/api/sessions/{sid}/events/stream?from_sequence=5")
+    text = resp.text
+    assert text.count("event: session.event") == 225
+    assert '"event_id": "evt-cur-4"' not in text
+    assert '"event_id": "evt-cur-5"' in text
+    assert '"event_id": "evt-cur-229"' in text
+
+
 def test_stream_session_events_live_delivery(client):
     """SSE delivers events added while stream is open until session completes."""
     sid = "sess-stream-live"
