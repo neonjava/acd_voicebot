@@ -739,19 +739,24 @@ async def stream_session_events(
             if not sess:
                 break
 
-            # If terminal state reached, send remaining events and complete
+            # If terminal state reached, drain every remaining event, then complete
             if sess.state in (
                 SessionState.completed,
                 SessionState.failed,
                 SessionState.expired,
             ):
-                remaining = session_service.get_events(
-                    session_id, from_sequence=cursor, limit=100
-                )
-                for evt in remaining:
-                    evt_data = evt.model_dump(mode="json")
-                    yield f"event: session.event\ndata: {json.dumps(evt_data)}\n\n"
-                    cursor += 1
+                while True:
+                    remaining = session_service.get_events(
+                        session_id, from_sequence=cursor, limit=100
+                    )
+                    if not remaining:
+                        break
+                    for evt in remaining:
+                        evt_data = evt.model_dump(mode="json")
+                        yield (
+                            f"event: session.event\ndata: {json.dumps(evt_data)}\n\n"
+                        )
+                        cursor += 1
 
                 status_data = json.dumps(
                     {"session_id": session_id, "state": sess.state.value}
