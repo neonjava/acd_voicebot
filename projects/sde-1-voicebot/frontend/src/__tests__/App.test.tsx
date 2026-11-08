@@ -663,7 +663,7 @@ describe('Voicebot App Component', () => {
         state: 'stopping',
         ui: 'stopping',
         message: /is stopping\. It has not completed yet/i,
-        enabled: { start: true, pause: false, resume: false, stop: false },
+        enabled: { start: false, pause: false, resume: false, stop: true },
       },
       {
         state: 'created',
@@ -710,6 +710,45 @@ describe('Voicebot App Component', () => {
       if (c.state !== 'completed') {
         expect(screen.queryByText(/completed successfully/i)).not.toBeInTheDocument();
       }
+    });
+
+    it('does not claim a failed session has no results when it returned events', async () => {
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({ ...baselineSessionResponse, state: 'failed' }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(screen.getByText(/failed on the backend/i)).toBeInTheDocument();
+      });
+      // The baseline response carries a final transcript, which stays visible
+      expect(screen.getByText('Hello from the mock voicebot.')).toBeInTheDocument();
+      expect(screen.queryByText(/no results/i)).not.toBeInTheDocument();
+    });
+
+    it('keeps Start blocked while stopping, including Alt+S, and lets local Stop reset', async () => {
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({ ...baselineSessionResponse, state: 'stopping' }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+      await waitFor(() => {
+        expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: stopping/i);
+      });
+
+      fireEvent.keyDown(window, { key: 's', altKey: true });
+      expect(mockClient.startMockSession).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('start-button')).toBeDisabled();
+
+      fireEvent.keyDown(window, { key: 'Escape' });
+      await waitFor(() => {
+        expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/UI: idle/i);
+      });
+      expect(screen.getByTestId('start-button')).toBeEnabled();
+      expect(screen.getByTestId('backend-state-indicator')).toHaveTextContent(/Backend: not_started/i);
     });
 
     it('resumes a session that started paused using the verified backend state', async () => {
