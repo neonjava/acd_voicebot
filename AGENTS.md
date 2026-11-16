@@ -2,7 +2,7 @@
 
 Work only with `neonjava/acd_voicebot`. Do not read, fetch, push to, or open PRs against the original provider repository unless Hemanth explicitly authorizes it later.
 
-Read the assigned issue, `projects/sde-1-voicebot/README.md`, and `projects/sde-1-voicebot/docs/contracts.md` before editing. Implement only that issue. Never generate a replacement application.
+Read the assigned issue, `projects/sde-1-voicebot/docs/product.md` (the product we are building), `projects/sde-1-voicebot/README.md`, and `projects/sde-1-voicebot/docs/contracts.md` before editing. Implement only that issue. Never generate a replacement application.
 
 - Team code belongs in `projects/sde-1-voicebot/`.
 - Base feature branches on `team/sde-1-voicebot`. PRs target that branch in `neonjava/acd_voicebot` explicitly.
@@ -10,7 +10,9 @@ Read the assigned issue, `projects/sde-1-voicebot/README.md`, and `projects/sde-
 - Use the contributor's existing Git identity. Do not impersonate another teammate.
 - Keep to the issue's allowed files. Ask Hemanth before changing another workstream or dependency configuration.
 - Shared contracts live once in `projects/sde-1-voicebot/backend/app/contracts/`. Frontend API types must follow the documented wire contract.
-- Mock mode is the default. No real microphone/screen capture, external messages, paid APIs, or model downloads for Week 1.
+- Mock mode is the default for tests, CI and demos. Real microphone, screen capture, local models and tools run only when enabled by config, as the issue describes. Never paid APIs, cloud keys or external messages.
+- Tests must fail without the feature they cover. No tests that only assert a mock was called, no skipped or empty tests, no snapshot-only tests. Never weaken or delete an existing test to make it pass.
+- No new dependency unless the issue names it. Optional real-provider packages are already declared as `uv` extras (`audio`, `stt`, `system`); do not move them into the default dependencies.
 - Never commit secrets, recordings, private screenshots, personal data, virtual environments, or node_modules.
 - Run the issue's checks; report actual output and any unavailable checks. Do not claim an unrun test passed.
 - Add meaningful tests with production code. Each member has one weekly issue; a follow-up test PR under that same issue adds boundary/failure coverage.
