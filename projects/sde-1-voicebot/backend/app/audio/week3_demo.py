@@ -130,9 +130,12 @@ def run_mock_demo() -> int:
     return 0
 
 
-def run_mic_demo(*, duration_ms: int = 5000, chunk_ms: int = 20) -> int:
+def run_mic_demo(
+    *, duration_ms: int = 5000, chunk_ms: int = 20, config: AudioConfig | None = None
+) -> int:
     """Run live capture using SoundDeviceMicrophone and OpenWakeWordDetector."""
-    config = AudioConfig(audio_source="mic")
+    base = config if config is not None else AudioConfig.from_env()
+    config = base.model_copy(update={"audio_source": "mic"})
     device = create_audio_device(config)
     detector = create_wake_word_detector(config)
     buffer = BoundedAudioBuffer(capacity_chunks=512)
@@ -190,12 +193,18 @@ def run_mic_demo(*, duration_ms: int = 5000, chunk_ms: int = 20) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    env_config = AudioConfig.from_env()
     parser = argparse.ArgumentParser(description="Week 3 audio speech-events demo")
-    parser.add_argument("--source", choices=("mock", "mic"), default="mock")
+    parser.add_argument(
+        "--source",
+        choices=("mock", "mic"),
+        default=env_config.audio_source,
+        help="defaults to AUDIO_SOURCE (mock when unset)",
+    )
     parser.add_argument("--duration-ms", type=int, default=5000)
     args = parser.parse_args(argv)
     if args.source == "mic":
-        return run_mic_demo(duration_ms=args.duration_ms)
+        return run_mic_demo(duration_ms=args.duration_ms, config=env_config)
     return run_mock_demo()
 
 

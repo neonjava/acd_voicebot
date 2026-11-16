@@ -54,6 +54,9 @@ class AudioConfig(ContractModel):
     wake_threshold: float = 0.5
     silence_timeout_ms: StrictInt = Field(default=2000, gt=0)
     speech_end_silence_ms: StrictInt = Field(default=400, gt=0)
+    # One utterance is cut here; bounds memory and the Silero score cache, and
+    # matches Whisper's 30 s window.
+    max_utterance_ms: StrictInt = Field(default=30_000, gt=0, le=35_000)
     vad_provider: Literal["auto", "mock", "silero"] = "auto"
     vad_threshold: float = 0.1
     vad_min_speech_ms: StrictInt = Field(default=40, gt=0)
@@ -86,6 +89,7 @@ class AudioConfig(ContractModel):
             wake_threshold=_parse_float_env("AUDIO_WAKE_THRESHOLD", 0.5),
             silence_timeout_ms=_parse_int_env("AUDIO_SILENCE_TIMEOUT_MS", 2000),
             speech_end_silence_ms=_parse_int_env("AUDIO_SPEECH_END_SILENCE_MS", 400),
+            max_utterance_ms=_parse_int_env("AUDIO_MAX_UTTERANCE_MS", 30_000),
             vad_provider=vad_provider,  # type: ignore[arg-type]
             vad_threshold=_parse_float_env("AUDIO_VAD_THRESHOLD", 0.1),
             vad_min_speech_ms=_parse_int_env("AUDIO_VAD_MIN_SPEECH_MS", 40),

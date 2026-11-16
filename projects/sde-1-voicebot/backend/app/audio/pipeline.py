@@ -182,6 +182,7 @@ class SpeechPipeline:
         out_events: list[SpeechEvent],
         out_chunks: list[AudioChunk],
         out_transcripts: list[TranscriptEvent],
+        keep_listening: bool = False,
     ) -> None:
         if self._active_span_start is None or self._active_span_end is None:
             return
@@ -212,7 +213,7 @@ class SpeechPipeline:
         self._active_span_start = None
         self._active_span_end = None
         self._vad_window.clear()
-        if self.config.wake_required:
+        if self.config.wake_required and not keep_listening:
             self._listening = False
             self._silence_since_ms = None
         else:
@@ -360,7 +361,18 @@ class SpeechPipeline:
         else:
             self._active_span_end = span_end
 
-        if chunk_end_ms - span_end >= self.config.speech_end_silence_ms:
+        if chunk_end_ms - span_start >= self.config.max_utterance_ms:
+            # Very long speech is split; listening stays open so the rest of
+            # the sentence becomes the next utterance instead of being lost.
+            self._active_span_end = chunk_end_ms
+            self._close_active_span(
+                timestamp=timestamp,
+                out_events=out_events,
+                out_chunks=out_chunks,
+                out_transcripts=out_transcripts,
+                keep_listening=True,
+            )
+        elif chunk_end_ms - span_end >= self.config.speech_end_silence_ms:
             self._close_active_span(
                 timestamp=timestamp,
                 out_events=out_events,
