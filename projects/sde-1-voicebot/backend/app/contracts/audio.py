@@ -45,3 +45,32 @@ class AudioError(ErrorEnvelope):
     """Safe audio error data returned by a later CLI or API boundary."""
 
     code: str = Field(pattern=r"^AUDIO_.+")
+
+
+SpeechEventKind = Literal["wake", "speech_start", "speech_end"]
+
+
+class SpeechEvent(ContractModel):
+    """Normalized audio event (W1 produces; W2 and W5 consume). Never carries PCM.
+
+    ``sequence_id`` orders speech events within one session; ``at_ms`` is relative
+    to the audio stream start. ``wake_word`` and ``score`` are set only for ``wake``.
+    """
+
+    kind: SpeechEventKind
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    correlation_id: str = Field(min_length=1, pattern=r"\S")
+    sequence_id: int = Field(strict=True, ge=0)
+    at_ms: int = Field(strict=True, ge=0)
+    wake_word: str | None = Field(default=None, min_length=1, pattern=r"\S")
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def wake_fields_only_on_wake(self) -> Self:
+        is_wake = self.kind == "wake"
+        has_wake_fields = self.wake_word is not None and self.score is not None
+        if is_wake and not has_wake_fields:
+            raise ValueError("wake events need wake_word and score")
+        if not is_wake and (self.wake_word is not None or self.score is not None):
+            raise ValueError("wake_word and score are only allowed on wake events")
+        return self

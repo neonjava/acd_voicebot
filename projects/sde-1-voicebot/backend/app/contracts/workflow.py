@@ -60,6 +60,36 @@ class WorkflowPlan(ContractModel):
         return self
 
 
+class WorkflowProposal(ContractModel):
+    """A plan suggested by reasoning (W3) for the workflow module (W4) to validate.
+
+    A proposal never runs anything by itself. W4 turns it into a ``WorkflowPlan``
+    and applies its own registry and approval policy; a step's
+    ``requires_approval=False`` can never override a consequential tool.
+    """
+
+    proposal_id: str = Field(min_length=1, pattern=r"\S")
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    correlation_id: str = Field(min_length=1, pattern=r"\S")
+    summary: str = Field(min_length=1, max_length=500, pattern=r"\S")
+    steps: list[WorkflowStep] = Field(min_length=1, max_length=20)
+    source_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_steps_and_sources(self) -> Self:
+        ids = [step.step_id for step in self.steps]
+        if len(ids) != len(set(ids)):
+            raise ValueError("step IDs must be unique")
+        known = set(ids)
+        if any(dep not in known for step in self.steps for dep in step.depends_on):
+            raise ValueError("depends_on must reference steps in this proposal")
+        if any(not source.strip() for source in self.source_ids):
+            raise ValueError("source_ids must be nonblank")
+        if len(self.source_ids) != len(set(self.source_ids)):
+            raise ValueError("source_ids must be unique")
+        return self
+
+
 class ApprovalRequest(ContractModel):
     approval_id: str = Field(min_length=1, pattern=r"\S")
     plan_id: str = Field(min_length=1, pattern=r"\S")
