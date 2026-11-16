@@ -97,6 +97,30 @@ W6's client exposes `startMockSession(): Promise<MockSessionResponse>`. Keep fix
 UI permission states are visibly simulated: prompt/granted/denied/unavailable. Do not call getUserMedia. Start/stop are local controls for the finite mock run; late results after stop must not update the UI. Backend lifecycle endpoints/streaming/replay are later-week work.
 
 
+## Week 3 contracts (fixed before the Week 3 issues; change only through Hemanth)
+
+These are defined now so all six Week 3 branches can build against them in parallel. Product context: [product.md](product.md).
+
+### W1 → W2, W5: `SpeechEvent` (`app/contracts/audio.py`)
+
+- Fields: `kind` (`wake` | `speech_start` | `speech_end`), `session_id`, `correlation_id`, `sequence_id` (≥0, orders speech events within a session), `at_ms` (≥0, relative to stream start). `wake_word` and `score` (0–1) are required on `wake` and forbidden otherwise. No PCM.
+- Order for one utterance: `wake` → `speech_start` → `speech_end`. Audio chunks between start and end go to W2 as `AudioChunk` values, as in Week 2.
+- Session stream envelope: `event_type="audio.speech"`, `producer="audio"`, `payload=SpeechEvent`.
+
+### W3 → W4: `WorkflowProposal` (`app/contracts/workflow.py`)
+
+- Fields: `proposal_id`, `session_id`, `correlation_id`, `summary` (1–500 chars), `steps` (1–20 `WorkflowStep`, unique IDs, `depends_on` only inside the proposal), `source_ids` (unique, the evidence used).
+- A proposal never runs anything. W4 converts it to a `WorkflowPlan` and applies its registry and approval policy. A registry tool with `consequential=true` always needs approval, whatever the step says.
+- Safety classes (product.md §6): `consequential=false` = safe, runs directly (for example `system_stats`, `open_url` for allow-listed sites). `consequential=true` = ask first.
+
+### W5 → W6: local API additions (W5 implements, W6 consumes)
+
+- **Auth boundary:** Electron starts the backend with env `VOICEBOT_LAUNCH_TOKEN` (random per launch). Every `/api/*` request except `GET /api/health` must send `Authorization: Bearer <token>`. Missing or wrong token → 401 `ErrorEnvelope` with `code="AUTH_REQUIRED"`. With no token configured (tests, mock demo), auth is off and `/api/ready` reports `"auth":"off"`.
+- **Rate limit:** over the limit → 429 `ErrorEnvelope`, `code="RATE_LIMITED"`, `retryable=true`, and a `Retry-After` header in seconds.
+- **Health:** `GET /api/health` → `{"status":"ok"|"degraded"|"down","modules":{"audio":..,"transcription":..,"reasoning":..,"workflow":..}}`, each module `"ok"|"degraded"|"down"|"mock"`.
+- **Event stream:** the existing `GET /api/sessions/{id}/events` and `/events/stream` also carry `audio.speech` (payload `SpeechEvent`) and `workflow.audit` (payload `AuditEvent`) events. Reconnect: the client passes `from_sequence` = number of events already received; the server replays from there with no gaps or duplicates.
+- **Approvals:** `GET /api/sessions/{id}/approvals` → list of pending `ApprovalRequest`. `POST /api/sessions/{id}/approvals/{approval_id}` with body `{"decision":"approve"|"reject"}` → the updated `ApprovalRequest`. Deciding an expired or already-decided approval → 409 `ErrorEnvelope`. Rejecting never executes the step.
+
 ## File locations and handoffs
 
 All Python paths above are relative to `backend/app/`, except paths explicitly starting with `app/` which are relative to `backend/`. Import through `app`, e.g. `from app.contracts.audio import AudioChunk`. W4's module is `app.agent`, while its event producer remains "workflow" and its schema file remains `app/contracts/workflow.py`. W5 creates `app/main.py` and `app/__main__.py`; session logic belongs to `app/sessions/`. Do not create a second backend package.
