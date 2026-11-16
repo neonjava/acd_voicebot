@@ -114,6 +114,7 @@ class SileroVAD(MockVAD):
         self._model = model
         self._cache_size = cache_size
         self._scores: dict[int, float] = {}
+        self._window_floor = 0
 
     def _ensure_model(self) -> object:
         if self._model is not None:
@@ -156,9 +157,18 @@ class SileroVAD(MockVAD):
         score = max(0.0, min(1.0, raw)) if isfinite(raw) else 0.0
         self._scores[chunk.sequence_id] = score
         if len(self._scores) > self._cache_size:
-            for old in sorted(self._scores)[: len(self._scores) - self._cache_size]:
+            # Only drop scores for chunks older than the window being checked;
+            # a chunk still in the window must never be scored a second time.
+            for old in sorted(self._scores):
+                if len(self._scores) <= self._cache_size or old >= self._window_floor:
+                    break
                 del self._scores[old]
         return score
+
+    def detect(self, chunks: Sequence[AudioChunk]) -> list[SpeechSpan]:
+        if chunks:
+            self._window_floor = chunks[0].sequence_id
+        return super().detect(chunks)
 
     def _is_speech(self, chunk: AudioChunk) -> bool:
         return self.speech_probability(chunk) >= self.threshold

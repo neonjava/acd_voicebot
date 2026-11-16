@@ -167,6 +167,8 @@ class SoundDeviceMicrophone:
         self._permission = PermissionState.prompt
         self._selected: str | None = None
         self._stream: object | None = None
+        self._overrun_pending = False
+        self.overrun_count = 0
 
     @property
     def permission(self) -> PermissionState:
@@ -267,7 +269,7 @@ class SoundDeviceMicrophone:
             )
         frames = duration_ms * (self.format.sample_rate_hz // 1000)
         try:
-            data, _overflowed = self._stream.read(frames)  # type: ignore[attr-defined]
+            data, overflowed = self._stream.read(frames)  # type: ignore[attr-defined]
             pcm = bytes(data)
         except Exception as exc:
             self.close()
@@ -279,7 +281,18 @@ class SoundDeviceMicrophone:
             raise AudioDeviceError(
                 "AUDIO_DEVICE_LOST", "Audio device returned an incomplete read."
             )
+        if overflowed:
+            # Frames were dropped before this read. sounddevice does not say how
+            # many, so the controller marks a gap instead of faking continuity.
+            self._overrun_pending = True
+            self.overrun_count += 1
         return chunk_pcm(pcm, session_id=session_id, chunk_ms=chunk_ms)
+
+    def consume_overrun(self) -> bool:
+        """Return True once if input frames were lost before the latest read."""
+        pending = self._overrun_pending
+        self._overrun_pending = False
+        return pending
 
     def close(self) -> None:
         """Stop and close the underlying input stream if open."""

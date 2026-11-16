@@ -979,3 +979,127 @@ def test_idle_window_trim_keeps_enough_audio_for_the_active_vad_minimum() -> Non
         ("speech_start", 200),
         ("speech_end", 320),
     ]
+
+
+def test_mic_overrun_becomes_a_gap_and_splits_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lost mic frames must not be stitched into one continuous utterance."""
+    speech_pcm = make_chunk(0, 0, duration_ms=40).pcm
+    reads = iter([(speech_pcm, False), (speech_pcm, True), (speech_pcm, False)])
+
+    class FakeRawInputStream:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def read(self, frames: int) -> tuple[bytes, bool]:
+            return next(reads)
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    fake_sd = types.ModuleType("sounddevice")
+    fake_sd.query_devices = lambda: [  # type: ignore[attr-defined]
+        {"name": "Built-in Mic", "max_input_channels": 1}
+    ]
+    fake_sd.check_input_settings = lambda **kwargs: None  # type: ignore[attr-defined]
+    fake_sd.RawInputStream = FakeRawInputStream  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+
+    mic = SoundDeviceMicrophone()
+    buffer = BoundedAudioBuffer(capacity_chunks=16)
+    capture = AudioCaptureController(
+        session_id=SESSION_ID, device=mic, buffer=buffer, sleep_fn=lambda _s: None
+    )
+    capture.start(SoundDeviceMicrophone.DEVICE_ID)
+    for _ in range(3):
+        capture.produce(duration_ms=40, chunk_ms=20)
+    chunks = buffer.drain()
+
+    # Read 2 reported an overrun: one sequence ID and 20 ms are skipped before it.
+    assert [(c.sequence_id, c.start_ms) for c in chunks] == [
+        (0, 0),
+        (1, 20),
+        (3, 60),
+        (4, 80),
+        (5, 100),
+        (6, 120),
+    ]
+    assert capture.overruns == 1 and mic.overrun_count == 1
+
+    pipeline, _ = build_pipeline(wake_required=False, with_orchestrator=False)
+    result = pipeline.process_chunks(chunks, timestamp=FIXED_TS, final=True)
+    assert [(e.kind, e.at_ms) for e in result.speech_events] == [
+        ("speech_start", 0),
+        ("speech_end", 40),
+        ("speech_start", 60),
+        ("speech_end", 140),
+    ]
+
+
+def test_long_speech_is_split_at_max_utterance_without_closing_listening() -> None:
+    orch = TranscriptionOrchestrator()
+    pipeline = SpeechPipeline(
+        session_id=SESSION_ID,
+        correlation_id=CORRELATION_ID,
+        config=AudioConfig(
+            wake_required=True, max_utterance_ms=200, speech_end_silence_ms=20
+        ),
+        orchestrator=orch,
+    )
+    chunks = [wake_chunk(0, 0)] + [make_chunk(i, 20 * i) for i in range(1, 16)]
+    chunks.append(silence_chunk(16, 320))
+
+    result = pipeline.process_chunks(chunks, timestamp=FIXED_TS)
+
+    assert [(e.kind, e.at_ms) for e in result.speech_events] == [
+        ("wake", 0),
+        ("speech_start", 20),
+        ("speech_end", 220),
+        ("speech_start", 220),
+        ("speech_end", 320),
+    ]
+    # Nothing is lost between the two parts.
+    assert [c.sequence_id for c in result.utterance_chunks] == list(range(1, 16))
+    assert len(orch.get_segments()) == 2
+
+
+def test_silero_never_rescores_a_chunk_still_in_the_window() -> None:
+    model = _FakeSilero([0.9] * 12)
+    vad = SileroVAD(model=model, min_speech_ms=20, cache_size=4)
+    chunks = [silence_chunk(i, 20 * i) for i in range(12)]
+
+    for end in range(1, 13):
+        spans = vad.detect(chunks[:end])  # one growing window, longer than cache
+
+    assert len(model.calls) == 12
+    assert spans == [SpeechSpan(SESSION_ID, 0, 240)]
+
+
+def test_demo_source_defaults_to_audio_source_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.audio.week3_demo as demo
+
+    seen: dict[str, object] = {}
+
+    def fake_mic_demo(*, duration_ms: int, config: AudioConfig) -> int:
+        seen["duration_ms"] = duration_ms
+        seen["config"] = config
+        return 0
+
+    monkeypatch.setattr(demo, "run_mic_demo", fake_mic_demo)
+    monkeypatch.setenv("AUDIO_SOURCE", "mic")
+    monkeypatch.setenv("AUDIO_WAKE_THRESHOLD", "0.7")
+
+    assert demo.main(["--duration-ms", "1000"]) == 0
+    assert seen["duration_ms"] == 1000
+    config = seen["config"]
+    assert isinstance(config, AudioConfig)
+    assert config.audio_source == "mic" and config.wake_threshold == 0.7

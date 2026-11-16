@@ -51,6 +51,7 @@ class AudioCaptureController:
         self._device_id: str | None = None
         self.cancelled = False
         self.reconnect_count = 0
+        self.overruns = 0
         self.reconnect_backoffs_ms: list[int] = []
         self.last_error: AudioError | None = None
 
@@ -170,6 +171,14 @@ class AudioCaptureController:
             chunks = self._reconnect_and_read(
                 duration_ms=duration_ms, chunk_ms=chunk_ms
             )
+
+        consume_overrun = getattr(self.device, "consume_overrun", None)
+        if callable(consume_overrun) and consume_overrun() and chunks:
+            # Lost input frames: skip one sequence ID and one chunk of time so
+            # downstream sees a gap and never merges speech across missing audio.
+            self.overruns += 1
+            self._next_sequence += 1
+            self._next_start_ms += chunks[0].duration_ms
 
         retained = 0
         for chunk in chunks:
