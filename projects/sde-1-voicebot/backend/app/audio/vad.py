@@ -1,5 +1,6 @@
-"""Deterministic energy-based mock VAD over validated AudioChunk values."""
+"""Voice activity detection: deterministic energy mock and real Silero VAD."""
 
+import array
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
@@ -71,12 +72,7 @@ class MockVAD:
                 ):
                     finish()
 
-            samples = len(chunk.pcm) // 2
-            energy = sum(
-                abs(int.from_bytes(chunk.pcm[i : i + 2], "little", signed=True))
-                for i in range(0, len(chunk.pcm), 2)
-            ) / (samples * 32768)
-            if energy >= self.threshold:
+            if self._is_speech(chunk):
                 if active_start is None:
                     active_start = chunk.start_ms
                 active_end = chunk.start_ms + chunk.duration_ms
@@ -86,3 +82,83 @@ class MockVAD:
             previous_end = chunk.start_ms + chunk.duration_ms
         finish()
         return spans
+
+    def _is_speech(self, chunk: AudioChunk) -> bool:
+        samples = len(chunk.pcm) // 2
+        energy = sum(
+            abs(int.from_bytes(chunk.pcm[i : i + 2], "little", signed=True))
+            for i in range(0, len(chunk.pcm), 2)
+        ) / (samples * 32768)
+        return energy >= self.threshold
+
+
+class SileroVAD(MockVAD):
+    """Real speech detector: Silero VAD (shipped with openwakeword, audio extra).
+
+    Silero is a streaming model, so each chunk is scored exactly once, in order,
+    and the score is cached by sequence ID; ``detect`` may then be called on any
+    window of already-seen chunks. Span building is shared with ``MockVAD``.
+    """
+
+    def __init__(
+        self,
+        *,
+        threshold: float = 0.5,
+        min_speech_ms: int = 100,
+        model: object | None = None,
+        cache_size: int = 2000,
+    ) -> None:
+        super().__init__(threshold=threshold, min_speech_ms=min_speech_ms)
+        if type(cache_size) is not int or cache_size <= 0:
+            raise ValueError("cache_size must be a positive integer")
+        self._model = model
+        self._cache_size = cache_size
+        self._scores: dict[int, float] = {}
+
+    def _ensure_model(self) -> object:
+        if self._model is not None:
+            return self._model
+        try:
+            from openwakeword.vad import VAD
+        except ImportError as exc:
+            from app.audio.device import AudioDeviceError
+
+            raise AudioDeviceError(
+                "AUDIO_DEPENDENCY_MISSING",
+                "Real voice activity detection requires the audio extra.",
+            ) from exc
+        try:
+            self._model = VAD()
+        except Exception as exc:
+            from app.audio.device import AudioDeviceError
+
+            raise AudioDeviceError(
+                "AUDIO_VAD_MODEL_UNAVAILABLE",
+                "The voice activity model could not be loaded.",
+            ) from exc
+        return self._model
+
+    def speech_probability(self, chunk: AudioChunk) -> float:
+        """Return the cached Silero speech probability for one chunk."""
+        cached = self._scores.get(chunk.sequence_id)
+        if cached is not None:
+            return cached
+        model = self._ensure_model()
+        try:
+            import numpy as np
+
+            samples: object = np.frombuffer(chunk.pcm, dtype=np.int16)
+        except ImportError:  # only an injected test model runs without numpy
+            pcm_samples = array.array("h")
+            pcm_samples.frombytes(chunk.pcm)
+            samples = pcm_samples
+        raw = float(model.predict(samples, frame_size=len(chunk.pcm) // 2))  # type: ignore[attr-defined]
+        score = max(0.0, min(1.0, raw)) if isfinite(raw) else 0.0
+        self._scores[chunk.sequence_id] = score
+        if len(self._scores) > self._cache_size:
+            for old in sorted(self._scores)[: len(self._scores) - self._cache_size]:
+                del self._scores[old]
+        return score
+
+    def _is_speech(self, chunk: AudioChunk) -> bool:
+        return self.speech_probability(chunk) >= self.threshold
