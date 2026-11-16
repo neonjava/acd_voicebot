@@ -1,6 +1,6 @@
 # SDE 1 — one project, six assignments
 
-**Folders and documentation only. No application code has been generated.** Each person owns one weekly issue and works on their own branch. Hemanth assigns and reviews the work.
+**What we are building:** a local desktop voice co-pilot in a top-centre notch, woken by "Hey Jarvis". Read [docs/product.md](docs/product.md) first; every weekly issue builds toward it. Each person owns one weekly issue and works on their own branch. Hemanth assigns and reviews the work.
 
 ## Folder structure
 

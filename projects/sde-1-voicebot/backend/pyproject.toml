@@ -18,6 +18,17 @@ dev = [
     "pytest-asyncio>=0.25.0",
     "ruff>=0.8.0",
 ]
+# Real local providers (product target, docs/product.md). Never needed for tests or CI.
+audio = [
+    "sounddevice>=0.5.0",
+    "openwakeword>=0.6.0",
+]
+stt = [
+    "faster-whisper>=1.1.0",
+]
+system = [
+    "psutil>=6.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -38,3 +49,8 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = []
+
+[tool.uv]
+# openwakeword lists tflite-runtime on Linux, which has no Python 3.12 wheels.
+# We run its ONNX models through onnxruntime instead, so tflite-runtime is never installed.
+override-dependencies = ["tflite-runtime; python_version < '3.12'"]
