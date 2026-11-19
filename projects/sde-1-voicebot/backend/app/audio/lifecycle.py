@@ -3,10 +3,14 @@
 import time
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from app.audio.buffer import BoundedAudioBuffer
 from app.audio.device import AudioDevice, AudioDeviceError, PermissionState
 from app.contracts.audio import AudioChunk, AudioError
+
+if TYPE_CHECKING:
+    from app.audio.config import AudioConfig
 
 
 class CaptureState(str, Enum):
@@ -54,6 +58,28 @@ class AudioCaptureController:
         self.overruns = 0
         self.reconnect_backoffs_ms: list[int] = []
         self.last_error: AudioError | None = None
+
+    @classmethod
+    def from_config(
+        cls,
+        config: "AudioConfig",
+        *,
+        session_id: str,
+        correlation_id: str,
+        device: AudioDevice,
+        buffer: BoundedAudioBuffer,
+        sleep_fn: Callable[[float], None] | None = None,
+    ) -> "AudioCaptureController":
+        """Build a controller that uses the configured reconnect policy."""
+        return cls(
+            session_id=session_id,
+            correlation_id=correlation_id,
+            device=device,
+            buffer=buffer,
+            max_reconnect_attempts=config.reconnect_max_attempts,
+            reconnect_backoff_ms=config.reconnect_backoff_ms,
+            sleep_fn=sleep_fn,
+        )
 
     def start(self, device_id: str) -> None:
         if self.state is not CaptureState.created:

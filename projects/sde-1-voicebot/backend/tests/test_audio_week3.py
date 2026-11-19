@@ -1103,3 +1103,74 @@ def test_demo_source_defaults_to_audio_source_env(
     config = seen["config"]
     assert isinstance(config, AudioConfig)
     assert config.audio_source == "mic" and config.wake_threshold == 0.7
+
+
+@pytest.mark.parametrize(
+    ("attempts", "backoff_ms", "recovers", "expected_backoffs"),
+    [(0, 50, False, []), (2, 10, True, [10, 20])],
+)
+def test_capture_from_config_uses_configured_reconnect_policy(
+    attempts: int, backoff_ms: int, recovers: bool, expected_backoffs: list[int]
+) -> None:
+    config = AudioConfig(
+        reconnect_max_attempts=attempts, reconnect_backoff_ms=backoff_ms
+    )
+    device = MockAudioDevice()
+    slept: list[float] = []
+    capture = AudioCaptureController.from_config(
+        config,
+        session_id=SESSION_ID,
+        correlation_id=CORRELATION_ID,
+        device=device,
+        buffer=BoundedAudioBuffer(capacity_chunks=8),
+        sleep_fn=slept.append,
+    )
+    capture.start(MockAudioDevice.DEVICE_ID)
+    device.disconnect(failures_before_recover=1)
+
+    if recovers:
+        assert capture.produce(duration_ms=20, chunk_ms=20) == 1
+    else:
+        with pytest.raises(AudioDeviceError) as err:
+            capture.produce(duration_ms=20, chunk_ms=20)
+        assert err.value.code == "AUDIO_DEVICE_LOST"
+    assert capture.reconnect_backoffs_ms == expected_backoffs
+    assert slept == [ms / 1000 for ms in expected_backoffs]
+
+
+def test_microphone_closes_stream_when_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FailingStartStream:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append("open")
+
+        def start(self) -> None:
+            calls.append("start")
+            raise OSError("device vanished")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    fake_sd = types.ModuleType("sounddevice")
+    fake_sd.query_devices = lambda: [  # type: ignore[attr-defined]
+        {"name": "Built-in Mic", "max_input_channels": 1}
+    ]
+    fake_sd.check_input_settings = lambda **kwargs: None  # type: ignore[attr-defined]
+    fake_sd.RawInputStream = FailingStartStream  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+
+    mic = SoundDeviceMicrophone()
+    mic.request_permission(SoundDeviceMicrophone.DEVICE_ID)
+    with pytest.raises(AudioDeviceError) as err:
+        mic.select_device(SoundDeviceMicrophone.DEVICE_ID)
+
+    assert err.value.code == "AUDIO_DEVICE_UNAVAILABLE"
+    assert calls == ["open", "start", "stop", "close"]
+    with pytest.raises(AudioDeviceError):
+        mic.read_chunks(session_id=SESSION_ID, duration_ms=20)
