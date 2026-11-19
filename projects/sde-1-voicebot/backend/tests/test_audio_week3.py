@@ -384,11 +384,13 @@ def test_device_loss_mid_session_reconnects_without_reusing_sequence_ids() -> No
     assert capture.last_error is None
 
     drained = buffer.drain()
+    # Audio was lost while the device was gone: one sequence ID and 20 ms are
+    # skipped so the pipeline sees a gap. No ID is ever reused.
     assert [(c.sequence_id, c.start_ms) for c in drained] == [
         (0, 0),
         (1, 20),
-        (2, 40),
         (3, 60),
+        (4, 80),
     ]
 
 
@@ -1174,3 +1176,60 @@ def test_microphone_closes_stream_when_start_fails(
     assert calls == ["open", "start", "stop", "close"]
     with pytest.raises(AudioDeviceError):
         mic.read_chunks(session_id=SESSION_ID, duration_ms=20)
+
+
+def test_speech_does_not_merge_across_device_loss_and_reconnect() -> None:
+    class LoudMockDevice(MockAudioDevice):
+        def read_chunks(
+            self, *, session_id: str, duration_ms: int, chunk_ms: int = 20
+        ) -> list[AudioChunk]:
+            chunks = super().read_chunks(
+                session_id=session_id, duration_ms=duration_ms, chunk_ms=chunk_ms
+            )
+            return [make_chunk(c.sequence_id, c.start_ms) for c in chunks]
+
+    device = LoudMockDevice()
+    buffer = BoundedAudioBuffer(capacity_chunks=16)
+    capture = AudioCaptureController(
+        session_id=SESSION_ID, device=device, buffer=buffer, sleep_fn=lambda _s: None
+    )
+    capture.start(MockAudioDevice.DEVICE_ID)
+    capture.produce(duration_ms=60, chunk_ms=20)  # speech before the loss
+    device.disconnect(failures_before_recover=0)
+    capture.produce(duration_ms=60, chunk_ms=20)  # speech after reconnect
+
+    pipeline, _ = build_pipeline(wake_required=False, with_orchestrator=False)
+    result = pipeline.process_chunks(buffer.drain(), timestamp=FIXED_TS, final=True)
+
+    assert [(e.kind, e.at_ms) for e in result.speech_events] == [
+        ("speech_start", 0),
+        ("speech_end", 60),
+        ("speech_start", 80),
+        ("speech_end", 140),
+    ]
+
+
+def test_silero_scores_are_scoped_to_one_session() -> None:
+    class ResettableSilero(_FakeSilero):
+        def __init__(self, scores: list[float]) -> None:
+            super().__init__(scores)
+            self.resets = 0
+
+        def reset_states(self) -> None:
+            self.resets += 1
+
+    model = ResettableSilero([0.9, 0.9, 0.9, 0.0, 0.0, 0.0])
+    vad = SileroVAD(model=model, min_speech_ms=20)
+
+    first = vad.detect([silence_chunk(i, 20 * i) for i in range(3)])
+    other = [
+        make_chunk(i, 20 * i, pcm=bytes(640), session_id="session-next")
+        for i in range(3)
+    ]
+    second = vad.detect(other)
+
+    # Same sequence IDs, new session: rescored with a reset model, not reused.
+    assert first == [SpeechSpan(SESSION_ID, 0, 60)]
+    assert second == []
+    assert len(model.calls) == 6
+    assert model.resets == 2

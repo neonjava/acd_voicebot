@@ -103,6 +103,15 @@ class AudioCaptureController:
             raise ValueError("capture can only resume while paused")
         self.state = CaptureState.active
 
+    def _mark_gap(self, duration_ms: int) -> None:
+        """Skip one sequence ID and one chunk of time before the next chunk.
+
+        Used when input audio was lost (mic overrun or device loss), so the
+        pipeline sees a gap and never merges speech across missing audio.
+        """
+        self._next_sequence += 1
+        self._next_start_ms += duration_ms
+
     def _close_device(self) -> None:
         close_fn = getattr(self.device, "close", None)
         if callable(close_fn):
@@ -197,14 +206,14 @@ class AudioCaptureController:
             chunks = self._reconnect_and_read(
                 duration_ms=duration_ms, chunk_ms=chunk_ms
             )
+            if chunks:
+                # Audio was lost while the device was gone.
+                self._mark_gap(chunks[0].duration_ms)
 
         consume_overrun = getattr(self.device, "consume_overrun", None)
         if callable(consume_overrun) and consume_overrun() and chunks:
-            # Lost input frames: skip one sequence ID and one chunk of time so
-            # downstream sees a gap and never merges speech across missing audio.
             self.overruns += 1
-            self._next_sequence += 1
-            self._next_start_ms += chunks[0].duration_ms
+            self._mark_gap(chunks[0].duration_ms)
 
         retained = 0
         for chunk in chunks:
