@@ -131,11 +131,16 @@ def run_mock_demo() -> int:
 
 
 def run_mic_demo(
-    *, duration_ms: int = 5000, chunk_ms: int = 20, config: AudioConfig | None = None
+    *,
+    duration_ms: int = 5000,
+    chunk_ms: int | None = None,
+    config: AudioConfig | None = None,
 ) -> int:
     """Run live capture using SoundDeviceMicrophone and OpenWakeWordDetector."""
     base = config if config is not None else AudioConfig.from_env()
     config = base.model_copy(update={"audio_source": "mic"})
+    if chunk_ms is None:
+        chunk_ms = config.chunk_ms
     device = create_audio_device(config)
     detector = create_wake_word_detector(config)
     buffer = BoundedAudioBuffer(capacity_chunks=512)

@@ -1233,3 +1233,31 @@ def test_silero_scores_are_scoped_to_one_session() -> None:
     assert second == []
     assert len(model.calls) == 6
     assert model.resets == 2
+
+
+def test_mic_demo_reads_with_configured_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.audio.week3_demo as demo
+
+    reads: list[tuple[int, int]] = []
+
+    class RecordingDevice(MockAudioDevice):
+        DEVICE_ID = SoundDeviceMicrophone.DEVICE_ID
+
+        def read_chunks(
+            self, *, session_id: str, duration_ms: int, chunk_ms: int = 20
+        ) -> list[AudioChunk]:
+            reads.append((duration_ms, chunk_ms))
+            return super().read_chunks(
+                session_id=session_id, duration_ms=duration_ms, chunk_ms=chunk_ms
+            )
+
+    monkeypatch.setattr(demo, "create_audio_device", lambda _cfg: RecordingDevice())
+    monkeypatch.setattr(
+        demo, "create_wake_word_detector", lambda _cfg: MockWakeWordDetector()
+    )
+    config = AudioConfig(chunk_ms=40, vad_provider="mock")
+
+    assert demo.run_mic_demo(duration_ms=200, config=config) == 0
+    assert reads == [(40, 40)] * 5
