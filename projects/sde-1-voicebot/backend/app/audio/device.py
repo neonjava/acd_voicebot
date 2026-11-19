@@ -239,6 +239,7 @@ class SoundDeviceMicrophone:
         self.close()
         sd = _load_sounddevice()
         device_arg = self._resolve_device_arg(device_id)
+        stream: object | None = None
         try:
             stream = sd.RawInputStream(  # type: ignore[attr-defined]
                 samplerate=self.format.sample_rate_hz,
@@ -246,8 +247,18 @@ class SoundDeviceMicrophone:
                 dtype="int16",
                 device=device_arg,
             )
-            stream.start()
+            stream.start()  # type: ignore[attr-defined]
         except Exception as exc:
+            # A stream that was created but failed to start still holds a
+            # PortAudio handle; close it so reconnect attempts don't leak.
+            if stream is not None:
+                for method_name in ("stop", "close"):
+                    method = getattr(stream, method_name, None)
+                    if callable(method):
+                        try:
+                            method()
+                        except Exception:
+                            pass
             raise AudioDeviceError(
                 "AUDIO_DEVICE_UNAVAILABLE", "Audio device could not be opened."
             ) from exc

@@ -141,7 +141,8 @@ def run_mic_demo(
     buffer = BoundedAudioBuffer(capacity_chunks=512)
     session_id = "session-mic-demo"
     correlation_id = "correlation-mic-demo"
-    capture = AudioCaptureController(
+    capture = AudioCaptureController.from_config(
+        config,
         session_id=session_id,
         correlation_id=correlation_id,
         device=device,
