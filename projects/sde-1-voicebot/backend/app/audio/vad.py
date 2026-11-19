@@ -115,6 +115,7 @@ class SileroVAD(MockVAD):
         self._cache_size = cache_size
         self._scores: dict[int, float] = {}
         self._window_floor = 0
+        self._session_id: str | None = None
 
     def _ensure_model(self) -> object:
         if self._model is not None:
@@ -141,6 +142,8 @@ class SileroVAD(MockVAD):
 
     def speech_probability(self, chunk: AudioChunk) -> float:
         """Return the cached Silero speech probability for one chunk."""
+        if chunk.session_id != self._session_id:
+            self._start_session(chunk.session_id)
         cached = self._scores.get(chunk.sequence_id)
         if cached is not None:
             return cached
@@ -169,6 +172,15 @@ class SileroVAD(MockVAD):
         if chunks:
             self._window_floor = chunks[0].sequence_id
         return super().detect(chunks)
+
+    def _start_session(self, session_id: str) -> None:
+        """Sequence IDs restart per session: drop old scores and model state."""
+        self._session_id = session_id
+        self._scores.clear()
+        self._window_floor = 0
+        reset = getattr(self._model, "reset_states", None)
+        if callable(reset):
+            reset()
 
     def _is_speech(self, chunk: AudioChunk) -> bool:
         return self.speech_probability(chunk) >= self.threshold
