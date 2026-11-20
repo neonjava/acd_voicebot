@@ -83,47 +83,41 @@ def test_post_mock_session_reports_missing_dependency_blocker(client):
 
 
 def test_post_mock_session_success_when_dependencies_present(client):
-    """POST /api/sessions/mock returns 201 MockSessionResponse when available."""
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", fake_w1_w2_modules()),
-    ):
-        response = client.post(
-            "/api/sessions/mock",
-            json={},
-            headers={"X-Correlation-ID": "test-corr-abc"},
-        )
-        assert response.status_code == 201
-        assert response.headers["X-Correlation-ID"] == "test-corr-abc"
-        assert "X-Request-ID" in response.headers
+    """POST /api/sessions/mock returns MockSessionResponse with full pipeline."""
+    response = client.post(
+        "/api/sessions/mock",
+        json={},
+        headers={"X-Correlation-ID": "test-corr-abc"},
+    )
+    assert response.status_code == 201
+    assert response.headers["X-Correlation-ID"] == "test-corr-abc"
+    assert "X-Request-ID" in response.headers
 
-        data = response.json()
-        validated = MockSessionResponse.model_validate(data)
-        assert validated.state == "completed"
-        assert validated.mode == "mock"
-        assert len(validated.events) == 2
-        assert validated.events[0].event_type == "audio.chunk"
-        assert validated.events[1].event_type == "transcript.segment"
+    data = response.json()
+    validated = MockSessionResponse.model_validate(data)
+    assert validated.state == "completed"
+    assert validated.mode == "mock"
+    event_types = [e.event_type for e in validated.events]
+    assert "audio.chunk" in event_types
+    assert "audio.speech" in event_types
+    assert "transcript.segment" in event_types
+    assert "workflow.audit" in event_types
 
 
 def test_post_mock_session_generates_unique_session_ids(client):
     """Subsequent POST requests must generate distinct session IDs in memory."""
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", fake_w1_w2_modules()),
-    ):
-        resp1 = client.post("/api/sessions/mock", json={})
-        resp2 = client.post("/api/sessions/mock", json={})
+    resp1 = client.post("/api/sessions/mock", json={})
+    resp2 = client.post("/api/sessions/mock", json={})
 
-        assert resp1.status_code == 201
-        assert resp2.status_code == 201
+    assert resp1.status_code == 201
+    assert resp2.status_code == 201
 
-        sid1 = resp1.json()["session_id"]
-        sid2 = resp2.json()["session_id"]
+    sid1 = resp1.json()["session_id"]
+    sid2 = resp2.json()["session_id"]
 
-        assert sid1 != sid2, "Session IDs must be unique across runtime requests"
-        assert session_service.get_session(sid1) is not None
-        assert session_service.get_session(sid2) is not None
+    assert sid1 != sid2, "Session IDs must be unique across runtime requests"
+    assert session_service.get_session(sid1) is not None
+    assert session_service.get_session(sid2) is not None
 
 
 def test_post_mock_session_rejects_extra_fields(client):
