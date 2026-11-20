@@ -218,5 +218,125 @@ describe('SessionClient implementations', () => {
       const client = new HttpSessionClient('/api/sessions/mock');
       await expect(client.startMockSession()).rejects.toThrow(MalformedResponseError);
     });
+
+    it('sends Authorization: Bearer <token> when launch token is provided', async () => {
+      let capturedHeaders: Record<string, string> = {};
+      globalThis.fetch = vi.fn().mockImplementation(async (_url, init) => {
+        capturedHeaders = init?.headers as Record<string, string>;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => baselineSessionResponse,
+        };
+      });
+
+      const client = new HttpSessionClient({
+        endpoint: '/api/sessions/mock',
+        token: 'vbt-secret-token-12345678',
+      });
+
+      await client.startMockSession();
+      expect(capturedHeaders['Authorization']).toBe('Bearer vbt-secret-token-12345678');
+    });
+
+    it('fetches events with from_sequence and approvals via HTTP client', async () => {
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+        if (url.includes('/events?from_sequence=2')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              session_id: 'sess-1',
+              from_sequence: 2,
+              total_events: 2,
+              has_more: false,
+              events: [],
+            }),
+          };
+        }
+        if (url.includes('/approvals/appr-1')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              approval_id: 'appr-1',
+              plan_id: 'plan-1',
+              step_id: 'step-1',
+              session_id: 'sess-1',
+              status: 'rejected',
+            }),
+          };
+        }
+        if (url.includes('/approvals')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => [
+              {
+                approval_id: 'appr-1',
+                plan_id: 'plan-1',
+                step_id: 'step-1',
+                session_id: 'sess-1',
+                status: 'pending',
+              },
+            ],
+          };
+        }
+        return { ok: false, status: 404 };
+      });
+
+      const client = new HttpSessionClient();
+      const eventsRes = await client.getEvents('sess-1', 2);
+      expect(eventsRes.from_sequence).toBe(2);
+
+      const approvals = await client.getPendingApprovals('sess-1');
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0].approval_id).toBe('appr-1');
+
+      const decision = await client.decideApproval('sess-1', 'appr-1', 'reject');
+      expect(decision.status).toBe('rejected');
+    });
+  });
+
+  describe('FixtureSessionClient Week 3 features', () => {
+    it('supports getEvents replay with from_sequence', async () => {
+      const client = new FixtureSessionClient();
+      const res0 = await client.getEvents('sess-test', 0);
+      expect(res0.from_sequence).toBe(0);
+      expect(res0.events.length).toBeGreaterThan(0);
+
+      const res2 = await client.getEvents('sess-test', 2);
+      expect(res2.from_sequence).toBe(2);
+      expect(res2.events.length).toBe(res0.events.length - 2);
+    });
+
+    it('proves rejecting approval never triggers step execution', async () => {
+      const initialApproval = {
+        approval_id: 'appr-risk-1',
+        plan_id: 'plan-risk',
+        step_id: 'step-delete-database',
+        session_id: 'sess-risk',
+        status: 'pending' as const,
+      };
+
+      const client = new FixtureSessionClient(undefined, 0, 'active', [initialApproval]);
+      expect(client.getExecutionCount()).toBe(0);
+
+      const pending = await client.getPendingApprovals('sess-risk');
+      expect(pending).toHaveLength(1);
+
+      // Reject the approval
+      const rejected = await client.decideApproval('sess-risk', 'appr-risk-1', 'reject');
+      expect(rejected.status).toBe('rejected');
+
+      // Crucial requirement: Rejecting NEVER triggers execution!
+      expect(client.getExecutionCount()).toBe(0);
+
+      // Cannot decide already-decided approval
+      await expect(client.decideApproval('sess-risk', 'appr-risk-1', 'approve')).rejects.toThrow(
+        BackendError
+      );
+      expect(client.getExecutionCount()).toBe(0);
+    });
   });
 });

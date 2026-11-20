@@ -9,6 +9,12 @@ import {
   validateContextItem,
   validateScreenContext,
   validateReasoningResult,
+  validateSpeechEvent,
+  validateAuditEvent,
+  validateApprovalRequest,
+  validateWorkflowProposal,
+  validateSessionEventStreamResponse,
+  validateEventEnvelope,
   MalformedResponseError,
 } from '../utils/validation';
 import { baselineSessionResponse } from '../fixtures/baselineSession';
@@ -347,6 +353,259 @@ describe('Runtime Validation', () => {
           prompt_version: 'v2' as any,
         })
       ).toThrow(MalformedResponseError);
+    });
+  });
+
+  describe('Week 3 Contracts Validation', () => {
+    it('validates SpeechEvent and enforces wake field exclusivity', () => {
+      const wake = validateSpeechEvent({
+        kind: 'wake',
+        session_id: 'sess-1',
+        correlation_id: 'corr-1',
+        sequence_id: 0,
+        at_ms: 120,
+        wake_word: 'hey voicebot',
+        score: 0.95,
+      });
+      expect(wake.kind).toBe('wake');
+      expect(wake.wake_word).toBe('hey voicebot');
+      expect(wake.score).toBe(0.95);
+
+      // Wake requires wake_word and score
+      expect(() =>
+        validateSpeechEvent({
+          kind: 'wake',
+          session_id: 'sess-1',
+          correlation_id: 'corr-1',
+          sequence_id: 0,
+          at_ms: 120,
+        })
+      ).toThrow(MalformedResponseError);
+
+      // Non-wake cannot have wake_word
+      expect(() =>
+        validateSpeechEvent({
+          kind: 'speech_start',
+          session_id: 'sess-1',
+          correlation_id: 'corr-1',
+          sequence_id: 1,
+          at_ms: 200,
+          wake_word: 'hey',
+        })
+      ).toThrow(MalformedResponseError);
+
+      const speechStart = validateSpeechEvent({
+        kind: 'speech_start',
+        session_id: 'sess-1',
+        correlation_id: 'corr-1',
+        sequence_id: 1,
+        at_ms: 200,
+      });
+      expect(speechStart.kind).toBe('speech_start');
+      expect(speechStart.wake_word).toBeNull();
+    });
+
+    it('validates AuditEvent for workflow progress', () => {
+      const audit = validateAuditEvent({
+        sequence: 3,
+        kind: 'step_succeeded',
+        plan_id: 'plan-101',
+        session_id: 'sess-1',
+        step_id: 'step-1',
+        details_redacted: { tool: 'echo' },
+      });
+      expect(audit.kind).toBe('step_succeeded');
+      expect(audit.step_id).toBe('step-1');
+      expect(audit.details_redacted?.tool).toBe('echo');
+
+      expect(() =>
+        validateAuditEvent({
+          sequence: -1,
+          kind: 'step_succeeded',
+          plan_id: 'plan-1',
+          session_id: 'sess-1',
+        })
+      ).toThrow(MalformedResponseError);
+
+      expect(() =>
+        validateAuditEvent({
+          sequence: 0,
+          kind: 'invalid_kind' as any,
+          plan_id: 'plan-1',
+          session_id: 'sess-1',
+        })
+      ).toThrow(MalformedResponseError);
+    });
+
+    it('validates ApprovalRequest status and expiry', () => {
+      const pending = validateApprovalRequest({
+        approval_id: 'appr-1',
+        plan_id: 'plan-1',
+        step_id: 'step-2',
+        session_id: 'sess-1',
+        status: 'pending',
+        expires_at: '2026-11-20T17:00:00Z',
+      });
+      expect(pending.status).toBe('pending');
+      expect(pending.expires_at).toBe('2026-11-20T17:00:00Z');
+
+      expect(() =>
+        validateApprovalRequest({
+          approval_id: 'appr-1',
+          plan_id: 'plan-1',
+          step_id: 'step-2',
+          session_id: 'sess-1',
+          status: 'invalid' as any,
+        })
+      ).toThrow(MalformedResponseError);
+
+      expect(() =>
+        validateApprovalRequest({
+          approval_id: 'appr-1',
+          plan_id: 'plan-1',
+          step_id: 'step-2',
+          session_id: 'sess-1',
+          status: 'pending',
+          expires_at: 'invalid-date',
+        })
+      ).toThrow(MalformedResponseError);
+    });
+
+    it('validates WorkflowProposal and checks dependencies and max steps', () => {
+      const valid = validateWorkflowProposal({
+        proposal_id: 'prop-1',
+        session_id: 'sess-1',
+        correlation_id: 'corr-1',
+        summary: 'Run automated check',
+        steps: [
+          {
+            step_id: 's1',
+            tool_name: 'read_status',
+            arguments: {},
+            requires_approval: false,
+          },
+          {
+            step_id: 's2',
+            tool_name: 'delete_file',
+            arguments: { path: '/tmp/test' },
+            requires_approval: true,
+            depends_on: ['s1'],
+          },
+        ],
+      });
+      expect(valid.steps).toHaveLength(2);
+      expect(valid.steps[1].depends_on).toEqual(['s1']);
+
+      // Duplicate step IDs rejected
+      expect(() =>
+        validateWorkflowProposal({
+          proposal_id: 'prop-1',
+          session_id: 'sess-1',
+          correlation_id: 'corr-1',
+          summary: 'Dupe steps',
+          steps: [
+            { step_id: 's1', tool_name: 'a', arguments: {} },
+            { step_id: 's1', tool_name: 'b', arguments: {} },
+          ],
+        })
+      ).toThrow(MalformedResponseError);
+
+      // Unknown dependency rejected
+      expect(() =>
+        validateWorkflowProposal({
+          proposal_id: 'prop-1',
+          session_id: 'sess-1',
+          correlation_id: 'corr-1',
+          summary: 'Missing dep',
+          steps: [
+            { step_id: 's1', tool_name: 'a', arguments: {}, depends_on: ['missing'] },
+          ],
+        })
+      ).toThrow(MalformedResponseError);
+    });
+
+    it('validates SessionEventStreamResponse and validates nested events with audio.speech and workflow.audit', () => {
+      const streamRes = validateSessionEventStreamResponse({
+        session_id: 'sess-1',
+        from_sequence: 0,
+        total_events: 2,
+        has_more: false,
+        events: [
+          {
+            event_id: 'evt-1',
+            event_type: 'audio.speech',
+            schema_version: '1.0',
+            session_id: 'sess-1',
+            correlation_id: 'corr-1',
+            timestamp: '2026-11-20T17:00:00Z',
+            producer: 'audio',
+            payload: {
+              kind: 'speech_start',
+              session_id: 'sess-1',
+              correlation_id: 'corr-1',
+              sequence_id: 0,
+              at_ms: 50,
+            },
+          },
+          {
+            event_id: 'evt-2',
+            event_type: 'workflow.audit',
+            schema_version: '1.0',
+            session_id: 'sess-1',
+            correlation_id: 'corr-1',
+            timestamp: '2026-11-20T17:00:01Z',
+            producer: 'workflow',
+            payload: {
+              sequence: 1,
+              kind: 'step_succeeded',
+              plan_id: 'plan-1',
+              session_id: 'sess-1',
+              step_id: 'step-1',
+            },
+          },
+        ],
+      });
+      expect(streamRes.events).toHaveLength(2);
+      expect(streamRes.from_sequence).toBe(0);
+    });
+
+    it('validates individual event envelope and rejects unsupported event types', () => {
+      const valid = validateEventEnvelope(
+        {
+          event_id: 'evt-direct-1',
+          event_type: 'audio.speech',
+          schema_version: '1.0',
+          session_id: 'sess-direct',
+          correlation_id: 'corr-direct',
+          timestamp: '2026-11-20T17:00:00Z',
+          producer: 'audio',
+          payload: {
+            kind: 'speech_start',
+            session_id: 'sess-direct',
+            correlation_id: 'corr-direct',
+            sequence_id: 1,
+            at_ms: 100,
+          },
+        },
+        'sess-direct'
+      );
+      expect(valid.event_id).toBe('evt-direct-1');
+
+      expect(() =>
+        validateEventEnvelope(
+          {
+            event_id: 'evt-bad',
+            event_type: 'unknown.event',
+            schema_version: '1.0',
+            session_id: 'sess-direct',
+            correlation_id: 'corr-direct',
+            timestamp: '2026-11-20T17:00:00Z',
+            producer: 'test',
+            payload: {},
+          },
+          'sess-direct'
+        )
+      ).toThrow(/Unsupported event_type/);
     });
   });
 });

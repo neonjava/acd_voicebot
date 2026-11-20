@@ -1,4 +1,7 @@
 import {
+  ApprovalRequest,
+  AuditEvent,
+  AuditKind,
   AudioChunkMetadata,
   ContextItem,
   ErrorEnvelope,
@@ -6,9 +9,14 @@ import {
   MockSessionResponse,
   ReasoningResult,
   ScreenContext,
+  SessionEventStreamResponse,
   SessionLifecycleState,
   SourceReference,
+  SpeechEvent,
+  SpeechEventKind,
   TranscriptSegment,
+  WorkflowProposal,
+  WorkflowStep,
 } from '../types/contracts';
 
 export class MalformedResponseError extends Error {
@@ -244,6 +252,10 @@ export function validateEventEnvelope(val: unknown, expectedSessionId: string): 
     payload = validateAudioChunkMetadata(val.payload);
   } else if (val.event_type === 'transcript.error') {
     payload = validateErrorEnvelope(val.payload);
+  } else if (val.event_type === 'audio.speech') {
+    payload = validateSpeechEvent(val.payload, expectedSessionId);
+  } else if (val.event_type === 'workflow.audit') {
+    payload = validateAuditEvent(val.payload, expectedSessionId);
   } else {
     throw new MalformedResponseError(`Unsupported event_type "${val.event_type}"`);
   }
@@ -428,5 +440,330 @@ export function validateReasoningResult(val: unknown): ReasoningResult {
     source_ids: sourceIds,
     insufficient_evidence: val.insufficient_evidence,
     prompt_version: 'v1',
+  };
+}
+
+export const VALID_SPEECH_EVENT_KINDS: ReadonlySet<SpeechEventKind> = new Set([
+  'wake',
+  'speech_start',
+  'speech_end',
+]);
+
+export function validateSpeechEvent(val: unknown, expectedSessionId?: string): SpeechEvent {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('SpeechEvent must be an object');
+  }
+
+  if (typeof val.kind !== 'string' || !VALID_SPEECH_EVENT_KINDS.has(val.kind as SpeechEventKind)) {
+    throw new MalformedResponseError(`Invalid SpeechEvent kind "${val.kind}"`);
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('SpeechEvent missing non-empty "session_id"');
+  }
+
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `SpeechEvent session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+
+  if (!isNonEmptyString(val.correlation_id)) {
+    throw new MalformedResponseError('SpeechEvent missing non-empty "correlation_id"');
+  }
+
+  if (!isInteger(val.sequence_id) || val.sequence_id < 0) {
+    throw new MalformedResponseError('SpeechEvent sequence_id must be an integer >= 0');
+  }
+
+  if (!isInteger(val.at_ms) || val.at_ms < 0) {
+    throw new MalformedResponseError('SpeechEvent at_ms must be an integer >= 0');
+  }
+
+  const isWake = val.kind === 'wake';
+  const hasWakeWord = isNonEmptyString(val.wake_word);
+  const hasScore = typeof val.score === 'number' && val.score >= 0.0 && val.score <= 1.0;
+
+  if (isWake) {
+    if (!hasWakeWord || !hasScore) {
+      throw new MalformedResponseError('SpeechEvent with kind "wake" requires non-empty wake_word and score in [0.0, 1.0]');
+    }
+  } else {
+    if (val.wake_word !== undefined && val.wake_word !== null) {
+      throw new MalformedResponseError('SpeechEvent wake_word is only permitted on "wake" events');
+    }
+    if (val.score !== undefined && val.score !== null) {
+      throw new MalformedResponseError('SpeechEvent score is only permitted on "wake" events');
+    }
+  }
+
+  return {
+    kind: val.kind as SpeechEventKind,
+    session_id: val.session_id,
+    correlation_id: val.correlation_id,
+    sequence_id: val.sequence_id,
+    at_ms: val.at_ms,
+    wake_word: isWake ? (val.wake_word as string) : null,
+    score: isWake ? (val.score as number) : null,
+  };
+}
+
+export const VALID_AUDIT_KINDS: ReadonlySet<AuditKind> = new Set([
+  'approval_granted',
+  'approval_rejected',
+  'approval_expired',
+  'approval_missing',
+  'step_succeeded',
+  'step_failed',
+  'step_timed_out',
+  'step_retried',
+  'workflow_cancelled',
+]);
+
+export function validateAuditEvent(val: unknown, expectedSessionId?: string): AuditEvent {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('AuditEvent must be an object');
+  }
+
+  if (!isInteger(val.sequence) || val.sequence < 0) {
+    throw new MalformedResponseError('AuditEvent sequence must be an integer >= 0');
+  }
+
+  if (typeof val.kind !== 'string' || !VALID_AUDIT_KINDS.has(val.kind as AuditKind)) {
+    throw new MalformedResponseError(`Invalid AuditEvent kind "${val.kind}"`);
+  }
+
+  if (!isNonEmptyString(val.plan_id)) {
+    throw new MalformedResponseError('AuditEvent missing non-empty "plan_id"');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('AuditEvent missing non-empty "session_id"');
+  }
+
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `AuditEvent session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+
+  const stepId = isNonEmptyString(val.step_id) ? val.step_id : null;
+  const approvalId = isNonEmptyString(val.approval_id) ? val.approval_id : null;
+
+  const details: Record<string, string> = {};
+  if (isObject(val.details_redacted)) {
+    for (const [k, v] of Object.entries(val.details_redacted)) {
+      if (typeof v === 'string') {
+        details[k] = v;
+      }
+    }
+  }
+
+  return {
+    sequence: val.sequence,
+    kind: val.kind as AuditKind,
+    plan_id: val.plan_id,
+    session_id: val.session_id,
+    step_id: stepId,
+    approval_id: approvalId,
+    details_redacted: details,
+  };
+}
+
+export function validateApprovalRequest(val: unknown, expectedSessionId?: string): ApprovalRequest {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('ApprovalRequest must be an object');
+  }
+
+  if (!isNonEmptyString(val.approval_id)) {
+    throw new MalformedResponseError('ApprovalRequest missing non-empty "approval_id"');
+  }
+
+  if (!isNonEmptyString(val.plan_id)) {
+    throw new MalformedResponseError('ApprovalRequest missing non-empty "plan_id"');
+  }
+
+  if (!isNonEmptyString(val.step_id)) {
+    throw new MalformedResponseError('ApprovalRequest missing non-empty "step_id"');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('ApprovalRequest missing non-empty "session_id"');
+  }
+
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `ApprovalRequest session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+
+  if (val.status !== 'pending' && val.status !== 'approved' && val.status !== 'rejected') {
+    throw new MalformedResponseError(`ApprovalRequest status must be pending/approved/rejected, got "${val.status}"`);
+  }
+
+  let expiresAt: string | null = null;
+  if (val.expires_at !== undefined && val.expires_at !== null) {
+    if (typeof val.expires_at !== 'string' || Number.isNaN(Date.parse(val.expires_at))) {
+      throw new MalformedResponseError('ApprovalRequest expires_at must be a valid ISO date string');
+    }
+    expiresAt = val.expires_at;
+  }
+
+  return {
+    approval_id: val.approval_id,
+    plan_id: val.plan_id,
+    step_id: val.step_id,
+    session_id: val.session_id,
+    status: val.status,
+    expires_at: expiresAt,
+  };
+}
+
+export function validateWorkflowStep(val: unknown): WorkflowStep {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('WorkflowStep must be an object');
+  }
+
+  if (!isNonEmptyString(val.step_id)) {
+    throw new MalformedResponseError('WorkflowStep missing non-empty "step_id"');
+  }
+
+  if (!isNonEmptyString(val.tool_name)) {
+    throw new MalformedResponseError('WorkflowStep missing non-empty "tool_name"');
+  }
+
+  if (!isObject(val.arguments)) {
+    throw new MalformedResponseError('WorkflowStep arguments must be a dictionary object');
+  }
+
+  const args: Record<string, string> = {};
+  for (const [k, v] of Object.entries(val.arguments)) {
+    if (typeof v !== 'string') {
+      throw new MalformedResponseError(`WorkflowStep argument "${k}" must be a string`);
+    }
+    args[k] = v;
+  }
+
+  const requiresApproval = typeof val.requires_approval === 'boolean' ? val.requires_approval : true;
+
+  const dependsOn: string[] = [];
+  if (Array.isArray(val.depends_on)) {
+    for (const d of val.depends_on) {
+      if (!isNonEmptyString(d)) {
+        throw new MalformedResponseError('WorkflowStep depends_on entries must be non-empty strings');
+      }
+      if (d === val.step_id) {
+        throw new MalformedResponseError(`WorkflowStep "${val.step_id}" cannot depend on itself`);
+      }
+      dependsOn.push(d);
+    }
+  }
+
+  return {
+    step_id: val.step_id,
+    tool_name: val.tool_name,
+    arguments: args,
+    requires_approval: requiresApproval,
+    depends_on: dependsOn,
+  };
+}
+
+export function validateWorkflowProposal(val: unknown): WorkflowProposal {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('WorkflowProposal must be an object');
+  }
+
+  if (!isNonEmptyString(val.proposal_id)) {
+    throw new MalformedResponseError('WorkflowProposal missing non-empty "proposal_id"');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('WorkflowProposal missing non-empty "session_id"');
+  }
+
+  if (!isNonEmptyString(val.correlation_id)) {
+    throw new MalformedResponseError('WorkflowProposal missing non-empty "correlation_id"');
+  }
+
+  if (!isNonEmptyString(val.summary) || val.summary.length > 500) {
+    throw new MalformedResponseError('WorkflowProposal summary must be a non-empty string <= 500 characters');
+  }
+
+  if (!Array.isArray(val.steps) || val.steps.length === 0 || val.steps.length > 20) {
+    throw new MalformedResponseError('WorkflowProposal steps must be an array of 1 to 20 steps');
+  }
+
+  const steps = val.steps.map((s) => validateWorkflowStep(s));
+  const stepIds = new Set<string>();
+  for (const s of steps) {
+    if (stepIds.has(s.step_id)) {
+      throw new MalformedResponseError(`Duplicate step_id "${s.step_id}" in WorkflowProposal`);
+    }
+    stepIds.add(s.step_id);
+  }
+
+  for (const s of steps) {
+    for (const dep of s.depends_on || []) {
+      if (!stepIds.has(dep)) {
+        throw new MalformedResponseError(
+          `WorkflowStep "${s.step_id}" depends on unknown step "${dep}" in proposal`
+        );
+      }
+    }
+  }
+
+  const sourceIds: string[] = [];
+  if (Array.isArray(val.source_ids)) {
+    for (const sid of val.source_ids) {
+      if (!isNonEmptyString(sid)) {
+        throw new MalformedResponseError('WorkflowProposal source_ids entries must be non-empty strings');
+      }
+      sourceIds.push(sid);
+    }
+  }
+
+  return {
+    proposal_id: val.proposal_id,
+    session_id: val.session_id,
+    correlation_id: val.correlation_id,
+    summary: val.summary,
+    steps,
+    source_ids: sourceIds,
+  };
+}
+
+export function validateSessionEventStreamResponse(val: unknown): SessionEventStreamResponse {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('SessionEventStreamResponse must be an object');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('SessionEventStreamResponse missing non-empty "session_id"');
+  }
+
+  if (!isInteger(val.from_sequence) || val.from_sequence < 0) {
+    throw new MalformedResponseError('SessionEventStreamResponse from_sequence must be an integer >= 0');
+  }
+
+  if (!isInteger(val.total_events) || val.total_events < 0) {
+    throw new MalformedResponseError('SessionEventStreamResponse total_events must be an integer >= 0');
+  }
+
+  if (typeof val.has_more !== 'boolean') {
+    throw new MalformedResponseError('SessionEventStreamResponse has_more must be a boolean');
+  }
+
+  if (!Array.isArray(val.events)) {
+    throw new MalformedResponseError('SessionEventStreamResponse events must be an array');
+  }
+
+  const events = val.events.map((evt) => validateEventEnvelope(evt, val.session_id as string));
+
+  return {
+    session_id: val.session_id,
+    events,
+    from_sequence: val.from_sequence,
+    total_events: val.total_events,
+    has_more: val.has_more,
   };
 }
