@@ -155,6 +155,14 @@ class ApprovalExpiredError(Exception):
         self.approval_id = approval_id
 
 
+class MissingWorkflowPlanError(Exception):
+    """Raised when deciding an approval whose associated workflow plan is missing."""
+
+    def __init__(self, plan_id: str) -> None:
+        super().__init__(f"Workflow plan not found for approval: {plan_id}")
+        self.plan_id = plan_id
+
+
 class SessionRecord(ContractModel):
     """In-memory representation of an active, paused, or completed session."""
 
@@ -388,10 +396,13 @@ class SessionService:
     def register_approval(
         self, approval: ApprovalRequest, plan: WorkflowPlan | None = None
     ) -> None:
-        """Register an approval request and its optional associated workflow plan."""
+        """Register an approval request and its required associated workflow plan."""
+        if plan is None:
+            raise ValueError(
+                "Workflow plan is required when registering an approval request"
+            )
         self._approvals[approval.approval_id] = approval
-        if plan is not None:
-            self._workflow_plans[plan.plan_id] = plan
+        self._workflow_plans[plan.plan_id] = plan
 
     def get_pending_approvals(self, session_id: str) -> list[ApprovalRequest]:
         """List all pending approval requests for a session."""
@@ -420,9 +431,13 @@ class SessionService:
         correlation_id: str | None = None,
     ) -> tuple[ApprovalRequest, WorkflowResult | None]:
         """Decide an approval request, executing the workflow plan if approved."""
-        sess = self.get_session(session_id, check_expiry=True)
+        sess = self.get_session(session_id, check_expiry=True, now=now)
         if not sess:
             raise SessionNotFoundError(session_id)
+
+        # 1. Reject if session is expired
+        if sess.state == SessionState.expired:
+            raise ApprovalExpiredError(approval_id)
 
         approval = self._approvals.get(approval_id)
         if not approval or approval.session_id != session_id:
@@ -432,39 +447,40 @@ class SessionService:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        # 1. Check if already decided
+        # 2. Check if already decided
         if approval.status in ("approved", "rejected"):
             raise ApprovalAlreadyDecidedError(approval_id, approval.status)
 
-        # 2. Check if expired
+        # 3. Check if approval itself has expired
         if approval.expires_at is not None and ts >= approval.expires_at:
             raise ApprovalExpiredError(approval_id)
 
-        # 3. Update approval
+        # 4. Check that associated workflow plan exists
+        plan = self._workflow_plans.get(approval.plan_id)
+        if plan is None:
+            raise MissingWorkflowPlanError(approval.plan_id)
+
+        # 5. Update approval
         new_status = "approved" if decision == "approve" else "rejected"
         updated = approval.model_copy(update={"status": new_status})
         self._approvals[approval_id] = updated
 
         cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
-        plan = self._workflow_plans.get(approval.plan_id)
-        workflow_result: WorkflowResult | None = None
-
-        if plan is not None:
-            workflow_result, audit_events = workflow_gateway.execute_plan(
-                plan, [updated], correlation_id=cid
+        workflow_result, audit_events = workflow_gateway.execute_plan(
+            plan, [updated], correlation_id=cid
+        )
+        for audit in audit_events:
+            audit_envelope = WorkflowAuditEvent(
+                event_id=f"event-audit-{uuid.uuid4().hex[:8]}",
+                event_type="workflow.audit",
+                schema_version="1.0",
+                session_id=session_id,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="workflow",
+                payload=audit,
             )
-            for audit in audit_events:
-                audit_envelope = WorkflowAuditEvent(
-                    event_id=f"event-audit-{uuid.uuid4().hex[:8]}",
-                    event_type="workflow.audit",
-                    schema_version="1.0",
-                    session_id=session_id,
-                    correlation_id=cid,
-                    timestamp=ts,
-                    producer="workflow",
-                    payload=audit,
-                )
-                self.add_event(session_id, audit_envelope)
+            self.add_event(session_id, audit_envelope)
 
         return updated, workflow_result
 
@@ -521,6 +537,25 @@ class SessionService:
         self.transition(sid, SessionState.active, now=ts)
 
         try:
+            # Check required upstream module specs
+            has_audio = importlib.util.find_spec("app.audio") is not None
+            if not has_audio:
+                raise MissingDependencyError("W1 Audio")
+
+            has_transcription = (
+                importlib.util.find_spec("app.transcription") is not None
+            )
+            if not has_transcription:
+                raise MissingDependencyError("W2 Transcription")
+
+            has_reasoning = importlib.util.find_spec("app.reasoning") is not None
+            if not has_reasoning:
+                raise MissingDependencyError("W3 Reasoning")
+
+            has_workflow = importlib.util.find_spec("app.agent") is not None
+            if not has_workflow:
+                raise MissingDependencyError("W4 Workflow")
+
             # 1. Audio Gateway
             chunks, metadata, speech_events = audio_gateway.produce_audio_and_speech(
                 session_id=sid,

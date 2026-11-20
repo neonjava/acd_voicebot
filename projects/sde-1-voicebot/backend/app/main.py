@@ -41,6 +41,7 @@ from app.sessions.service import (
     IdempotencyConflictError,
     InvalidSessionTransitionError,
     MissingDependencyError,
+    MissingWorkflowPlanError,
     SessionAlreadyExistsError,
     SessionExpiredError,
     SessionNotFoundError,
@@ -580,6 +581,31 @@ async def approval_expired_handler(
     return response
 
 
+@app.exception_handler(MissingWorkflowPlanError)
+async def missing_workflow_plan_handler(
+    request: Request,
+    exc: MissingWorkflowPlanError,
+) -> JSONResponse:
+    """Report deciding an approval with missing workflow plan as 409 Conflict."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="WORKFLOW_PLAN_MISSING",
+        message_safe_for_user=f"Workflow plan not found for approval: {exc.plan_id}",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={"plan_id": exc.plan_id},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
 @app.exception_handler(GatewayError)
 async def gateway_error_handler(
     request: Request,
@@ -673,9 +699,16 @@ async def create_mock_session(
     corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
     session_id = f"session-{uuid.uuid4().hex[:12]}"
     current_session_id.set(session_id)
-    return session_service.run_mock_session(
+    _record, events = session_service.run_pipeline_session(
         session_id=session_id,
         correlation_id=corr_id,
+        auto_approve=True,
+    )
+    return MockSessionResponse(
+        session_id=session_id,
+        state="completed",
+        mode="mock",
+        events=events,
     )
 
 

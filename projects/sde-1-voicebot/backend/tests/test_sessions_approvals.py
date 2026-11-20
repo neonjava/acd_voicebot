@@ -187,3 +187,83 @@ def test_deciding_after_expiry_returns_409(client):
     assert res.status_code == 409
     err = ErrorEnvelope.model_validate(res.json())
     assert err.code == "APPROVAL_EXPIRED"
+
+
+def test_deciding_approval_on_expired_session_returns_409_and_runs_nothing(client):
+    """Approving on an expired session returns 409 and runs no consequential tools."""
+    session_service.create_session("sess-expired-session")
+    step = WorkflowStep(
+        step_id="step-exp-session",
+        tool_name="echo_text",
+        arguments={"text": "should never execute"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-exp-session",
+        session_id="sess-expired-session",
+        steps=[step],
+    )
+    appr = ApprovalRequest(
+        approval_id="appr-exp-session-1",
+        plan_id="plan-exp-session",
+        step_id="step-exp-session",
+        session_id="sess-expired-session",
+        status="pending",
+    )
+    session_service.register_approval(appr, plan)
+
+    # Expire the session
+    session_service.expire_session("sess-expired-session")
+
+    # Attempt to approve
+    res = client.post(
+        "/api/sessions/sess-expired-session/approvals/appr-exp-session-1",
+        json={"decision": "approve"},
+    )
+    assert res.status_code == 409
+    err = ErrorEnvelope.model_validate(res.json())
+    assert err.code == "APPROVAL_EXPIRED"
+
+    # Verify tool was NOT executed and no audit event was emitted
+    events = session_service.get_events("sess-expired-session")
+    audit_payloads = [e.payload for e in events if e.event_type == "workflow.audit"]
+    assert not any(a.kind == "step_succeeded" for a in audit_payloads)
+
+
+def test_deciding_approval_with_missing_plan_returns_409(client):
+    """Deciding an approval whose plan is missing returns 409 and runs nothing."""
+    session_service.create_session("sess-missing-plan")
+    appr = ApprovalRequest(
+        approval_id="appr-missing-plan-1",
+        plan_id="plan-does-not-exist",
+        step_id="step-missing",
+        session_id="sess-missing-plan",
+        status="pending",
+    )
+    # Inject directly without a plan to test defensive missing plan handling
+    session_service._approvals[appr.approval_id] = appr
+
+    res = client.post(
+        "/api/sessions/sess-missing-plan/approvals/appr-missing-plan-1",
+        json={"decision": "approve"},
+    )
+    assert res.status_code == 409
+    err = ErrorEnvelope.model_validate(res.json())
+    assert err.code == "WORKFLOW_PLAN_MISSING"
+
+    # Verify tool was NOT executed
+    events = session_service.get_events("sess-missing-plan")
+    assert len(events) == 0
+
+
+def test_register_approval_requires_plan():
+    """register_approval raises ValueError if plan is omitted."""
+    appr = ApprovalRequest(
+        approval_id="appr-no-plan",
+        plan_id="plan-none",
+        step_id="step-none",
+        session_id="sess-test",
+        status="pending",
+    )
+    with pytest.raises(ValueError, match="Workflow plan is required"):
+        session_service.register_approval(appr, None)
