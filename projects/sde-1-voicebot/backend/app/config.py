@@ -20,6 +20,18 @@ class Settings(ContractModel):
     max_payload_bytes: int = Field(default=65536, gt=0, le=10485760)
     max_events_per_session: int = Field(default=1000, gt=0)
     event_stream_chunk_ms: int = Field(default=20, gt=0)
+    launch_token: str | None = Field(default=None)
+    rate_limit_requests: int = Field(default=100, gt=0)
+    rate_limit_window_seconds: int = Field(default=60, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        if value != "127.0.0.1":
+            raise ValueError(
+                f"Server must bind only to 127.0.0.1 for local isolation, got '{value}'"
+            )
+        return value
 
     @field_validator("log_level")
     @classmethod
@@ -39,8 +51,9 @@ class Settings(ContractModel):
 
         host_val = os.getenv("HOST", "127.0.0.1")
 
+        port_str = os.getenv("VOICEBOT_PORT") or os.getenv("PORT", "8000")
         try:
-            port_val = int(os.getenv("PORT", "8000"))
+            port_val = int(port_str)
         except ValueError as err:
             raise ValueError(f"PORT must be an integer: {err}") from err
 
@@ -63,6 +76,25 @@ class Settings(ContractModel):
                 f"MAX_EVENTS_PER_SESSION must be an integer: {err}"
             ) from err
 
+        token_raw = os.getenv("VOICEBOT_LAUNCH_TOKEN")
+        launch_token_val = (
+            token_raw.strip() if token_raw and token_raw.strip() else None
+        )
+
+        try:
+            rate_limit_req_val = int(os.getenv("VOICEBOT_RATE_LIMIT_REQUESTS", "100"))
+        except ValueError as err:
+            raise ValueError(
+                f"VOICEBOT_RATE_LIMIT_REQUESTS must be an integer: {err}"
+            ) from err
+
+        try:
+            rate_limit_win_val = int(os.getenv("VOICEBOT_RATE_LIMIT_WINDOW", "60"))
+        except ValueError as err:
+            raise ValueError(
+                f"VOICEBOT_RATE_LIMIT_WINDOW must be an integer: {err}"
+            ) from err
+
         return cls(
             mock_mode=mock_val,
             host=host_val,
@@ -71,6 +103,9 @@ class Settings(ContractModel):
             session_ttl_seconds=ttl_val,
             max_payload_bytes=max_payload_val,
             max_events_per_session=max_events_val,
+            launch_token=launch_token_val,
+            rate_limit_requests=rate_limit_req_val,
+            rate_limit_window_seconds=rate_limit_win_val,
         )
 
 
