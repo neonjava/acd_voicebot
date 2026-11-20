@@ -5,8 +5,10 @@ from typing import Any, Literal, Self, Union
 
 from pydantic import Field, field_validator, model_validator
 
+from app.contracts.audio import SpeechEvent
 from app.contracts.common import ContractModel, EventEnvelope, SessionState
 from app.contracts.transcription import TranscriptEvent
+from app.contracts.workflow import AuditEvent
 
 
 class AudioChunkMetadata(ContractModel):
@@ -40,7 +42,26 @@ class AudioChunkEvent(EventEnvelope[AudioChunkMetadata]):
     event_type: Literal["audio.chunk"] = "audio.chunk"
 
 
-SessionEvent = Union[AudioChunkEvent, TranscriptEvent]
+class SpeechStreamEvent(EventEnvelope[SpeechEvent]):
+    """Session stream envelope for speech events (wake, speech_start, speech_end)."""
+
+    producer: Literal["audio"] = "audio"
+    event_type: Literal["audio.speech"] = "audio.speech"
+
+
+class WorkflowAuditEvent(EventEnvelope[AuditEvent]):
+    """Session stream envelope for workflow audit events."""
+
+    producer: Literal["workflow"] = "workflow"
+    event_type: Literal["workflow.audit"] = "workflow.audit"
+
+
+SessionEvent = Union[
+    AudioChunkEvent,
+    TranscriptEvent,
+    SpeechStreamEvent,
+    WorkflowAuditEvent,
+]
 
 
 class MockSessionRequest(ContractModel):
@@ -129,3 +150,24 @@ class IdempotencyRecord(ContractModel):
     status_code: int = Field(ge=200, le=599)
     response_body: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+
+
+# --- Week 3 Approvals & Health Contracts ---
+
+
+class ApprovalDecisionRequest(ContractModel):
+    """Payload for deciding a pending approval request."""
+
+    decision: Literal["approve", "reject"]
+
+
+ModuleHealthStatus = Literal["ok", "degraded", "down", "mock"]
+OverallHealthStatus = Literal["ok", "degraded", "down"]
+
+
+class HealthResponse(ContractModel):
+    """Aggregated health status covering all module gateways."""
+
+    status: OverallHealthStatus
+    mode: Literal["mock"] = "mock"
+    modules: dict[str, ModuleHealthStatus]
