@@ -811,4 +811,259 @@ describe('Voicebot App Component', () => {
       resolveSession2(baselineSessionResponse);
     });
   });
+
+  describe('Week 3 Notch UI, Workflow Progress & Approval Features', () => {
+    it('supports notch collapse and expand behavior and invokes desktop bridge', async () => {
+      const mockSetWindowExpanded = vi.fn();
+      (window as any).voicebot = {
+        isElectron: true,
+        getToken: () => 'vbt-mock',
+        setWindowExpanded: mockSetWindowExpanded,
+      };
+
+      // Starts collapsed when initialExpanded is false
+      render(<App initialExpanded={false} />);
+
+      expect(screen.getByTestId('notch-pill')).toBeInTheDocument();
+      expect(screen.queryByTestId('notch-expanded')).not.toBeInTheDocument();
+
+      // Click expand button on pill
+      fireEvent.click(screen.getByTestId('notch-expand-button'));
+      expect(mockSetWindowExpanded).toHaveBeenCalledWith(true);
+
+      // Now expanded
+      expect(screen.getByTestId('notch-expanded')).toBeInTheDocument();
+
+      // Click collapse button
+      fireEvent.click(screen.getByTestId('notch-collapse-button'));
+      expect(mockSetWindowExpanded).toHaveBeenCalledWith(false);
+      expect(screen.getByTestId('notch-pill')).toBeInTheDocument();
+
+      delete (window as any).voicebot;
+    });
+
+    it('renders workflow progress and displays compact step states from audit events', async () => {
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          session_id: 'sess-audit-test',
+          state: 'active',
+          mode: 'mock',
+          events: [
+            {
+              event_id: 'evt-audit-1',
+              event_type: 'workflow.audit',
+              schema_version: '1.0',
+              session_id: 'sess-audit-test',
+              correlation_id: 'corr-audit',
+              timestamp: '2026-01-01T00:00:00Z',
+              producer: 'workflow',
+              payload: {
+                sequence: 0,
+                kind: 'step_succeeded',
+                plan_id: 'plan-system-health',
+                session_id: 'sess-audit-test',
+                step_id: 'step-read-metrics',
+              },
+            },
+          ],
+        }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(screen.getByText(/Workflow Progress/i)).toBeInTheDocument();
+      });
+
+      expect(screen.getByText(/step: step-read-metrics/i)).toBeInTheDocument();
+      expect(screen.getByText(/Succeeded/i)).toBeInTheDocument();
+    });
+
+    it('renders approval dialog with risk explanation and proves rejecting never triggers execution', async () => {
+      let executionTriggered = false;
+      const initialApproval = {
+        approval_id: 'appr-w3-001',
+        plan_id: 'plan-system-health',
+        step_id: 'step-run-diagnostic',
+        session_id: 'sess-approval-test',
+        status: 'pending' as const,
+      };
+
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          session_id: 'sess-approval-test',
+          state: 'active',
+          mode: 'mock',
+          events: [],
+        }),
+        getPendingApprovals: vi.fn().mockResolvedValue([initialApproval]),
+        decideApproval: vi.fn().mockImplementation(async (_sid, _aid, decision) => {
+          if (decision === 'approve') {
+            executionTriggered = true;
+          }
+          return {
+            ...initialApproval,
+            status: decision === 'approve' ? 'approved' : 'rejected',
+          };
+        }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      // Wait for approval dialog to appear
+      await waitFor(() => {
+        expect(screen.getByRole('dialog', { name: /Action Approval Required/i })).toBeInTheDocument();
+      });
+
+      // One-line risk explanation is present and explains what will happen
+      expect(
+        screen.getByText(/will perform consequential system actions that require explicit human consent/i)
+      ).toBeInTheDocument();
+
+      // Reject the approval
+      const rejectBtn = screen.getByRole('button', { name: /Reject action/i });
+      fireEvent.click(rejectBtn);
+
+      await waitFor(() => {
+        expect(mockClient.decideApproval).toHaveBeenCalledWith(
+          'sess-approval-test',
+          'appr-w3-001',
+          'reject'
+        );
+      });
+
+      // Crucial requirement: PROVE rejecting never triggers execution!
+      expect(executionTriggered).toBe(false);
+
+      // Audit event for rejection is recorded in progress panel
+      const progressSection = screen.getByLabelText(/workflow progress/i);
+      expect(within(progressSection).getByText('Rejected')).toBeInTheDocument();
+      expect(screen.getByText(/Step execution prevented/i)).toBeInTheDocument();
+    });
+
+    it('reconnects and replays missed events without duplicates', async () => {
+      let fetchCount = 0;
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          session_id: 'sess-reconnect-test',
+          state: 'active',
+          mode: 'mock',
+          events: [
+            {
+              event_id: 'evt-seg-1',
+              event_type: 'transcript.segment',
+              schema_version: '1.0',
+              session_id: 'sess-reconnect-test',
+              correlation_id: 'corr-rec',
+              timestamp: '2026-01-01T00:00:00Z',
+              producer: 'transcription',
+              payload: {
+                segment_id: 'seg-1',
+                session_id: 'sess-reconnect-test',
+                sequence_id: 0,
+                start_ms: 0,
+                end_ms: 500,
+                text: 'Initial segment text',
+                confidence: 0.9,
+                language: 'en',
+                is_final: true,
+              },
+            },
+          ],
+        }),
+        getEvents: vi.fn().mockImplementation(async (_sid, fromSeq) => {
+          fetchCount++;
+          return {
+            session_id: 'sess-reconnect-test',
+            from_sequence: fromSeq,
+            total_events: 2,
+            has_more: false,
+            events: [
+              // Replays evt-seg-1 (duplicate that must be ignored) and evt-seg-2 (new)
+              {
+                event_id: 'evt-seg-1',
+                event_type: 'transcript.segment',
+                schema_version: '1.0',
+                session_id: 'sess-reconnect-test',
+                correlation_id: 'corr-rec',
+                timestamp: '2026-01-01T00:00:00Z',
+                producer: 'transcription',
+                payload: {
+                  segment_id: 'seg-1',
+                  session_id: 'sess-reconnect-test',
+                  sequence_id: 0,
+                  start_ms: 0,
+                  end_ms: 500,
+                  text: 'Initial segment text',
+                  confidence: 0.9,
+                  language: 'en',
+                  is_final: true,
+                },
+              },
+              {
+                event_id: 'evt-seg-2',
+                event_type: 'transcript.segment',
+                schema_version: '1.0',
+                session_id: 'sess-reconnect-test',
+                correlation_id: 'corr-rec',
+                timestamp: '2026-01-01T00:00:01Z',
+                producer: 'transcription',
+                payload: {
+                  segment_id: 'seg-2',
+                  session_id: 'sess-reconnect-test',
+                  sequence_id: 1,
+                  start_ms: 500,
+                  end_ms: 1000,
+                  text: 'Replayed new segment text',
+                  confidence: 0.95,
+                  language: 'en',
+                  is_final: true,
+                },
+              },
+            ],
+          };
+        }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Initial segment text')).toBeInTheDocument();
+      });
+
+      // Trigger reconnect
+      const reconnectBtn = screen.getByTestId('reconnect-button');
+      fireEvent.click(reconnectBtn);
+
+      await waitFor(() => {
+        expect(screen.getByText('Replayed new segment text')).toBeInTheDocument();
+      });
+
+      // Verify no duplicates of the initial segment
+      const matches = screen.getAllByText('Initial segment text');
+      expect(matches).toHaveLength(1);
+      expect(screen.getByText(/zero duplicates/i)).toBeInTheDocument();
+    });
+
+    it('enforces privacy settings: screen-context is OFF by default and visible', () => {
+      render(<App />);
+
+      const toggle = screen.getByTestId('screen-context-toggle');
+      expect(toggle).toBeInTheDocument();
+      expect(toggle).toHaveAttribute('aria-checked', 'false');
+
+      // Turn on
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-checked', 'true');
+      expect(screen.getByText(/ON \(capture_enabled: true\)/i)).toBeInTheDocument();
+
+      // Turn off
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-checked', 'false');
+      expect(screen.getByText(/OFF \(capture_enabled: false\)/i)).toBeInTheDocument();
+    });
+  });
 });

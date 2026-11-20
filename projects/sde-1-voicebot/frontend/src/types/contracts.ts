@@ -94,3 +94,124 @@ export interface ReasoningResult {
   insufficient_evidence: boolean;
   prompt_version: 'v1';
 }
+
+/**
+ * Audio Speech Events owned by W1/W2/W5 (backend/app/contracts/audio.py).
+ */
+export type SpeechEventKind = 'wake' | 'speech_start' | 'speech_end';
+
+export interface SpeechEvent {
+  kind: SpeechEventKind;
+  session_id: string;
+  correlation_id: string;
+  sequence_id: number;
+  at_ms: number;
+  wake_word?: string | null;
+  score?: number | null;
+}
+
+/**
+ * Workflow and Approvals contracts owned by W4 (backend/app/contracts/workflow.py).
+ */
+export type WorkflowState =
+  | 'draft'
+  | 'awaiting_approval'
+  | 'running'
+  | 'paused'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export interface WorkflowStep {
+  step_id: string;
+  tool_name: string;
+  arguments: Record<string, string>;
+  requires_approval: boolean;
+  depends_on?: string[];
+}
+
+export interface WorkflowPlan {
+  plan_id: string;
+  session_id: string;
+  steps: WorkflowStep[];
+  state?: WorkflowState;
+}
+
+export interface WorkflowProposal {
+  proposal_id: string;
+  session_id: string;
+  correlation_id: string;
+  summary: string;
+  steps: WorkflowStep[];
+  source_ids?: string[];
+}
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+
+export interface ApprovalRequest {
+  approval_id: string;
+  plan_id: string;
+  step_id: string;
+  session_id: string;
+  status: ApprovalStatus;
+  expires_at?: string | null;
+}
+
+export interface ApprovalDecisionRequest {
+  decision: 'approve' | 'reject';
+}
+
+export type AuditKind =
+  | 'approval_granted'
+  | 'approval_rejected'
+  | 'approval_expired'
+  | 'approval_missing'
+  | 'step_succeeded'
+  | 'step_failed'
+  | 'step_timed_out'
+  | 'step_retried'
+  | 'workflow_cancelled';
+
+export interface AuditEvent {
+  sequence: number;
+  kind: AuditKind;
+  plan_id: string;
+  session_id: string;
+  step_id?: string | null;
+  approval_id?: string | null;
+  details_redacted?: Record<string, string>;
+}
+
+export interface WorkflowResult {
+  plan_id: string;
+  session_id: string;
+  state: WorkflowState;
+  outputs?: Record<string, string>;
+  error?: ErrorEnvelope | null;
+  audit_events?: AuditEvent[];
+}
+
+/**
+ * Event Stream / Replay response owned by W5 (backend/app/contracts/sessions.py).
+ */
+export interface SessionEventStreamResponse {
+  session_id: string;
+  events: EventEnvelope<unknown>[];
+  from_sequence: number;
+  total_events: number;
+  has_more: boolean;
+}
+
+export interface VoicebotDesktopBridge {
+  isElectron: true;
+  getToken: () => string;
+  setWindowExpanded: (expanded: boolean) => Promise<void>;
+}
+
+declare global {
+  interface Window {
+    voicebot?: VoicebotDesktopBridge;
+  }
+}
+
+
