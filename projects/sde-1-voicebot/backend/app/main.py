@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -15,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import settings
 from app.contracts.common import ErrorEnvelope, SessionState
 from app.contracts.sessions import (
+    ApprovalDecisionRequest,
     MockSessionRequest,
     MockSessionResponse,
     SessionActionRequest,
@@ -22,6 +26,8 @@ from app.contracts.sessions import (
     SessionEventStreamResponse,
     SessionStateResponse,
 )
+from app.contracts.workflow import ApprovalRequest
+from app.sessions.gateways import GatewayError
 from app.sessions.logging import (
     StructuredRedactingFormatter,
     current_correlation_id,
@@ -29,9 +35,13 @@ from app.sessions.logging import (
     current_session_id,
 )
 from app.sessions.service import (
+    ApprovalAlreadyDecidedError,
+    ApprovalExpiredError,
+    ApprovalNotFoundError,
     IdempotencyConflictError,
     InvalidSessionTransitionError,
     MissingDependencyError,
+    MissingWorkflowPlanError,
     SessionAlreadyExistsError,
     SessionExpiredError,
     SessionNotFoundError,
@@ -48,10 +58,57 @@ logger = logging.getLogger("voicebot.backend")
 CORRELATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
+
+class RateLimiter:
+    """Sliding-window in-memory rate limiter."""
+
+    def __init__(self) -> None:
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+
+    def is_allowed(
+        self,
+        key: str,
+        max_requests: int,
+        window_seconds: int,
+        now: float | None = None,
+    ) -> tuple[bool, int]:
+        current_time = now if now is not None else time.time()
+        window_start = current_time - window_seconds
+        queue = self._requests[key]
+
+        while queue and queue[0] < window_start:
+            queue.popleft()
+
+        if len(queue) >= max_requests:
+            oldest = queue[0]
+            retry_after = max(1, int(oldest + window_seconds - current_time) + 1)
+            return False, retry_after
+
+        queue.append(current_time)
+        return True, 0
+
+    def reset(self) -> None:
+        self._requests.clear()
+
+
+rate_limiter = RateLimiter()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context printing ready notification when server starts listening."""
+    print(
+        f"VOICEBOT_READY: http://{settings.host}:{settings.port}",
+        flush=True,
+    )
+    yield
+
+
 app = FastAPI(
     title="SDE 1 Voicebot Backend",
     version="1.0.0",
     description="Backend API and session orchestrator for SDE 1 Voicebot",
+    lifespan=lifespan,
 )
 
 
@@ -59,7 +116,7 @@ app = FastAPI(
 async def correlation_and_limits_middleware(
     request: Request, call_next: Any
 ) -> Response:
-    """Validate correlation IDs, payload limits on actual bytes read, and trace IDs."""
+    """Validate auth boundary, rate limits, payload limits, and correlation IDs."""
     request_id = str(uuid.uuid4())
     incoming_corr_id = request.headers.get("X-Correlation-ID")
     generated_corr_id = f"corr-{uuid.uuid4().hex[:16]}"
@@ -84,7 +141,63 @@ async def correlation_and_limits_middleware(
     else:
         effective_corr_id = generated_corr_id
 
-    # Check Content-Length header if supplied
+    # Attach IDs to request state and contextvars early for logging
+    request.state.request_id = request_id
+    request.state.correlation_id = effective_corr_id
+    current_correlation_id.set(effective_corr_id)
+    current_request_id.set(request_id)
+
+    # 1. Local Auth Boundary check (VOICEBOT_LAUNCH_TOKEN)
+    if settings.launch_token and request.url.path.startswith("/api/"):
+        if request.url.path != "/api/health":
+            auth_header = request.headers.get("Authorization")
+            expected_auth = f"Bearer {settings.launch_token}"
+            if not auth_header or auth_header.strip() != expected_auth:
+                error_envelope = ErrorEnvelope(
+                    code="AUTH_REQUIRED",
+                    message_safe_for_user="Authentication required.",
+                    retryable=False,
+                    correlation_id=effective_corr_id,
+                    details_redacted={},
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content=error_envelope.model_dump(mode="json"),
+                )
+                response.headers["X-Request-ID"] = request_id
+                response.headers["X-Correlation-ID"] = effective_corr_id
+                return response
+
+    # 2. Rate limiting check
+    if request.url.path.startswith("/api/"):
+        client_ip = (
+            request.client.host
+            if request.client and request.client.host
+            else "127.0.0.1"
+        )
+        allowed, retry_after = rate_limiter.is_allowed(
+            client_ip,
+            settings.rate_limit_requests,
+            settings.rate_limit_window_seconds,
+        )
+        if not allowed:
+            error_envelope = ErrorEnvelope(
+                code="RATE_LIMITED",
+                message_safe_for_user="Rate limit exceeded. Please retry later.",
+                retryable=True,
+                correlation_id=effective_corr_id,
+                details_redacted={"retry_after": str(retry_after)},
+            )
+            response = JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content=error_envelope.model_dump(mode="json"),
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Correlation-ID"] = effective_corr_id
+            return response
+
+    # 3. Check Content-Length header if supplied
     content_length_str = request.headers.get("Content-Length")
     if content_length_str is not None:
         try:
@@ -126,7 +239,7 @@ async def correlation_and_limits_middleware(
             response.headers["X-Correlation-ID"] = effective_corr_id
             return response
 
-    # Enforce payload limit on actual bytes read (including chunked requests)
+    # 4. Enforce payload limit on actual bytes read (including chunked requests)
     if request.method in ("POST", "PUT", "PATCH"):
         body_chunks = []
         bytes_read = 0
@@ -153,12 +266,6 @@ async def correlation_and_limits_middleware(
             body_chunks.append(chunk)
 
         request._body = b"".join(body_chunks)
-
-    # Attach IDs to request state and contextvars
-    request.state.request_id = request_id
-    request.state.correlation_id = effective_corr_id
-    current_correlation_id.set(effective_corr_id)
-    current_request_id.set(request_id)
 
     try:
         response = await call_next(request)
@@ -393,6 +500,130 @@ async def session_expired_handler(
     return response
 
 
+@app.exception_handler(ApprovalNotFoundError)
+async def approval_not_found_handler(
+    request: Request,
+    exc: ApprovalNotFoundError,
+) -> JSONResponse:
+    """Report nonexistent approval ID as 404 with ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="APPROVAL_NOT_FOUND",
+        message_safe_for_user=f"Approval request not found: {exc.approval_id}",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={"approval_id": exc.approval_id},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(ApprovalAlreadyDecidedError)
+async def approval_already_decided_handler(
+    request: Request,
+    exc: ApprovalAlreadyDecidedError,
+) -> JSONResponse:
+    """Report deciding an already-decided approval as 409 Conflict."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="APPROVAL_ALREADY_DECIDED",
+        message_safe_for_user=(
+            f"Approval '{exc.approval_id}' has already been decided: "
+            f"{exc.current_status}."
+        ),
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={
+            "approval_id": exc.approval_id,
+            "status": exc.current_status,
+        },
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(ApprovalExpiredError)
+async def approval_expired_handler(
+    request: Request,
+    exc: ApprovalExpiredError,
+) -> JSONResponse:
+    """Report deciding an expired approval as 409 Conflict with ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="APPROVAL_EXPIRED",
+        message_safe_for_user=f"Approval request has expired: {exc.approval_id}",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={"approval_id": exc.approval_id},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(MissingWorkflowPlanError)
+async def missing_workflow_plan_handler(
+    request: Request,
+    exc: MissingWorkflowPlanError,
+) -> JSONResponse:
+    """Report deciding an approval with missing workflow plan as 409 Conflict."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="WORKFLOW_PLAN_MISSING",
+        message_safe_for_user=f"Workflow plan not found for approval: {exc.plan_id}",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={"plan_id": exc.plan_id},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(GatewayError)
+async def gateway_error_handler(
+    request: Request,
+    exc: GatewayError,
+) -> JSONResponse:
+    """Normalize gateway failures into safe ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    response = JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content=exc.envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(
     request: Request,
@@ -437,20 +668,22 @@ def validate_idempotency_key(key: str | None, corr_id: str) -> None:
 
 
 @app.get("/api/health")
-async def health() -> dict[str, str]:
-    """Health endpoint confirming the server is running."""
-    return {"status": "ok", "mode": "mock"}
+async def health() -> dict[str, Any]:
+    """Health endpoint returning aggregated status across all module gateways."""
+    aggregated = session_service.get_aggregated_health()
+    return aggregated.model_dump(mode="json")
 
 
 @app.get("/api/ready")
 async def ready() -> dict[str, str]:
-    """Readiness endpoint verifying configuration is ready."""
+    """Readiness endpoint verifying configuration and auth mode."""
     if not settings.mock_mode:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Mock mode configuration is unavailable.",
         )
-    return {"status": "ready", "mode": "mock"}
+    auth_mode = "token" if settings.launch_token else "off"
+    return {"status": "ready", "mode": "mock", "auth": auth_mode}
 
 
 @app.post(
@@ -466,9 +699,16 @@ async def create_mock_session(
     corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
     session_id = f"session-{uuid.uuid4().hex[:12]}"
     current_session_id.set(session_id)
-    return session_service.run_mock_session(
+    _record, events = session_service.run_pipeline_session(
         session_id=session_id,
         correlation_id=corr_id,
+        auto_approve=True,
+    )
+    return MockSessionResponse(
+        session_id=session_id,
+        state="completed",
+        mode="mock",
+        events=events,
     )
 
 
@@ -739,7 +979,7 @@ async def stream_session_events(
             if not sess:
                 break
 
-            # If terminal state reached, drain every remaining event, then complete
+            # If terminal state reached, drain remaining events, then complete
             if sess.state in (
                 SessionState.completed,
                 SessionState.failed,
@@ -775,3 +1015,40 @@ async def stream_session_events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# --- Week 3 Approvals Endpoints ---
+
+
+@app.get(
+    "/api/sessions/{session_id}/approvals",
+    response_model=list[ApprovalRequest],
+)
+async def list_session_approvals(
+    session_id: str,
+) -> list[ApprovalRequest]:
+    """List pending approval requests for a session."""
+    current_session_id.set(session_id)
+    return session_service.get_pending_approvals(session_id)
+
+
+@app.post(
+    "/api/sessions/{session_id}/approvals/{approval_id}",
+    response_model=ApprovalRequest,
+)
+async def decide_session_approval(
+    request: Request,
+    session_id: str,
+    approval_id: str,
+    body: ApprovalDecisionRequest,
+) -> ApprovalRequest:
+    """Approve or reject a pending approval request."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    current_session_id.set(session_id)
+    updated, _ = session_service.decide_approval(
+        session_id,
+        approval_id,
+        body.decision,
+        correlation_id=corr_id,
+    )
+    return updated

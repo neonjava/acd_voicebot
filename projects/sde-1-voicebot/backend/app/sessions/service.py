@@ -3,19 +3,35 @@
 import importlib.util
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from app.config import settings
 from app.contracts.common import ContractModel, SessionState
 from app.contracts.sessions import (
     AudioChunkEvent,
     AudioChunkMetadata,
+    HealthResponse,
     IdempotencyRecord,
     MockSessionResponse,
+    ModuleHealthStatus,
+    OverallHealthStatus,
     SessionEvent,
     SessionStateResponse,
+    SpeechStreamEvent,
+    WorkflowAuditEvent,
 )
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
+from app.contracts.workflow import (
+    ApprovalRequest,
+    WorkflowPlan,
+    WorkflowResult,
+)
+from app.sessions.gateways import (
+    audio_gateway,
+    reasoning_gateway,
+    transcription_gateway,
+    workflow_gateway,
+)
 
 # Documented legal transition table
 LEGAL_TRANSITIONS: dict[SessionState, set[SessionState]] = {
@@ -112,6 +128,41 @@ class MissingDependencyError(RuntimeError):
         self.dependency_name = dependency_name
 
 
+class ApprovalNotFoundError(Exception):
+    """Raised when looking up an approval ID that does not exist."""
+
+    def __init__(self, approval_id: str) -> None:
+        super().__init__(f"Approval request not found: {approval_id}")
+        self.approval_id = approval_id
+
+
+class ApprovalAlreadyDecidedError(Exception):
+    """Raised when deciding an approval that has already been approved or rejected."""
+
+    def __init__(self, approval_id: str, current_status: str) -> None:
+        super().__init__(
+            f"Approval '{approval_id}' has already been decided: {current_status}"
+        )
+        self.approval_id = approval_id
+        self.current_status = current_status
+
+
+class ApprovalExpiredError(Exception):
+    """Raised when attempting to decide an expired approval request."""
+
+    def __init__(self, approval_id: str) -> None:
+        super().__init__(f"Approval request has expired: {approval_id}")
+        self.approval_id = approval_id
+
+
+class MissingWorkflowPlanError(Exception):
+    """Raised when deciding an approval whose associated workflow plan is missing."""
+
+    def __init__(self, plan_id: str) -> None:
+        super().__init__(f"Workflow plan not found for approval: {plan_id}")
+        self.plan_id = plan_id
+
+
 class SessionRecord(ContractModel):
     """In-memory representation of an active, paused, or completed session."""
 
@@ -130,12 +181,16 @@ class SessionService:
         self._sessions: dict[str, SessionRecord] = {}
         self._session_events: dict[str, list[SessionEvent]] = {}
         self._idempotency_cache: dict[str, IdempotencyRecord] = {}
+        self._approvals: dict[str, ApprovalRequest] = {}
+        self._workflow_plans: dict[str, WorkflowPlan] = {}
 
     def clear(self) -> None:
         """Clear all sessions and caches (primarily for test isolation)."""
         self._sessions.clear()
         self._session_events.clear()
         self._idempotency_cache.clear()
+        self._approvals.clear()
+        self._workflow_plans.clear()
 
     def create_session(
         self,
@@ -336,6 +391,250 @@ class SessionService:
         all_events = self._session_events.get(session_id, [])
         return all_events[from_sequence : from_sequence + limit]
 
+    # --- Approvals management ---
+
+    def register_approval(
+        self, approval: ApprovalRequest, plan: WorkflowPlan | None = None
+    ) -> None:
+        """Register an approval request and its required associated workflow plan."""
+        if plan is None:
+            raise ValueError(
+                "Workflow plan is required when registering an approval request"
+            )
+        self._approvals[approval.approval_id] = approval
+        self._workflow_plans[plan.plan_id] = plan
+
+    def get_pending_approvals(self, session_id: str) -> list[ApprovalRequest]:
+        """List all pending approval requests for a session."""
+        if session_id not in self._sessions:
+            raise SessionNotFoundError(session_id)
+        now = datetime.now(timezone.utc)
+        pending: list[ApprovalRequest] = []
+        for appr in self._approvals.values():
+            if appr.session_id == session_id:
+                is_expired = appr.expires_at is not None and now >= appr.expires_at
+                if appr.status == "pending" and not is_expired:
+                    pending.append(appr)
+        return pending
+
+    def get_approval(self, approval_id: str) -> ApprovalRequest | None:
+        """Retrieve an approval request by its ID."""
+        return self._approvals.get(approval_id)
+
+    def decide_approval(
+        self,
+        session_id: str,
+        approval_id: str,
+        decision: Literal["approve", "reject"],
+        *,
+        now: datetime | None = None,
+        correlation_id: str | None = None,
+    ) -> tuple[ApprovalRequest, WorkflowResult | None]:
+        """Decide an approval request, executing the workflow plan if approved."""
+        sess = self.get_session(session_id, check_expiry=True, now=now)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+
+        # 1. Reject if session is expired
+        if sess.state == SessionState.expired:
+            raise ApprovalExpiredError(approval_id)
+
+        approval = self._approvals.get(approval_id)
+        if not approval or approval.session_id != session_id:
+            raise ApprovalNotFoundError(approval_id)
+
+        ts = now or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        # 2. Check if already decided
+        if approval.status in ("approved", "rejected"):
+            raise ApprovalAlreadyDecidedError(approval_id, approval.status)
+
+        # 3. Check if approval itself has expired
+        if approval.expires_at is not None and ts >= approval.expires_at:
+            raise ApprovalExpiredError(approval_id)
+
+        # 4. Check that associated workflow plan exists
+        plan = self._workflow_plans.get(approval.plan_id)
+        if plan is None:
+            raise MissingWorkflowPlanError(approval.plan_id)
+
+        # 5. Update approval
+        new_status = "approved" if decision == "approve" else "rejected"
+        updated = approval.model_copy(update={"status": new_status})
+        self._approvals[approval_id] = updated
+
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+        workflow_result, audit_events = workflow_gateway.execute_plan(
+            plan, [updated], correlation_id=cid
+        )
+        for audit in audit_events:
+            audit_envelope = WorkflowAuditEvent(
+                event_id=f"event-audit-{uuid.uuid4().hex[:8]}",
+                event_type="workflow.audit",
+                schema_version="1.0",
+                session_id=session_id,
+                correlation_id=cid,
+                timestamp=ts,
+                producer="workflow",
+                payload=audit,
+            )
+            self.add_event(session_id, audit_envelope)
+
+        return updated, workflow_result
+
+    # --- Health Aggregation ---
+
+    def get_aggregated_health(self) -> HealthResponse:
+        """Check status across audio, transcription, reasoning, and workflow."""
+        audio_st = audio_gateway.health()
+        trans_st = transcription_gateway.health()
+        reas_st = reasoning_gateway.health()
+        work_st = workflow_gateway.health()
+
+        modules: dict[str, ModuleHealthStatus] = {
+            "audio": audio_st,
+            "transcription": trans_st,
+            "reasoning": reas_st,
+            "workflow": work_st,
+        }
+
+        statuses = list(modules.values())
+        if all(s in ("ok", "mock") for s in statuses):
+            overall: OverallHealthStatus = "ok"
+        elif any(s == "down" for s in statuses):
+            overall = "down"
+        else:
+            overall = "degraded"
+
+        return HealthResponse(
+            status=overall,
+            mode="mock",
+            modules=modules,
+        )
+
+    # --- End-to-End Gateway Orchestration Pipeline ---
+
+    def run_pipeline_session(
+        self,
+        *,
+        session_id: str | None = None,
+        correlation_id: str | None = None,
+        question: str = "What was said?",
+        timestamp: datetime | None = None,
+        auto_approve: bool = True,
+    ) -> tuple[SessionRecord, list[SessionEvent]]:
+        """Route session through audio, transcription, reasoning, and workflow."""
+        sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+        ts = timestamp or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        # Create session and transition to active
+        self.create_session(session_id=sid, now=ts)
+        self.transition(sid, SessionState.active, now=ts)
+
+        try:
+            # Check required upstream module specs
+            has_audio = importlib.util.find_spec("app.audio") is not None
+            if not has_audio:
+                raise MissingDependencyError("W1 Audio")
+
+            has_transcription = (
+                importlib.util.find_spec("app.transcription") is not None
+            )
+            if not has_transcription:
+                raise MissingDependencyError("W2 Transcription")
+
+            has_reasoning = importlib.util.find_spec("app.reasoning") is not None
+            if not has_reasoning:
+                raise MissingDependencyError("W3 Reasoning")
+
+            has_workflow = importlib.util.find_spec("app.agent") is not None
+            if not has_workflow:
+                raise MissingDependencyError("W4 Workflow")
+
+            # 1. Audio Gateway
+            chunks, metadata, speech_events = audio_gateway.produce_audio_and_speech(
+                session_id=sid,
+                correlation_id=cid,
+                duration_ms=1000,
+                timestamp=ts,
+            )
+            for idx, meta in enumerate(metadata):
+                audio_evt = AudioChunkEvent(
+                    event_id=f"event-audio-{idx}",
+                    event_type="audio.chunk",
+                    schema_version="1.0",
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                    producer="audio",
+                    payload=meta,
+                )
+                self.add_event(sid, audio_evt)
+
+            for idx, sp in enumerate(speech_events):
+                speech_evt = SpeechStreamEvent(
+                    event_id=f"event-speech-{idx}",
+                    event_type="audio.speech",
+                    schema_version="1.0",
+                    session_id=sid,
+                    correlation_id=cid,
+                    timestamp=ts,
+                    producer="audio",
+                    payload=sp,
+                )
+                self.add_event(sid, speech_evt)
+
+            # 2. Transcription Gateway
+            transcript_events = transcription_gateway.transcribe(
+                chunks,
+                session_id=sid,
+                correlation_id=cid,
+                timestamp=ts,
+            )
+            segments: list[TranscriptSegment] = []
+            for tr_evt in transcript_events:
+                self.add_event(sid, tr_evt)
+                if isinstance(tr_evt.payload, TranscriptSegment):
+                    segments.append(tr_evt.payload)
+
+            # 3. Reasoning Gateway
+            reasoning_result = reasoning_gateway.reason_from_transcript(
+                session_id=sid,
+                correlation_id=cid,
+                segments=segments,
+                question=question,
+            )
+
+            # 4. Workflow Gateway
+            prop, plan, approval = workflow_gateway.build_proposal_and_plan(
+                session_id=sid,
+                correlation_id=cid,
+                text_to_echo=reasoning_result.answer,
+                source_ids=reasoning_result.source_ids,
+            )
+            self.register_approval(approval, plan)
+
+            if auto_approve:
+                self.decide_approval(
+                    sid,
+                    approval.approval_id,
+                    "approve",
+                    now=ts,
+                    correlation_id=cid,
+                )
+
+            completed_record = self.transition(sid, SessionState.completed, now=ts)
+            return completed_record, self._session_events.get(sid, [])
+
+        except Exception:
+            self.transition(sid, SessionState.failed, now=ts)
+            raise
+
     # --- Idempotency helpers ---
 
     def get_idempotent_result(
@@ -436,7 +735,6 @@ class SessionService:
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        # 1. Create session and transition created -> active
         self.create_session(session_id=sid, now=ts)
         self.transition(sid, SessionState.active, now=ts)
 
@@ -466,7 +764,7 @@ class SessionService:
                 )
                 events.append(audio_evt)
 
-                transcript_segment = TranscriptSegment(
+                transcript_seg = TranscriptSegment(
                     segment_id=f"{sid}-segment-0",
                     session_id=sid,
                     sequence_id=0,
@@ -485,18 +783,19 @@ class SessionService:
                     correlation_id=cid,
                     timestamp=ts,
                     producer="transcription",
-                    payload=transcript_segment,
+                    payload=transcript_seg,
                 )
                 events.append(transcript_evt)
             else:
-                if (
-                    importlib.util.find_spec("app.audio.source") is None
-                    or importlib.util.find_spec("app.audio.chunker") is None
-                ):
-                    raise MissingDependencyError("app.audio (W1)")
+                has_audio = importlib.util.find_spec("app.audio") is not None
+                if not has_audio:
+                    raise MissingDependencyError("W1 Audio")
 
-                if importlib.util.find_spec("app.transcription.mock") is None:
-                    raise MissingDependencyError("app.transcription (W2)")
+                has_transcription = (
+                    importlib.util.find_spec("app.transcription") is not None
+                )
+                if not has_transcription:
+                    raise MissingDependencyError("W2 Transcription")
 
                 from app.audio.chunker import chunk_pcm
                 from app.audio.source import make_fake_pcm
@@ -534,13 +833,11 @@ class SessionService:
                 )
                 events.extend(transcript_events)
 
-            # Apply the same per-session cap that add_event enforces
             if len(events) > settings.max_events_per_session:
                 raise ValueError(
                     f"Session event limit ({settings.max_events_per_session}) reached"
                 )
 
-            # Build and validate response FIRST before marking completed
             response = MockSessionResponse(
                 session_id=sid,
                 state="completed",
@@ -548,9 +845,7 @@ class SessionService:
                 events=events,
             )
 
-            # Store events into buffer
             self._session_events[sid] = list(events)
-
             self.transition(sid, SessionState.completed, now=ts)
             return response
         except Exception:

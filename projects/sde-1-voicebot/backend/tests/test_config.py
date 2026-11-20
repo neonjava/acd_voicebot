@@ -20,13 +20,14 @@ def test_default_settings():
     assert cfg.max_payload_bytes == 65536
     assert cfg.max_events_per_session == 1000
     assert cfg.event_stream_chunk_ms == 20
+    assert cfg.launch_token is None
 
 
 def test_valid_custom_environment():
     """Settings loaded from valid environment variables must apply."""
     env = {
         "MOCK_MODE": "false",
-        "HOST": "0.0.0.0",
+        "HOST": "127.0.0.1",
         "PORT": "9000",
         "LOG_LEVEL": "debug",
         "SESSION_TTL_SECONDS": "1800",
@@ -36,12 +37,37 @@ def test_valid_custom_environment():
     with patch.dict(os.environ, env, clear=True):
         cfg = Settings.from_env()
         assert cfg.mock_mode is False
-        assert cfg.host == "0.0.0.0"
+        assert cfg.host == "127.0.0.1"
         assert cfg.port == 9000
         assert cfg.log_level == "DEBUG"
         assert cfg.session_ttl_seconds == 1800
         assert cfg.max_payload_bytes == 32768
         assert cfg.max_events_per_session == 500
+
+
+def test_host_other_than_127_0_0_1_rejected():
+    """Server must bind only to 127.0.0.1; any other host is rejected."""
+    with pytest.raises(ValidationError):
+        Settings(host="0.0.0.0")
+
+    with pytest.raises(ValidationError):
+        Settings(host="192.168.1.100")
+
+    with patch.dict(os.environ, {"HOST": "0.0.0.0"}, clear=True):
+        with pytest.raises(ValidationError):
+            Settings.from_env()
+
+
+def test_voicebot_port_and_launch_token_from_env():
+    """Settings reads VOICEBOT_PORT and VOICEBOT_LAUNCH_TOKEN from environment."""
+    env = {
+        "VOICEBOT_PORT": "8088",
+        "VOICEBOT_LAUNCH_TOKEN": "my-secret-launch-token",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        cfg = Settings.from_env()
+        assert cfg.port == 8088
+        assert cfg.launch_token == "my-secret-launch-token"
 
 
 def test_invalid_log_level_rejected():
