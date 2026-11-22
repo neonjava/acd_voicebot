@@ -17,10 +17,18 @@ class SegmentAccumulator:
     - Error events do not become transcript segments.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, confidence_threshold: float = 0.4) -> None:
+        self.confidence_threshold = float(confidence_threshold)
         self._session_id: str | None = None
         self._segments: dict[str, TranscriptSegment] = {}
         self._revisions: dict[str, int] = {}
+
+    def is_low_confidence(self, segment: TranscriptSegment) -> bool:
+        """Check whether a segment falls below the confidence threshold."""
+        return (
+            segment.confidence is not None
+            and segment.confidence < self.confidence_threshold
+        )
 
     @property
     def session_id(self) -> str | None:
@@ -102,21 +110,44 @@ class SegmentAccumulator:
             key=lambda s: (s.start_ms, s.sequence_id, s.segment_id),
         )
 
-    def final_segments(self) -> list[TranscriptSegment]:
-        """Return only finalized segments in chronological order."""
-        return [s for s in self.segments() if s.is_final]
+    def final_segments(
+        self, *, include_low_confidence: bool = False
+    ) -> list[TranscriptSegment]:
+        """Return only finalized segments in chronological order.
+
+        By default, low-confidence segments are excluded so they are never sent on
+        as final text without an explicit flag.
+        """
+        finals = [s for s in self.segments() if s.is_final]
+        if include_low_confidence:
+            return finals
+        return [s for s in finals if not self.is_low_confidence(s)]
 
     def interim_segments(self) -> list[TranscriptSegment]:
         """Return only interim segments in chronological order."""
         return [s for s in self.segments() if not s.is_final]
 
+    def low_confidence_segments(self) -> list[TranscriptSegment]:
+        """Return all segments falling below the confidence threshold."""
+        return [s for s in self.segments() if self.is_low_confidence(s)]
+
     def revisions_count(self, segment_id: str) -> int:
         """Return the number of revisions recorded for a given segment ID."""
         return self._revisions.get(segment_id, 0)
 
-    def text(self) -> str:
+    def text(self, *, include_low_confidence: bool = True) -> str:
         """Return the combined text of all accumulated segments in order."""
-        return " ".join(s.text for s in self.segments())
+        segs = self.segments()
+        if not include_low_confidence:
+            segs = [s for s in segs if not self.is_low_confidence(s)]
+        return " ".join(s.text for s in segs)
+
+    def final_text(self, *, include_low_confidence: bool = False) -> str:
+        """Return text of finalized segments, excluding low-confidence by default."""
+        return " ".join(
+            s.text
+            for s in self.final_segments(include_low_confidence=include_low_confidence)
+        )
 
     def gaps(self, min_gap_ms: int = 0) -> list[tuple[int, int]]:
         """Return chronological gaps (start_ms, end_ms) between segments."""
