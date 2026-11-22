@@ -18,6 +18,10 @@ class SegmentAccumulator:
     """
 
     def __init__(self, *, confidence_threshold: float = 0.4) -> None:
+        if type(confidence_threshold) not in (int, float) or not (
+            0.0 <= confidence_threshold <= 1.0
+        ):
+            raise ValueError("confidence_threshold must be a float between 0.0 and 1.0")
         self.confidence_threshold = float(confidence_threshold)
         self._session_id: str | None = None
         self._segments: dict[str, TranscriptSegment] = {}

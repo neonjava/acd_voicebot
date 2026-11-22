@@ -143,37 +143,60 @@ class TranscriptionOrchestrator:
         timestamp: datetime,
         preprocess: bool = True,
     ) -> list[TranscriptEvent]:
-        """Transcribe chunks between W1 speech_start and speech_end as one utterance."""
+        """Transcribe chunks between W1 speech_start and speech_end boundaries.
+
+        - Rejects speech events belonging to mismatched sessions.
+        - Identifies each distinct (speech_start, speech_end) utterance without merging.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a nonempty string")
+        if not isinstance(correlation_id, str) or not correlation_id.strip():
+            raise ValueError("correlation_id must be a nonempty string")
+
         if session_id in self._cancelled_sessions:
             return []
 
-        start_events = [e for e in speech_events if e.kind == "speech_start"]
-        end_events = [e for e in speech_events if e.kind == "speech_end"]
+        # Validate that all speech events belong strictly to the target session
+        for e in speech_events:
+            if e.session_id != session_id:
+                raise ValueError(
+                    f"Cannot process speech event with session_id '{e.session_id}' "
+                    f"in session '{session_id}'"
+                )
 
-        if not start_events or not end_events:
+        # Pair speech_start and speech_end events to process each utterance separately
+        utterance_intervals: list[tuple[int, int]] = []
+        current_start: int | None = None
+
+        for e in sorted(speech_events, key=lambda ev: (ev.at_ms, ev.sequence_id)):
+            if e.kind == "speech_start":
+                current_start = e.at_ms
+            elif e.kind == "speech_end" and current_start is not None:
+                utterance_intervals.append((current_start, e.at_ms))
+                current_start = None
+
+        if not utterance_intervals:
             return []
 
-        utterance_start_ms = start_events[0].at_ms
-        utterance_end_ms = end_events[-1].at_ms
+        all_events: list[TranscriptEvent] = []
+        for start_ms, end_ms in utterance_intervals:
+            utterance_chunks = [
+                c
+                for c in chunks
+                if c.start_ms >= start_ms
+                and (c.start_ms + c.duration_ms) <= end_ms + 40
+            ]
+            if utterance_chunks:
+                evts = self.process_chunks(
+                    utterance_chunks,
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    preprocess=preprocess,
+                )
+                all_events.extend(evts)
 
-        # Filter chunks bounded by speech_start and speech_end
-        utterance_chunks = [
-            c
-            for c in chunks
-            if c.start_ms >= utterance_start_ms
-            and (c.start_ms + c.duration_ms) <= utterance_end_ms + 40
-        ]
-
-        if not utterance_chunks:
-            return []
-
-        return self.process_chunks(
-            utterance_chunks,
-            session_id=session_id,
-            correlation_id=correlation_id,
-            timestamp=timestamp,
-            preprocess=preprocess,
-        )
+        return all_events
 
     def ingest_event(self, event: TranscriptEvent) -> bool:
         """Directly add a transcript event to the accumulator."""

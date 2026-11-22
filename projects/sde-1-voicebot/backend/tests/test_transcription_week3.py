@@ -1,5 +1,8 @@
 """Tests for Week 3 Speech-to-Text: revisions, confidence, and stream."""
 
+import io
+import sys
+import wave
 from datetime import datetime, timezone
 from typing import Any
 
@@ -204,6 +207,28 @@ class TestConfidenceThresholdHandling:
         assert acc.final_segments() == []
         assert acc.final_segments(include_low_confidence=True) == [mid_conf]
 
+    def test_confidence_threshold_validation(self) -> None:
+        """Validate confidence threshold is a valid float in [0.0, 1.0]."""
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            SegmentAccumulator(confidence_threshold=-0.1)
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            SegmentAccumulator(confidence_threshold=1.5)
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            TranscriptionConfig(confidence_threshold=-0.5)
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            TranscriptionConfig(confidence_threshold=2.0)
+
 
 class TestCancellationAndFailureRecovery:
     """Cancellation stops transcription cleanly, fallback to mock."""
@@ -287,6 +312,215 @@ class TestCancellationAndFailureRecovery:
         # Assert raw exception text/tokens never leak into details or message
         assert "secret-token-123" not in str(err.details_redacted)
         assert "secret-token-123" not in err.message_safe_for_user
+
+    def test_faster_whisper_caches_failed_model_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed model load is cached so subsequent calls don't retry repeatedly."""
+        load_attempts = 0
+
+        def failing_whisper_model(*args: Any, **kwargs: Any) -> Any:
+            nonlocal load_attempts
+            load_attempts += 1
+            raise RuntimeError("Failed to load WhisperModel from network")
+
+        import sys
+
+        # Mock the faster_whisper import inside faster_whisper.py
+        class MockModule:
+            WhisperModel = staticmethod(failing_whisper_model)
+
+        monkeypatch.setitem(sys.modules, "faster_whisper", MockModule)
+
+        config = TranscriptionConfig(provider="faster_whisper", fallback_to_mock=False)
+        adapter = FasterWhisperAdapter(config=config)
+        chunks = [_make_chunk("sess-cache-test", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # First call triggers load attempt
+        adapter.transcribe(
+            chunks, session_id="sess-cache-test", correlation_id="c1", timestamp=ts
+        )
+        assert load_attempts == 1
+        assert adapter.health() == "degraded"
+
+        # Second call uses cached _load_error and must NOT attempt loading again
+        adapter.transcribe(
+            chunks, session_id="sess-cache-test", correlation_id="c2", timestamp=ts
+        )
+        assert load_attempts == 1
+
+    def test_error_event_ids_unique_across_calls(self) -> None:
+        """Every error/fallback event must carry a globally unique event ID."""
+        # 1. FakeTranscriber error IDs
+        fake = FakeTranscriber(failure_mode="quota_error")
+        chunks = [_make_chunk("sess-unique-err", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        evts1 = fake.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c1", timestamp=ts
+        )
+        evts2 = fake.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c2", timestamp=ts
+        )
+        assert evts1[0].event_id != evts2[0].event_id
+
+        # 2. FasterWhisperAdapter error IDs without fallback
+        class ErrModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("engine failure")
+
+        adapter_no_fb = FasterWhisperAdapter(
+            config=TranscriptionConfig(fallback_to_mock=False),
+            model=ErrModel(),
+        )
+        a_evts1 = adapter_no_fb.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c1", timestamp=ts
+        )
+        a_evts2 = adapter_no_fb.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c2", timestamp=ts
+        )
+        assert a_evts1[0].event_id != a_evts2[0].event_id
+
+        # 3. FasterWhisperAdapter fallback error IDs with fallback enabled
+        adapter_fb = FasterWhisperAdapter(
+            config=TranscriptionConfig(fallback_to_mock=True),
+            model=ErrModel(),
+        )
+        fb_evts1 = adapter_fb.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c1", timestamp=ts
+        )
+        fb_evts2 = adapter_fb.transcribe(
+            chunks, session_id="sess-unique-err", correlation_id="c2", timestamp=ts
+        )
+        assert fb_evts1[0].event_id != fb_evts2[0].event_id
+
+    def test_faster_whisper_quota_network_failure_handling(
+        self,
+    ) -> None:
+        """Test real-provider fallback to mock on quota and network model failures."""
+
+        class QuotaExceededError(Exception):
+            pass
+
+        class ModelNetworkConnectionError(Exception):
+            pass
+
+        class FailingModel:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
+            def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+                raise self.exc
+
+        chunks = [_make_chunk("sess-err-fallback", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Quota error with fallback_to_mock=True
+        cfg_fb = TranscriptionConfig(provider="faster_whisper", fallback_to_mock=True)
+        adapter_q = FasterWhisperAdapter(
+            config=cfg_fb,
+            model=FailingModel(QuotaExceededError("Rate limit / quota exceeded")),
+        )
+        events_q = adapter_q.transcribe(
+            chunks,
+            session_id="sess-err-fallback",
+            correlation_id="c-q",
+            timestamp=ts,
+        )
+        assert len(events_q) >= 2
+        assert events_q[0].event_type == "transcript.error"
+        err_q = events_q[0].payload
+        assert isinstance(err_q, ErrorEnvelope)
+        assert err_q.code == "TRANSCRIPTION_FALLBACK_TO_MOCK"
+        assert err_q.details_redacted is not None
+        assert err_q.details_redacted["reason"] == "QuotaExceededError"
+        assert events_q[1].event_type == "transcript.segment"
+        assert events_q[1].payload.text == "Hello from the mock voicebot."
+
+        # 2. Network error with fallback_to_mock=True
+        adapter_n = FasterWhisperAdapter(
+            config=cfg_fb,
+            model=FailingModel(ModelNetworkConnectionError("Connection timed out")),
+        )
+        events_n = adapter_n.transcribe(
+            chunks,
+            session_id="sess-err-fallback",
+            correlation_id="c-n",
+            timestamp=ts,
+        )
+        assert len(events_n) >= 2
+        assert events_n[0].event_type == "transcript.error"
+        err_n = events_n[0].payload
+        assert isinstance(err_n, ErrorEnvelope)
+        assert err_n.code == "TRANSCRIPTION_FALLBACK_TO_MOCK"
+        assert err_n.details_redacted is not None
+        assert err_n.details_redacted["reason"] == "ModelNetworkConnectionError"
+        assert events_n[1].event_type == "transcript.segment"
+
+        # 3. Network error with fallback_to_mock=False (no raw leak)
+        cfg_no_fb = TranscriptionConfig(
+            provider="faster_whisper", fallback_to_mock=False
+        )
+        adapter_no_fb = FasterWhisperAdapter(
+            config=cfg_no_fb,
+            model=FailingModel(
+                ModelNetworkConnectionError("internal-endpoint:8080/private-key-456")
+            ),
+        )
+        events_no_fb = adapter_no_fb.transcribe(
+            chunks,
+            session_id="sess-err-fallback",
+            correlation_id="c-no-fb",
+            timestamp=ts,
+        )
+        assert len(events_no_fb) == 1
+        assert events_no_fb[0].event_type == "transcript.error"
+        err_no_fb = events_no_fb[0].payload
+        assert isinstance(err_no_fb, ErrorEnvelope)
+        assert err_no_fb.code == "TRANSCRIPTION_PROVIDER_ERROR"
+        assert err_no_fb.details_redacted["reason"] == "ModelNetworkConnectionError"
+        assert "private-key-456" not in str(err_no_fb.details_redacted)
+
+    def test_transcription_config_device_and_compute_resolution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TranscriptionConfig resolves device and compute respecting CUDA."""
+        import torch
+
+        # Test CUDA auto-detection
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        cfg_cuda = TranscriptionConfig(device="auto", compute_type="auto")
+        assert cfg_cuda.resolve_device_and_compute() == ("cuda", "float16")
+
+        # Test CPU auto-detection
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        cfg_cpu = TranscriptionConfig(device="auto", compute_type="auto")
+        assert cfg_cpu.resolve_device_and_compute() == ("cpu", "int8")
+
+        # Guard against invalid float16 on CPU
+        cfg_cpu_f16 = TranscriptionConfig(device="cpu", compute_type="float16")
+        assert cfg_cpu_f16.resolve_device_and_compute() == ("cpu", "int8")
+
+    def test_faster_whisper_numpy_missing_wave_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When numpy is not installed, raw PCM is wrapped in valid WAV buffer."""
+        adapter = FasterWhisperAdapter()
+        pcm = bytes(3200)  # 100ms 16kHz 16-bit mono PCM
+
+        # Hide numpy to force fallback to standard library wave module
+        monkeypatch.setitem(sys.modules, "numpy", None)
+
+        result = adapter._prepare_audio_input(pcm)
+        assert isinstance(result, io.BytesIO)
+        result.seek(0)
+        with wave.open(result, "rb") as wav_file:
+            assert wav_file.getnchannels() == 1
+            assert wav_file.getsampwidth() == 2
+            assert wav_file.getframerate() == 16000
+            frames = wav_file.readframes(1600)
+            assert frames == pcm
 
     def test_quota_failure_falls_back_with_normalized_error(self) -> None:
         transcriber = FakeTranscriber(failure_mode="quota_error")
@@ -434,29 +668,162 @@ class TestSpeechEventsAndEventStreamIntegration:
         assert seg.end_ms >= 700
 
     def test_publishes_transcript_events_to_session_event_stream(self) -> None:
-        published_events: list[tuple[str, TranscriptEvent]] = []
+        """Integration with real W5 SessionService event sink."""
+        from app.sessions.service import SessionService
 
-        def mock_event_sink(session_id: str, event: TranscriptEvent) -> None:
-            published_events.append((session_id, event))
+        service = SessionService()
+        session_id = "sess-stream-w5"
+        service.create_session(session_id)
 
-        orchestrator = TranscriptionOrchestrator(event_sink=mock_event_sink)
-        chunks = [_make_chunk("sess-stream", 0)]
+        orchestrator = TranscriptionOrchestrator(event_sink=service.add_event)
+        chunks = [_make_chunk(session_id, 0)]
         ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
         events = orchestrator.process_chunks(
-            chunks, session_id="sess-stream", correlation_id="c-stream", timestamp=ts
+            chunks, session_id=session_id, correlation_id="c-stream", timestamp=ts
         )
 
         assert len(events) == 1
-        assert len(published_events) == 1
-        sess_id, published_evt = published_events[0]
-        assert sess_id == "sess-stream"
-        assert published_evt.event_type == "transcript.segment"
-        assert published_evt.payload.session_id == "sess-stream"
+        recorded_events = service.get_events(session_id)
+        assert len(recorded_events) == 1
+        recorded_evt = recorded_events[0]
+        assert recorded_evt.session_id == session_id
+        assert recorded_evt.event_type == "transcript.segment"
+        assert recorded_evt.payload.session_id == session_id
+        assert recorded_evt.payload.text == "Hello from the mock voicebot."
+
+    def test_process_speech_session_handles_multiple_utterances_without_merging(
+        self,
+    ) -> None:
+        """Speech session pairs speech_start and speech_end into distinct utterances."""
+        orchestrator = TranscriptionOrchestrator()
+        session_id = "sess-multi-utt"
+        corr_id = "corr-multi"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        pcm = make_fake_pcm(duration_ms=1000)
+        chunks = chunk_pcm(pcm, session_id=session_id, chunk_ms=20)
+
+        # Two distinct utterances: [100..300ms] and [500..800ms]
+        speech_events = [
+            SpeechEvent(
+                kind="wake",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=0,
+                at_ms=0,
+                wake_word="hey_jarvis",
+                score=0.9,
+            ),
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=1,
+                at_ms=100,
+            ),
+            SpeechEvent(
+                kind="speech_end",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=2,
+                at_ms=300,
+            ),
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=3,
+                at_ms=500,
+            ),
+            SpeechEvent(
+                kind="speech_end",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=4,
+                at_ms=800,
+            ),
+        ]
+
+        events = orchestrator.process_speech_session(
+            speech_events,
+            chunks,
+            session_id=session_id,
+            correlation_id=corr_id,
+            timestamp=ts,
+        )
+
+        # Must produce 2 distinct segments, not merged into one
+        assert len(events) == 2
+        assert events[0].payload.start_ms == 100
+        assert events[0].payload.end_ms <= 340
+        assert events[1].payload.start_ms == 500
+        assert events[1].payload.end_ms <= 840
+
+    def test_process_speech_session_rejects_other_sessions_speech_events(self) -> None:
+        """Reject speech events belonging to mismatched sessions."""
+        orchestrator = TranscriptionOrchestrator()
+        session_id = "sess-target"
+        corr_id = "corr-tgt"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        chunks = [_make_chunk(session_id, 0)]
+
+        foreign_speech_events = [
+            SpeechEvent(
+                kind="speech_start",
+                session_id="sess-foreign",
+                correlation_id=corr_id,
+                sequence_id=0,
+                at_ms=0,
+            ),
+            SpeechEvent(
+                kind="speech_end",
+                session_id="sess-foreign",
+                correlation_id=corr_id,
+                sequence_id=1,
+                at_ms=20,
+            ),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Cannot process speech event with session_id 'sess-foreign' "
+                "in session 'sess-target'"
+            ),
+        ):
+            orchestrator.process_speech_session(
+                foreign_speech_events,
+                chunks,
+                session_id=session_id,
+                correlation_id=corr_id,
+                timestamp=ts,
+            )
 
 
 class TestAudioChunkIntegrity:
     """Acceptance criteria: out-of-order and missing chunks produce safe errors."""
+
+    def test_missing_chunks_detected_by_default(self) -> None:
+        """Missing chunks detection is active by default without extra config."""
+        transcriber = FakeTranscriber()
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        chunk0 = _make_chunk("sess-gap-def", 0, start_ms=0)
+        chunk3 = _make_chunk("sess-gap-def", 3, start_ms=60)
+
+        events = transcriber.transcribe(
+            [chunk0, chunk3],
+            session_id="sess-gap-def",
+            correlation_id="c-def",
+            timestamp=ts,
+        )
+
+        assert len(events) == 1
+        assert events[0].event_type == "transcript.error"
+        err = events[0].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_MISSING_CHUNKS"
 
     def test_out_of_order_chunks_produce_normalized_error(self) -> None:
         transcriber = FakeTranscriber()

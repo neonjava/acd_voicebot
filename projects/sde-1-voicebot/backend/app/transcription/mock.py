@@ -20,7 +20,7 @@ class FakeTranscriber:
         custom_texts: Sequence[str] | None = None,
         default_confidence: float = 1.0,
         default_is_final: bool = True,
-        detect_missing_chunks: bool = False,
+        detect_missing_chunks: bool = True,
     ) -> None:
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a positive number")
@@ -115,7 +115,7 @@ class FakeTranscriber:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"event-transcript-err-{session_id}",
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,
@@ -140,7 +140,7 @@ class FakeTranscriber:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"event-transcript-err-{session_id}",
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,
@@ -165,7 +165,7 @@ class FakeTranscriber:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"event-transcript-err-{session_id}",
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,

@@ -41,11 +41,15 @@ class FasterWhisperAdapter:
         self._cancelled_sessions: set[str] = set()
         self._load_error: str | None = None
         self._segment_indices: dict[str, int] = {}
+        self._error_counter: int = 0
 
     def _ensure_model_loaded(self) -> Any:
         """Lazily load the faster-whisper WhisperModel if not already provided."""
         if self._model is not None:
             return self._model
+
+        if self._load_error is not None:
+            raise RuntimeError(self._load_error)
 
         try:
             from faster_whisper import WhisperModel
@@ -53,20 +57,7 @@ class FasterWhisperAdapter:
             self._load_error = f"faster-whisper is not installed: {err}"
             raise RuntimeError(self._load_error) from err
 
-        device = self.config.device
-        compute_type = self.config.compute_type
-
-        # Auto-detect CUDA if requested
-        if device == "auto":
-            try:
-                import torch
-
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                device = "cpu"
-
-        if device == "cpu" and compute_type == "float16":
-            compute_type = "int8"
+        device, compute_type = self.config.resolve_device_and_compute()
 
         try:
             self._model = WhisperModel(
@@ -128,6 +119,7 @@ class FasterWhisperAdapter:
                 timestamp=timestamp,
             )
         except Exception as exc:
+            self._error_counter += 1
             if not self.config.fallback_to_mock:
                 # If fallback disabled, emit a normalized error event
                 err_env = ErrorEnvelope(
@@ -142,7 +134,7 @@ class FasterWhisperAdapter:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"evt-err-{session_id}-load-failed",
+                        event_id=f"evt-err-{session_id}-{self._error_counter}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,
@@ -167,7 +159,7 @@ class FasterWhisperAdapter:
                 },
             )
             fallback_event = TranscriptEvent(
-                event_id=f"evt-fallback-{session_id}-{correlation_id}",
+                event_id=f"evt-fallback-{session_id}-{self._error_counter}",
                 event_type="transcript.error",
                 schema_version="1.0",
                 session_id=session_id,
@@ -183,6 +175,25 @@ class FasterWhisperAdapter:
                 timestamp=timestamp,
             )
             return [fallback_event, *mock_events]
+
+    def _prepare_audio_input(self, raw_pcm: bytes) -> Any:
+        """Prepare audio input for Whisper: normalized float32 array or WAV buffer."""
+        try:
+            import numpy as np
+
+            return np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        except ImportError:
+            # Fallback to in-memory RIFF/WAVE container with valid headers
+            import wave
+
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(raw_pcm)
+            wav_buf.seek(0)
+            return wav_buf
 
     def _transcribe_with_model(
         self,
@@ -201,17 +212,7 @@ class FasterWhisperAdapter:
         # Combine PCM bytes from chunks
         raw_pcm = b"".join(c.pcm for c in chunks)
         stream_base_ms = chunks[0].start_ms
-
-        # Prepare audio input for Whisper: 16-bit PCM to float32 normalized [-1.0, 1.0]
-        try:
-            import numpy as np
-
-            audio_data = (
-                np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-            )
-        except ImportError:
-            # Fallback to io.BytesIO if numpy unavailable
-            audio_data = io.BytesIO(raw_pcm)
+        audio_data = self._prepare_audio_input(raw_pcm)
 
         segments_iterable, _ = model.transcribe(
             audio_data,
