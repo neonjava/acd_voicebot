@@ -135,7 +135,10 @@ class FasterWhisperAdapter:
                     message_safe_for_user="Local transcription model failed.",
                     retryable=False,
                     correlation_id=correlation_id,
-                    details_redacted={"reason": str(exc)},
+                    details_redacted={
+                        "reason": type(exc).__name__,
+                        "provider": "faster_whisper",
+                    },
                 )
                 return [
                     TranscriptEvent(
