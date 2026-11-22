@@ -12,7 +12,7 @@ def detect_default_device() -> str:
     try:
         import torch
 
-        if torch.cuda.is_available():
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
             return "cuda"
     except Exception:
         pass
