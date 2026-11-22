@@ -4,6 +4,12 @@ Week 2 adds dependency ordering, permission scopes, approval expiry with an
 injected clock, safe audit events, per-step timeouts, bounded retries for
 idempotent tools only, and cooperative cancellation. With no Week 2 options the
 behavior is the same as Week 1: one in-memory run, no durable history.
+
+Week 3 adds an optional ``WorkflowStore``: checkpoints let a failed run resume
+without re-running completed steps, and an idempotency key returns the stored
+final result instead of executing twice. ``on_audit`` streams each audit event
+as it happens (progress for the UI), ``approval_source`` reads approval
+decisions from the backend, and ``runtime`` selects mock or real tools.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -14,6 +20,8 @@ from time import monotonic
 from typing import Literal
 
 from app.agent import tools
+from app.agent.approvals import ApprovalSource
+from app.agent.checkpoint import WorkflowStore
 from app.agent.errors import TransientToolError, WorkflowPolicyError
 from app.agent.plan_validation import execution_order
 from app.agent.state_machine import transition
@@ -28,6 +36,7 @@ from app.contracts.workflow import (
 )
 
 Clock = Callable[[], datetime]
+AuditListener = Callable[[AuditEvent], None]
 ToolInvoker = Callable[[str, Mapping[str, str]], str]
 StepStatus = Literal["ok", "timeout", "failed", "cancelled", "expired"]
 
@@ -54,8 +63,11 @@ class _StepCancelled(Exception):
 
 
 class _Audit:
-    def __init__(self, plan: WorkflowPlan) -> None:
+    def __init__(
+        self, plan: WorkflowPlan, listener: AuditListener | None = None
+    ) -> None:
         self._plan = plan
+        self._listener = listener
         self.events: list[AuditEvent] = []
 
     def record(
@@ -66,17 +78,21 @@ class _Audit:
         approval_id: str | None = None,
         **details: str,
     ) -> None:
-        self.events.append(
-            AuditEvent(
-                sequence=len(self.events),
-                kind=kind,
-                plan_id=self._plan.plan_id,
-                session_id=self._plan.session_id,
-                step_id=step_id,
-                approval_id=approval_id,
-                details_redacted=dict(details),
-            )
+        event = AuditEvent(
+            sequence=len(self.events),
+            kind=kind,
+            plan_id=self._plan.plan_id,
+            session_id=self._plan.session_id,
+            step_id=step_id,
+            approval_id=approval_id,
+            details_redacted=dict(details),
         )
+        self.events.append(event)
+        if self._listener is not None:
+            try:
+                self._listener(event)
+            except Exception:  # noqa: BLE001 - a broken listener never stops a run
+                pass
 
 
 def _result(
@@ -150,6 +166,74 @@ def execute(
     cancellation: CancellationToken | None = None,
     invoker: ToolInvoker | None = None,
     correlation_id: str = "workflow-mock",
+    store: WorkflowStore | None = None,
+    idempotency_key: str | None = None,
+    on_audit: AuditListener | None = None,
+    approval_source: ApprovalSource | None = None,
+    runtime: tools.ToolRuntime | None = None,
+) -> WorkflowResult:
+    """Run a plan; see ``_execute_once`` for the policy rules.
+
+    - ``store`` keeps checkpoints: a later call for the same plan skips steps
+      that already succeeded (audited as ``step_restored``) and never calls
+      their tools again.
+    - ``idempotency_key`` (needs ``store``): a finished run's result is stored;
+      repeating the key for the same plan returns it without running anything,
+      and using it for a different plan is a ``WORKFLOW_IDEMPOTENCY_CONFLICT``.
+    - ``approval_source`` reads approvals from the backend instead of passing
+      ``approvals`` directly (not both).
+    - ``runtime`` chooses the tools' data and side effects; mock by default.
+    """
+    if idempotency_key is not None:
+        if store is None:
+            raise ValueError("idempotency_key requires a store")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("idempotency_key must be a nonblank string")
+        if not isinstance(plan, WorkflowPlan):
+            raise TypeError("plan must be a WorkflowPlan")
+        stored = store.result_for_key(idempotency_key, plan)
+        if stored is not None:
+            return stored
+    if approval_source is not None:
+        if approvals:
+            raise ValueError("pass approvals or approval_source, not both")
+        approvals = tuple(approval_source.approvals_for_plan(plan.plan_id))
+    result = _execute_once(
+        plan,
+        approvals=approvals,
+        granted_scopes=granted_scopes,
+        clock=clock,
+        step_timeout_ms=step_timeout_ms,
+        max_retries=max_retries,
+        cancellation=cancellation,
+        invoker=invoker,
+        correlation_id=correlation_id,
+        store=store,
+        on_audit=on_audit,
+        runtime=runtime,
+    )
+    if store is not None and result.state in _TERMINAL:
+        if result.state == WorkflowState.succeeded:
+            store.clear_checkpoint(plan.plan_id)
+        if idempotency_key is not None:
+            store.save_result(idempotency_key, plan, result)
+    return result
+
+
+def _execute_once(
+    plan: WorkflowPlan,
+    *,
+    approvals: Sequence[ApprovalRequest],
+    granted_scopes: frozenset[str],
+    clock: Clock | None,
+    step_timeout_ms: int | None,
+    max_retries: int,
+    cancellation: CancellationToken | None,
+    invoker: ToolInvoker | None,
+    correlation_id: str,
+    store: WorkflowStore | None,
+    on_audit: AuditListener | None,
+    runtime: tools.ToolRuntime | None,
 ) -> WorkflowResult:
     """Execute once only if every policy check and required approval passes.
 
@@ -164,7 +248,8 @@ def execute(
       A timed-out tool cannot be killed; see ``_call_supervised``.
     - A consequential tool is never called a second time.
 
-    This call has no durable history. Calling it again may run the same steps again.
+    Without a ``WorkflowStore`` there is no history: calling it again may run
+    the same steps again.
     """
     if not isinstance(plan, WorkflowPlan):
         raise TypeError("plan must be a WorkflowPlan")
@@ -182,9 +267,13 @@ def execute(
 
     # Preflight: nothing below may invoke a tool.
     ordered = execution_order(plan)
+    allowed_hosts = (runtime or tools.MOCK_RUNTIME).allowed_hosts
     for step in ordered:
-        tools.validate_tool_call(step.tool_name, step.arguments)
+        tools.validate_tool_call(
+            step.tool_name, step.arguments, allowed_hosts=allowed_hosts
+        )
         tools.check_scope(step.tool_name, granted_scopes)
+    completed = store.completed_steps(plan) if store is not None else {}
 
     approval_by_step = _match_approvals(plan, approvals)
     has_expiry = any(a.expires_at is not None for a in approval_by_step.values())
@@ -192,18 +281,20 @@ def execute(
         raise ValueError("approval expiry requires an injected clock")
     now = clock() if clock is not None else None
 
-    audit = _Audit(plan)
+    audit = _Audit(plan, on_audit)
+    # A step restored from a checkpoint already ran with its approval.
     required = [
         step
         for step in ordered
-        if step.requires_approval or tools.TOOL_SPECS[step.tool_name].consequential
+        if step.step_id not in completed
+        and (step.requires_approval or tools.TOOL_SPECS[step.tool_name].consequential)
     ]
 
     # Any supplied rejection or expired approval stops the whole plan (Week 1 rule).
     blocked = False
     for step in ordered:
         approval = approval_by_step.get(step.step_id)
-        if approval is None:
+        if approval is None or step.step_id in completed:
             continue
         if approval.status == "rejected":
             audit.record(
@@ -265,6 +356,10 @@ def execute(
     )
     outputs: dict[str, str] = {}
     for step in ordered:
+        if step.step_id in completed:
+            outputs[step.step_id] = completed[step.step_id]
+            audit.record("step_restored", step_id=step.step_id, reason="checkpoint")
+            continue
         if cancellation is not None and cancellation.cancelled:
             return _cancel(
                 plan, running, audit, reason="cancelled_during_run", outputs=outputs
@@ -283,10 +378,12 @@ def execute(
                 step_timeout_ms=step_timeout_ms,
                 max_retries=max_retries,
                 cancellation=cancellation,
-                invoker=invoker,
+                invoker=invoker if invoker is not None else _runtime_invoker(runtime),
             )
         if status == "ok":
             outputs[step.step_id] = output
+            if store is not None:
+                store.save_step(plan, step.step_id, output)
             continue
         if status == "cancelled":
             return _cancel(
@@ -326,6 +423,12 @@ def execute(
     return _result(
         plan, transition(running, WorkflowState.succeeded), audit, outputs=outputs
     )
+
+
+def _runtime_invoker(runtime: tools.ToolRuntime | None) -> ToolInvoker | None:
+    # None keeps the Week 2 behaviour: ``tools.invoke_tool`` is looked up at call
+    # time (mock runtime), which existing callers and tests rely on.
+    return runtime.invoke if runtime is not None else None
 
 
 def _call_supervised(
