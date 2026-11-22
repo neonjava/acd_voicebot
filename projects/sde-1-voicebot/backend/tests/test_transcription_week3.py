@@ -486,19 +486,35 @@ class TestCancellationAndFailureRecovery:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """TranscriptionConfig resolves device and compute respecting CUDA."""
-        import torch
 
-        # Test CUDA auto-detection
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        class MockCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+        class MockTorch:
+            cuda = MockCuda
+
+        # 1. When torch is installed and CUDA is available
+        monkeypatch.setitem(sys.modules, "torch", MockTorch)
         cfg_cuda = TranscriptionConfig(device="auto", compute_type="auto")
         assert cfg_cuda.resolve_device_and_compute() == ("cuda", "float16")
 
-        # Test CPU auto-detection
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        # 2. When torch is installed but CUDA is unavailable
+        MockCuda.is_available = staticmethod(lambda: False)
         cfg_cpu = TranscriptionConfig(device="auto", compute_type="auto")
         assert cfg_cpu.resolve_device_and_compute() == ("cpu", "int8")
 
-        # Guard against invalid float16 on CPU
+        # 3. When torch is not installed at all
+        monkeypatch.setitem(sys.modules, "torch", None)
+        cfg_no_torch = TranscriptionConfig(device="auto", compute_type="auto")
+        assert cfg_no_torch.resolve_device_and_compute() == ("cpu", "int8")
+
+        # 4. Explicit override
+        cfg_custom = TranscriptionConfig(device="cpu", compute_type="int8")
+        assert cfg_custom.resolve_device_and_compute() == ("cpu", "int8")
+
+        # 5. Guard against float16 on CPU
         cfg_cpu_f16 = TranscriptionConfig(device="cpu", compute_type="float16")
         assert cfg_cpu_f16.resolve_device_and_compute() == ("cpu", "int8")
 
