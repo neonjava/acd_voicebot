@@ -256,6 +256,38 @@ class TestCancellationAndFailureRecovery:
         assert events[1].payload.session_id == "sess-fallback"
         assert events[1].payload.text == "Hello from the mock voicebot."
 
+    def test_faster_whisper_error_without_fallback_redacts_raw_exception(
+        self,
+    ) -> None:
+        """Raw exception messages and paths must not leak when fallback is disabled."""
+
+        class FailingModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+                raise RuntimeError(r"C:\Users\megha\models secret-token-123")
+
+        config = TranscriptionConfig(provider="faster_whisper", fallback_to_mock=False)
+        adapter = FasterWhisperAdapter(config=config, model=FailingModel())
+        chunks = [_make_chunk("sess-leak-check", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        events = adapter.transcribe(
+            chunks,
+            session_id="sess-leak-check",
+            correlation_id="c-leak",
+            timestamp=ts,
+        )
+
+        assert len(events) == 1
+        assert events[0].event_type == "transcript.error"
+        err = events[0].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_PROVIDER_ERROR"
+        assert err.details_redacted is not None
+        assert err.details_redacted.get("reason") == "RuntimeError"
+        # Assert raw exception text/tokens never leak into details or message
+        assert "secret-token-123" not in str(err.details_redacted)
+        assert "secret-token-123" not in err.message_safe_for_user
+
     def test_quota_failure_falls_back_with_normalized_error(self) -> None:
         transcriber = FakeTranscriber(failure_mode="quota_error")
         chunks = [_make_chunk("sess-quota", 0)]
