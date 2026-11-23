@@ -10,9 +10,9 @@ STTProviderType = Literal["mock", "faster_whisper"]
 def detect_default_device() -> str:
     """Detect CUDA when available, otherwise fall back to CPU."""
     try:
-        import torch
+        import ctranslate2
 
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if ctranslate2.get_cuda_device_count() > 0:
             return "cuda"
     except Exception:
         pass
