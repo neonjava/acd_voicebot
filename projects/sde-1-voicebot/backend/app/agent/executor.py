@@ -38,9 +38,12 @@ from app.contracts.workflow import (
 Clock = Callable[[], datetime]
 AuditListener = Callable[[AuditEvent], None]
 ToolInvoker = Callable[[str, Mapping[str, str]], str]
-StepStatus = Literal["ok", "timeout", "failed", "cancelled", "expired"]
+# "interrupted": cancelled while the tool was still running (outcome unknown).
+StepStatus = Literal["ok", "timeout", "failed", "cancelled", "interrupted", "expired"]
 
 _TERMINAL = {WorkflowState.succeeded, WorkflowState.failed, WorkflowState.cancelled}
+# A failed run is not final for its key: the same key resumes from the checkpoint.
+_STORED_UNDER_KEY = {WorkflowState.succeeded, WorkflowState.cancelled}
 _POLL_SECONDS = 0.02
 
 
@@ -176,10 +179,15 @@ def execute(
 
     - ``store`` keeps checkpoints: a later call for the same plan skips steps
       that already succeeded (audited as ``step_restored``) and never calls
-      their tools again.
-    - ``idempotency_key`` (needs ``store``): a finished run's result is stored;
-      repeating the key for the same plan returns it without running anything,
-      and using it for a different plan is a ``WORKFLOW_IDEMPOTENCY_CONFLICT``.
+      their tools again. An approval-gated step whose outcome is unknown (it
+      timed out, or was cancelled while its tool ran) is not repeated under the
+      same approval: the run waits for a fresh one (a new ``approval_id``).
+    - ``idempotency_key`` (needs ``store``): a ``succeeded`` or ``cancelled``
+      result is stored; repeating the key for the same plan returns it without
+      running anything. A ``failed`` run is not stored, so the same key
+      resumes from the checkpoint. Using the key for a different plan is a
+      ``WORKFLOW_IDEMPOTENCY_CONFLICT``; reusing it while its run is still in
+      progress is a ``WORKFLOW_IDEMPOTENCY_IN_PROGRESS``.
     - ``approval_source`` reads approvals from the backend instead of passing
       ``approvals`` directly (not both).
     - ``runtime`` chooses the tools' data and side effects; mock by default.
@@ -191,9 +199,49 @@ def execute(
             raise ValueError("idempotency_key must be a nonblank string")
         if not isinstance(plan, WorkflowPlan):
             raise TypeError("plan must be a WorkflowPlan")
-        stored = store.result_for_key(idempotency_key, plan)
+        stored = store.claim_key(idempotency_key, plan)
         if stored is not None:
             return stored
+    try:
+        return _execute_and_store(
+            plan,
+            approvals=approvals,
+            granted_scopes=granted_scopes,
+            clock=clock,
+            step_timeout_ms=step_timeout_ms,
+            max_retries=max_retries,
+            cancellation=cancellation,
+            invoker=invoker,
+            correlation_id=correlation_id,
+            store=store,
+            idempotency_key=idempotency_key,
+            on_audit=on_audit,
+            approval_source=approval_source,
+            runtime=runtime,
+        )
+    finally:
+        if idempotency_key is not None:
+            assert store is not None
+            store.release_key(idempotency_key)
+
+
+def _execute_and_store(
+    plan: WorkflowPlan,
+    *,
+    approvals: Sequence[ApprovalRequest],
+    granted_scopes: frozenset[str],
+    clock: Clock | None,
+    step_timeout_ms: int | None,
+    max_retries: int,
+    cancellation: CancellationToken | None,
+    invoker: ToolInvoker | None,
+    correlation_id: str,
+    store: WorkflowStore | None,
+    idempotency_key: str | None,
+    on_audit: AuditListener | None,
+    approval_source: ApprovalSource | None,
+    runtime: tools.ToolRuntime | None,
+) -> WorkflowResult:
     if approval_source is not None:
         if approvals:
             raise ValueError("pass approvals or approval_source, not both")
@@ -212,10 +260,10 @@ def execute(
         on_audit=on_audit,
         runtime=runtime,
     )
-    if store is not None and result.state in _TERMINAL:
+    if store is not None:
         if result.state == WorkflowState.succeeded:
             store.clear_checkpoint(plan.plan_id)
-        if idempotency_key is not None:
+        if idempotency_key is not None and result.state in _STORED_UNDER_KEY:
             store.save_result(idempotency_key, plan, result)
     return result
 
@@ -246,7 +294,9 @@ def _execute_once(
     - Timeouts need ``clock``. A step that passes ``step_timeout_ms`` counts as
       timed out and its output is discarded, even if the tool is still blocked.
       A timed-out tool cannot be killed; see ``_call_supervised``.
-    - A consequential tool is never called a second time.
+    - A consequential tool is never called a second time in one run, and with
+      a ``store`` never again under an approval whose attempt had an unknown
+      outcome (``approval_missing`` with ``reason=previous_outcome_unknown``).
 
     Without a ``WorkflowStore`` there is no history: calling it again may run
     the same steps again.
@@ -274,6 +324,7 @@ def _execute_once(
         )
         tools.check_scope(step.tool_name, granted_scopes)
     completed = store.completed_steps(plan) if store is not None else {}
+    unknown = store.outcome_unknown_steps(plan) if store is not None else {}
 
     approval_by_step = _match_approvals(plan, approvals)
     has_expiry = any(a.expires_at is not None for a in approval_by_step.values())
@@ -320,19 +371,30 @@ def _execute_once(
     if cancellation is not None and cancellation.cancelled:
         return _cancel(plan, plan.state, audit, reason="cancelled_before_start")
 
+    def _stale(step: WorkflowStep, approval: ApprovalRequest) -> bool:
+        # The approval was already used by an attempt that may have run.
+        return step.step_id in unknown and unknown[step.step_id] == approval.approval_id
+
     missing = [
         step
         for step in required
         if approval_by_step.get(step.step_id) is None
         or approval_by_step[step.step_id].status != "approved"
+        or _stale(step, approval_by_step[step.step_id])
     ]
     if missing:
         for step in missing:
             approval = approval_by_step.get(step.step_id)
+            details = (
+                {"reason": "previous_outcome_unknown"}
+                if step.step_id in unknown
+                else {}
+            )
             audit.record(
                 "approval_missing",
                 step_id=step.step_id,
                 approval_id=approval.approval_id if approval else None,
+                **details,
             )
         if plan.state == WorkflowState.draft:
             target = transition(plan.state, WorkflowState.awaiting_approval)
@@ -354,6 +416,7 @@ def _execute_once(
         if plan.state == WorkflowState.running
         else transition(plan.state, WorkflowState.running)
     )
+    gated = {step.step_id for step in required}
     outputs: dict[str, str] = {}
     for step in ordered:
         if step.step_id in completed:
@@ -385,7 +448,13 @@ def _execute_once(
             if store is not None:
                 store.save_step(plan, step.step_id, output)
             continue
-        if status == "cancelled":
+        if store is not None and status in ("timeout", "interrupted"):
+            if step.step_id in gated:
+                # The tool may have run: its approval is used up.
+                store.mark_outcome_unknown(
+                    plan, step.step_id, approval.approval_id if approval else None
+                )
+        if status in ("cancelled", "interrupted"):
             return _cancel(
                 plan, running, audit, reason="cancelled_during_run", outputs=outputs
             )
@@ -500,7 +569,7 @@ def _run_step(
                     cancellation,
                 )
         except _StepCancelled:
-            return "cancelled", ""
+            return "interrupted", ""
         except TimeoutError:
             failure = "timeout"
         except TransientToolError:
