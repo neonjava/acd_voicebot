@@ -83,7 +83,7 @@ def test_post_mock_session_reports_missing_dependency_blocker(client):
 
 
 def test_post_mock_session_success_when_dependencies_present(client):
-    """POST /api/sessions/mock returns MockSessionResponse with full pipeline."""
+    """POST /api/sessions/mock keeps approval pending for client decision."""
     response = client.post(
         "/api/sessions/mock",
         json={},
@@ -95,13 +95,28 @@ def test_post_mock_session_success_when_dependencies_present(client):
 
     data = response.json()
     validated = MockSessionResponse.model_validate(data)
-    assert validated.state == "completed"
+    assert validated.state == "active"
     assert validated.mode == "mock"
     event_types = [e.event_type for e in validated.events]
     assert "audio.chunk" in event_types
     assert "audio.speech" in event_types
     assert "transcript.segment" in event_types
-    assert "workflow.audit" in event_types
+
+    # Ensure approval remains pending for client decision (Ruthwin dialog)
+    appr_resp = client.get(f"/api/sessions/{validated.session_id}/approvals")
+    assert appr_resp.status_code == 200
+    approvals = appr_resp.json()
+    assert len(approvals) == 1
+    assert approvals[0]["status"] == "pending"
+    appr_id = approvals[0]["approval_id"]
+
+    # Client decides approval through approvals endpoint
+    decide_resp = client.post(
+        f"/api/sessions/{validated.session_id}/approvals/{appr_id}",
+        json={"decision": "approve"},
+    )
+    assert decide_resp.status_code == 200
+    assert decide_resp.json()["status"] == "approved"
 
 
 def test_post_mock_session_generates_unique_session_ids(client):

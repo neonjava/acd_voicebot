@@ -72,7 +72,7 @@ class MockSessionResponse(ContractModel):
     """Finite run mock session response returned by POST /api/sessions/mock."""
 
     session_id: str = Field(min_length=1, pattern=r"\S")
-    state: Literal["completed"] = "completed"
+    state: Literal["active", "completed"] = "active"
     mode: Literal["mock"] = "mock"
     events: list[SessionEvent] = Field(default_factory=list)
 

@@ -108,3 +108,27 @@ def test_invalid_max_payload_rejected():
 
     with pytest.raises(ValidationError):
         Settings(max_payload_bytes=20000000)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_ready_line_only_after_port_binds(capsys):
+    """VOICEBOT_READY is printed only after port connection succeeds, not before."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from app.main import app, lifespan
+
+    # 1. When port connection fails, VOICEBOT_READY is NOT printed
+    with patch("socket.create_connection", side_effect=OSError("Connection refused")):
+        async with lifespan(app):
+            await asyncio.sleep(0.05)
+            captured = capsys.readouterr()
+            assert "VOICEBOT_READY" not in captured.out
+
+    # 2. When port connection succeeds, VOICEBOT_READY is printed
+    mock_sock = MagicMock()
+    with patch("socket.create_connection", return_value=mock_sock):
+        async with lifespan(app):
+            await asyncio.sleep(0.05)
+            captured = capsys.readouterr()
+            assert "VOICEBOT_READY" in captured.out

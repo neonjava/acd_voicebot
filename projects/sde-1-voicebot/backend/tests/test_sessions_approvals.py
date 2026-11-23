@@ -267,3 +267,86 @@ def test_register_approval_requires_plan():
     )
     with pytest.raises(ValueError, match="Workflow plan is required"):
         session_service.register_approval(appr, None)
+
+
+def test_deciding_approval_after_stop_returns_409_and_runs_nothing(client):
+    """Approving after session stop (completed state) returns 409 and runs no tool."""
+    from app.contracts.common import SessionState
+
+    session_service.create_session("sess-stop-appr", initial_state=SessionState.active)
+    step = WorkflowStep(
+        step_id="step-stop",
+        tool_name="echo_text",
+        arguments={"text": "should never execute"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-stop",
+        session_id="sess-stop-appr",
+        steps=[step],
+    )
+    appr = ApprovalRequest(
+        approval_id="appr-stop-1",
+        plan_id="plan-stop",
+        step_id="step-stop",
+        session_id="sess-stop-appr",
+        status="pending",
+    )
+    session_service.register_approval(appr, plan)
+
+    # Stop the session (completed state)
+    res_stop = client.post("/api/sessions/sess-stop-appr/stop")
+    assert res_stop.status_code == 200
+    assert res_stop.json()["state"] == "completed"
+
+    # Approving after stop must return 409
+    res = client.post(
+        "/api/sessions/sess-stop-appr/approvals/appr-stop-1",
+        json={"decision": "approve"},
+    )
+    assert res.status_code == 409
+    err = ErrorEnvelope.model_validate(res.json())
+    assert err.code == "SESSION_TERMINAL_STATE"
+
+    # Verify no tool execution occurred
+    events = session_service.get_events("sess-stop-appr")
+    audit_payloads = [e.payload for e in events if e.event_type == "workflow.audit"]
+    assert not any(a.kind == "step_succeeded" for a in audit_payloads)
+
+
+def test_deciding_approval_on_failed_session_returns_409(client):
+    """Approving on a failed session returns 409 and runs no tool."""
+    from app.contracts.common import SessionState
+
+    session_service.create_session("sess-failed-appr")
+    step = WorkflowStep(
+        step_id="step-fail",
+        tool_name="echo_text",
+        arguments={"text": "should never execute"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-fail",
+        session_id="sess-failed-appr",
+        steps=[step],
+    )
+    appr = ApprovalRequest(
+        approval_id="appr-fail-1",
+        plan_id="plan-fail",
+        step_id="step-fail",
+        session_id="sess-failed-appr",
+        status="pending",
+    )
+    session_service.register_approval(appr, plan)
+
+    # Transition session to failed
+    session_service.transition("sess-failed-appr", SessionState.failed)
+
+    # Approving on failed session must return 409
+    res = client.post(
+        "/api/sessions/sess-failed-appr/approvals/appr-fail-1",
+        json={"decision": "approve"},
+    )
+    assert res.status_code == 409
+    err = ErrorEnvelope.model_validate(res.json())
+    assert err.code == "SESSION_TERMINAL_STATE"
