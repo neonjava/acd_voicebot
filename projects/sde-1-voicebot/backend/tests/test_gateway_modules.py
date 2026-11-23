@@ -188,3 +188,88 @@ def test_end_to_end_pipeline_routes_through_all_gateways():
     for evt in events:
         assert evt.correlation_id == "corr-e2e-pipeline"
         assert evt.session_id == "session-e2e-pipeline"
+
+
+def test_workflow_gateway_failure_retains_audit_events():
+    """When workflow execution fails, audit events (step_failed) are preserved."""
+    gw = WorkflowGateway()
+    _, plan, approval = gw.build_proposal_and_plan(
+        session_id="session-wf-fail",
+        correlation_id="corr-wf-fail",
+        text_to_echo="Failing command",
+    )
+    approved = approval.model_copy(update={"status": "approved"})
+
+    with patch("app.agent.tools.invoke_tool", side_effect=RuntimeError("Tool crashed")):
+        result, audits = gw.execute_plan(
+            plan, [approved], correlation_id="corr-wf-fail"
+        )
+        assert result.state == WorkflowState.failed
+        assert len(audits) >= 2
+        assert any(a.kind == "approval_granted" for a in audits)
+        assert any(a.kind == "step_failed" for a in audits)
+
+
+def test_reasoning_gateway_skips_interim_transcripts():
+    """Reasoning gateway converts only final transcripts, skipping interim."""
+    from app.contracts.transcription import TranscriptSegment
+
+    interim = TranscriptSegment(
+        segment_id="seg-interim",
+        session_id="session-interim",
+        sequence_id=0,
+        start_ms=0,
+        end_ms=500,
+        text="this is interim text",
+        confidence=0.5,
+        language="en",
+        is_final=False,
+    )
+    final = TranscriptSegment(
+        segment_id="seg-final",
+        session_id="session-interim",
+        sequence_id=1,
+        start_ms=0,
+        end_ms=1000,
+        text="this is final text",
+        confidence=0.99,
+        language="en",
+        is_final=True,
+    )
+
+    gw = ReasoningGateway()
+    with patch("app.reasoning.mock.reason") as mock_reason:
+        from app.contracts.reasoning import ReasoningResult
+
+        mock_reason.return_value = ReasoningResult(
+            request_id="req-1",
+            session_id="session-interim",
+            answer="final answer",
+            source_ids=["seg-final"],
+            insufficient_evidence=False,
+            prompt_version="v1",
+        )
+        gw.reason_from_transcript(
+            session_id="session-interim",
+            correlation_id="corr-interim",
+            segments=[interim, final],
+        )
+
+        # Verify reason was called with only the final segment
+        assert mock_reason.call_count == 1
+        req = mock_reason.call_args[0][0]
+        assert len(req.context) == 1
+        assert req.context[0].item_id == "seg-final"
+        assert req.context[0].text == "this is final text"
+
+
+def test_reasoning_gateway_does_not_swallow_validation_errors():
+    """Validation errors on invalid segments raise GatewayError, not swallowed."""
+    gw = ReasoningGateway()
+    with pytest.raises(GatewayError) as exc_info:
+        gw.reason_from_transcript(
+            session_id="session-bad-seg",
+            correlation_id="corr-bad-seg",
+            segments=["not-a-segment"],  # Invalid segment type
+        )
+    assert exc_info.value.envelope.code == "REASONING_FAILED"

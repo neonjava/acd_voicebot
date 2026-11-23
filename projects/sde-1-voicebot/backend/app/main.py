@@ -45,6 +45,7 @@ from app.sessions.service import (
     SessionAlreadyExistsError,
     SessionExpiredError,
     SessionNotFoundError,
+    SessionTerminalStateError,
     session_service,
 )
 
@@ -96,12 +97,31 @@ rate_limiter = RateLimiter()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context printing ready notification when server starts listening."""
-    print(
-        f"VOICEBOT_READY: http://{settings.host}:{settings.port}",
-        flush=True,
-    )
-    yield
+    """Lifespan context printing ready notification only after port binds."""
+
+    async def _notify_when_listening():
+        import asyncio
+        import socket
+
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            try:
+                with socket.create_connection(
+                    (settings.host, settings.port), timeout=0.05
+                ):
+                    print(
+                        f"VOICEBOT_READY: http://{settings.host}:{settings.port}",
+                        flush=True,
+                    )
+                    break
+            except OSError:
+                continue
+
+    ready_task = asyncio.create_task(_notify_when_listening())
+    try:
+        yield
+    finally:
+        ready_task.cancel()
 
 
 app = FastAPI(
@@ -581,6 +601,41 @@ async def approval_expired_handler(
     return response
 
 
+@app.exception_handler(SessionTerminalStateError)
+async def session_terminal_state_handler(
+    request: Request,
+    exc: SessionTerminalStateError,
+) -> JSONResponse:
+    """Report deciding an approval on a terminal session as 409 Conflict."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    code = (
+        "APPROVAL_EXPIRED"
+        if exc.state == SessionState.expired
+        else "SESSION_TERMINAL_STATE"
+    )
+    error_envelope = ErrorEnvelope(
+        code=code,
+        message_safe_for_user=(
+            f"Session '{exc.session_id}' is in terminal state '{exc.state.value}'."
+        ),
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={
+            "session_id": exc.session_id,
+            "state": exc.state.value,
+        },
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
 @app.exception_handler(MissingWorkflowPlanError)
 async def missing_workflow_plan_handler(
     request: Request,
@@ -702,11 +757,11 @@ async def create_mock_session(
     _record, events = session_service.run_pipeline_session(
         session_id=session_id,
         correlation_id=corr_id,
-        auto_approve=True,
+        auto_approve=False,
     )
     return MockSessionResponse(
         session_id=session_id,
-        state="completed",
+        state=_record.state.value,
         mode="mock",
         events=events,
     )

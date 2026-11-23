@@ -155,6 +155,17 @@ class ApprovalExpiredError(Exception):
         self.approval_id = approval_id
 
 
+class SessionTerminalStateError(Exception):
+    """Raised when deciding an approval on a session in a terminal state."""
+
+    def __init__(self, session_id: str, state: SessionState) -> None:
+        super().__init__(
+            f"Session '{session_id}' is in terminal state '{state.value}'."
+        )
+        self.session_id = session_id
+        self.state = state
+
+
 class MissingWorkflowPlanError(Exception):
     """Raised when deciding an approval whose associated workflow plan is missing."""
 
@@ -435,9 +446,13 @@ class SessionService:
         if not sess:
             raise SessionNotFoundError(session_id)
 
-        # 1. Reject if session is expired
-        if sess.state == SessionState.expired:
-            raise ApprovalExpiredError(approval_id)
+        # 1. Reject if session is in terminal state (completed, failed, expired)
+        if sess.state in (
+            SessionState.completed,
+            SessionState.failed,
+            SessionState.expired,
+        ):
+            raise SessionTerminalStateError(session_id, sess.state)
 
         approval = self._approvals.get(approval_id)
         if not approval or approval.session_id != session_id:
@@ -627,9 +642,11 @@ class SessionService:
                     now=ts,
                     correlation_id=cid,
                 )
+                completed_record = self.transition(sid, SessionState.completed, now=ts)
+                return completed_record, self._session_events.get(sid, [])
 
-            completed_record = self.transition(sid, SessionState.completed, now=ts)
-            return completed_record, self._session_events.get(sid, [])
+            current_record = self.get_session(sid, check_expiry=False)
+            return current_record, self._session_events.get(sid, [])
 
         except Exception:
             self.transition(sid, SessionState.failed, now=ts)

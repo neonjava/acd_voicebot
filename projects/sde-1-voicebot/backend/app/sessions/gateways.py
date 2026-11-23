@@ -11,7 +11,6 @@ from app.contracts.reasoning import (
     ContextItem,
     ReasoningRequest,
     ReasoningResult,
-    SourceReference,
 )
 from app.contracts.sessions import AudioChunkMetadata, ModuleHealthStatus
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
@@ -192,26 +191,14 @@ class ReasoningGateway:
     ) -> ReasoningResult:
         """Convert transcript segments to context items and call reasoning."""
         try:
+            from app.reasoning.context import context_item_from_transcript
             from app.reasoning.mock import reason
 
             context_items: list[ContextItem] = []
             for seg in segments:
-                try:
-                    from app.reasoning.context import (
-                        context_item_from_transcript,
-                    )
-
-                    item = context_item_from_transcript(seg)
-                except Exception:  # noqa: BLE001
-                    item = ContextItem(
-                        item_id=seg.segment_id,
-                        text=seg.text,
-                        source=SourceReference(
-                            source_id=seg.segment_id,
-                            locator=seg.segment_id,
-                            kind="transcript",
-                        ),
-                    )
+                if not seg.is_final:
+                    continue
+                item = context_item_from_transcript(seg)
                 context_items.append(item)
 
             req = ReasoningRequest(
@@ -313,58 +300,7 @@ class WorkflowGateway:
             from app.agent.executor import execute
 
             result = execute(plan, approvals=approvals)
-
-            audit_events: list[AuditEvent] = []
-            seq = 0
-            for appr in approvals:
-                if appr.status == "approved":
-                    audit_events.append(
-                        AuditEvent(
-                            sequence=seq,
-                            kind="approval_granted",
-                            plan_id=plan.plan_id,
-                            session_id=plan.session_id,
-                            step_id=appr.step_id,
-                            approval_id=appr.approval_id,
-                        )
-                    )
-                    seq += 1
-                elif appr.status == "rejected":
-                    audit_events.append(
-                        AuditEvent(
-                            sequence=seq,
-                            kind="approval_rejected",
-                            plan_id=plan.plan_id,
-                            session_id=plan.session_id,
-                            step_id=appr.step_id,
-                            approval_id=appr.approval_id,
-                        )
-                    )
-                    seq += 1
-
-            if result.state.value == "succeeded":
-                for step in plan.steps:
-                    audit_events.append(
-                        AuditEvent(
-                            sequence=seq,
-                            kind="step_succeeded",
-                            plan_id=plan.plan_id,
-                            session_id=plan.session_id,
-                            step_id=step.step_id,
-                        )
-                    )
-                    seq += 1
-            elif result.state.value == "cancelled":
-                audit_events.append(
-                    AuditEvent(
-                        sequence=seq,
-                        kind="workflow_cancelled",
-                        plan_id=plan.plan_id,
-                        session_id=plan.session_id,
-                    )
-                )
-
-            return result, audit_events
+            return result, result.audit_events
 
         except Exception as exc:  # noqa: BLE001
             envelope = ErrorEnvelope(
