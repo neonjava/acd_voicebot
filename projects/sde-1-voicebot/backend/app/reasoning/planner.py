@@ -11,7 +11,10 @@ consequential tools.
 Prompt-injection defence: only the user's own request can ask for an action.
 ``RuleBasedPlanner`` reads intent from the request text only, never from
 context. ``LLMWorkflowPlanner`` rejects any proposal that uses an unknown tool,
-cites a source that was not supplied, or does not cite the user's request.
+cites a source that was not supplied, does not cite the user's request, or
+uses a tool the request text itself does not ask for (``requested_tools``, the
+same intent rules as ``RuleBasedPlanner``). The model cannot pass that last
+check by citing the request, because it reads only the user's own words.
 """
 
 import json
@@ -45,11 +48,38 @@ _SEARCH = re.compile(
     r"\bsearch(?:\s+up|\s+for)?\s+(?P<query>.+?)(?:\s+(?:on|in)\s+youtube)?\s*$",
     re.IGNORECASE,
 )
-_CLOSE = re.compile(r"\bclose\s+(?:the\s+)?(?P<target>[\w.+-]+)", re.IGNORECASE)
+# Imperatives count only at the start of the request, after an optional wake
+# word and politeness ("jarvis, can you please close it"). A question that
+# merely contains the word ("is it close to full?") is not a request.
+_LEAD = (
+    r"^\s*(?:(?:hey\s+)?jarvis\b[\s,.:!]*)?"
+    r"(?:(?:please|(?:can|could|would|will)\s+you)\s+)*"
+)
+_CLOSE = re.compile(_LEAD + r"close\s+(?:the\s+)?(?P<target>[\w.+-]+)", re.IGNORECASE)
 _NOTE = re.compile(
-    r"\b(?:save|make|take|write)\s+(?:a\s+)?note\b(?:\s+(?:that|saying))?[\s:,]*(?P<text>.*)$",
+    _LEAD
+    + r"(?:save|make|take|write)\s+(?:a\s+)?note\b"
+    + r"(?:\s+(?:that|saying))?[\s:,]*(?P<text>.*)$",
     re.IGNORECASE,
 )
+
+
+def requested_tools(text: str) -> frozenset[str]:
+    """The tools the user's own words ask for (deterministic intent rules).
+
+    Shared by both planners: ``RuleBasedPlanner`` acts on these intents and
+    ``LLMWorkflowPlanner`` accepts a proposed tool only if it is listed here.
+    """
+    tools: set[str] = set()
+    if _CLOSE.search(text):
+        tools.add("close_app")
+    if _NOTE.search(text):
+        tools.add("mock_save_note")
+    if _OPEN_YOUTUBE.search(text):
+        tools.add("open_url")
+    if _RAM.search(text):
+        tools.add("system_stats")
+    return frozenset(tools)
 
 
 @dataclass(frozen=True)
@@ -146,6 +176,20 @@ class RuleBasedPlanner:
                 summary=f"Close {target}", steps=[step], extra_sources=extra, **common
             )
 
+        if note := _NOTE.search(text):
+            if "mock_save_note" not in catalogue:
+                return missing_tool()
+            body = note.group("text").strip(" .") or text
+            step = WorkflowStep(
+                step_id="note",
+                tool_name="mock_save_note",
+                arguments={"text": body[:1000]},
+                requires_approval=True,
+            )
+            return _proposal(
+                summary=f"Save a note: {body[:60]}", steps=[step], **common
+            )
+
         if _OPEN_YOUTUBE.search(text):
             if "open_url" not in catalogue:
                 return missing_tool()
@@ -173,20 +217,6 @@ class RuleBasedPlanner:
             )
             return _proposal(
                 summary="Check memory and CPU usage", steps=[step], **common
-            )
-
-        if note := _NOTE.search(text):
-            if "mock_save_note" not in catalogue:
-                return missing_tool()
-            body = note.group("text").strip(" .") or text
-            step = WorkflowStep(
-                step_id="note",
-                tool_name="mock_save_note",
-                arguments={"text": body[:1000]},
-                requires_approval=True,
-            )
-            return _proposal(
-                summary=f"Save a note: {body[:60]}", steps=[step], **common
             )
 
         return PlanDecision("none")
@@ -307,6 +337,9 @@ class LLMWorkflowPlanner:
             return self._unsafe("not_from_user_request")
         if not set(sources) <= known_sources:
             return self._unsafe("unknown_source")
+        # Citing the request is not enough: the model picks its own citations.
+        # Every tool must be one the user's own words ask for.
+        allowed = requested_tools(request.text)
 
         steps: list[WorkflowStep] = []
         for raw_step in raw_steps:
@@ -316,6 +349,8 @@ class LLMWorkflowPlanner:
             arguments = raw_step.get("arguments", {})
             if tool not in catalogue:
                 return self._unsafe("unknown_tool")
+            if tool not in allowed:
+                return self._unsafe("not_from_user_request")
             if not isinstance(arguments, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in arguments.items()
             ):
