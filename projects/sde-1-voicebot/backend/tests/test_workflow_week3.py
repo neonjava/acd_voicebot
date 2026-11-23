@@ -4,6 +4,7 @@ backend approvals and the first real tools (system_stats, open_url)."""
 import json
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
@@ -18,7 +19,7 @@ from app.agent.approvals import (
 )
 from app.agent.checkpoint import WorkflowStore
 from app.agent.errors import TransientToolError, WorkflowPolicyError
-from app.agent.executor import execute
+from app.agent.executor import CancellationToken, execute
 from app.agent.progress import audit_envelopes
 from app.agent.proposals import plan_from_proposal
 from app.agent.system_tools import (
@@ -206,6 +207,177 @@ def test_unfinished_run_is_not_stored_under_its_idempotency_key() -> None:
 def test_idempotency_key_requires_a_store() -> None:
     with pytest.raises(ValueError, match="requires a store"):
         execute(make_plan(step("a")), idempotency_key="k")
+
+
+# --- Unknown outcomes, failed-run resume and concurrent keys (review of #81) ---
+
+
+def _advancing_clock(seconds_per_call: float):  # noqa: ANN202 - test helper
+    now = [T0]
+
+    def clock() -> datetime:
+        return now[0]
+
+    def slow_tool(name: str, arguments: Mapping[str, str]) -> str:
+        now[0] += timedelta(seconds=seconds_per_call)
+        return tools.invoke_tool(name, arguments)
+
+    return clock, slow_tool
+
+
+def test_timed_out_consequential_step_needs_a_fresh_approval_to_run_again() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    clock, slow_tool = _advancing_clock(5)
+    recorder = Recorder()
+
+    def late_save(name: str, arguments: Mapping[str, str]) -> str:
+        recorder.calls.append((name, arguments["text"]))
+        return slow_tool(name, arguments)  # returns after the 1 s deadline
+
+    kwargs = {"store": store, "clock": clock, "step_timeout_ms": 1000}
+    first = execute(
+        plan, approvals=[approved(plan, "save")], invoker=late_save, **kwargs
+    )
+    assert first.state == WorkflowState.failed
+    assert first.error is not None and first.error.code == "WORKFLOW_STEP_TIMEOUT"
+
+    # The note may have been saved: the same approval must not save it again.
+    again = execute(
+        plan, approvals=[approved(plan, "save")], invoker=late_save, **kwargs
+    )
+    assert again.state == WorkflowState.awaiting_approval
+    assert recorder.calls == [("mock_save_note", "save")]
+    assert [
+        (e.kind, e.step_id, e.approval_id, e.details_redacted)
+        for e in again.audit_events
+    ] == [
+        (
+            "approval_missing",
+            "save",
+            "approval-save",
+            {"reason": "previous_outcome_unknown"},
+        )
+    ]
+
+    # A fresh decision (new approval ID) lets the step run exactly once more.
+    fresh = approved(plan, "save").model_copy(update={"approval_id": "approval-save-2"})
+    done = execute(plan, approvals=[fresh], store=store, invoker=recorder)
+    assert done.state == WorkflowState.succeeded
+    assert recorder.calls == [("mock_save_note", "save"), ("mock_save_note", "save")]
+
+
+def test_consequential_step_cancelled_mid_call_needs_a_fresh_approval() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    token = CancellationToken()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def blocking_save(name: str, arguments: Mapping[str, str]) -> str:
+        calls.append(name)
+        token.cancel()
+        release.wait(2)
+        return tools.invoke_tool(name, arguments)
+
+    try:
+        first = execute(
+            plan,
+            approvals=[approved(plan, "save")],
+            store=store,
+            cancellation=token,
+            invoker=blocking_save,
+        )
+    finally:
+        release.set()
+    assert first.state == WorkflowState.cancelled
+
+    again = execute(
+        plan, approvals=[approved(plan, "save")], store=store, invoker=blocking_save
+    )
+    assert again.state == WorkflowState.awaiting_approval
+    assert calls == ["mock_save_note"]
+    assert again.audit_events[-1].details_redacted == {
+        "reason": "previous_outcome_unknown"
+    }
+
+
+def test_timed_out_safe_step_still_resumes_under_its_approval() -> None:
+    # Only approval-gated steps need a fresh decision; a safe step just reruns.
+    plan = make_plan(step("read"))
+    store = WorkflowStore()
+    clock, slow_tool = _advancing_clock(5)
+    kwargs = {"store": store, "clock": clock, "step_timeout_ms": 1000}
+
+    assert execute(plan, invoker=slow_tool, **kwargs).state == WorkflowState.failed
+    assert execute(plan, store=store).state == WorkflowState.succeeded
+
+
+def test_failed_run_with_an_idempotency_key_resumes_with_the_same_key() -> None:
+    plan = make_plan(step("read"), step("save", "mock_save_note", depends_on=("read",)))
+    store = WorkflowStore()
+    recorder = Recorder(fail={"save": 1})
+    kwargs = {
+        "approvals": [approved(plan, "save")],
+        "store": store,
+        "idempotency_key": "retry-me",
+        "invoker": recorder,
+    }
+
+    first = execute(plan, **kwargs)
+    second = execute(plan, **kwargs)
+    third = execute(plan, **kwargs)
+
+    assert first.state == WorkflowState.failed
+    assert second.state == WorkflowState.succeeded
+    assert [(e.kind, e.step_id) for e in second.audit_events][:2] == [
+        ("approval_granted", "save"),
+        ("step_restored", "read"),
+    ]
+    assert third == second
+    assert recorder.calls == [
+        ("echo_text", "read"),
+        ("mock_save_note", "save"),
+        ("mock_save_note", "save"),
+    ]
+
+
+def test_concurrent_calls_with_one_idempotency_key_execute_once() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    results: list[WorkflowState] = []
+
+    def blocking_save(name: str, arguments: Mapping[str, str]) -> str:
+        calls.append(name)
+        entered.set()
+        release.wait(2)
+        return tools.invoke_tool(name, arguments)
+
+    kwargs = {
+        "approvals": [approved(plan, "save")],
+        "store": store,
+        "idempotency_key": "double-click",
+        "invoker": blocking_save,
+    }
+    worker = threading.Thread(
+        target=lambda: results.append(execute(plan, **kwargs).state)
+    )
+    worker.start()
+    try:
+        assert entered.wait(2)
+        with pytest.raises(WorkflowPolicyError) as err:
+            execute(plan, **kwargs)
+        assert err.value.code == "WORKFLOW_IDEMPOTENCY_IN_PROGRESS"
+    finally:
+        release.set()
+        worker.join(2)
+
+    assert results == [WorkflowState.succeeded]
+    assert execute(plan, **kwargs).state == WorkflowState.succeeded
+    assert calls == ["mock_save_note"]
 
 
 # --- Audit trail and progress events -------------------------------------------
