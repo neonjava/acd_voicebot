@@ -207,7 +207,9 @@ class TestConfidenceThresholdHandling:
         assert acc.final_segments() == []
         assert acc.final_segments(include_low_confidence=True) == [mid_conf]
 
-    def test_confidence_threshold_validation(self) -> None:
+    def test_confidence_threshold_validation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Validate confidence threshold is a valid float in [0.0, 1.0]."""
         with pytest.raises(
             ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
@@ -222,12 +224,56 @@ class TestConfidenceThresholdHandling:
         with pytest.raises(
             ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
         ):
+            SegmentAccumulator(confidence_threshold=float("nan"))
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            SegmentAccumulator(confidence_threshold=float("inf"))
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
             TranscriptionConfig(confidence_threshold=-0.5)
 
         with pytest.raises(
             ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
         ):
             TranscriptionConfig(confidence_threshold=2.0)
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            TranscriptionConfig(confidence_threshold=float("nan"))
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            TranscriptionConfig(confidence_threshold=float("inf"))
+
+        with pytest.raises(
+            ValueError, match="confidence_threshold must be a float between 0.0 and 1.0"
+        ):
+            TranscriptionConfig(confidence_threshold=float("-inf"))
+
+        # from_env() validates env var and raises ValueError on invalid/nan/inf values
+        for bad_val in ("nan", "inf", "-inf", "bad", "-0.5", "1.5", ""):
+            monkeypatch.setenv("STT_CONFIDENCE_THRESHOLD", bad_val)
+            with pytest.raises(
+                ValueError,
+                match="confidence_threshold must be a float between 0.0 and 1.0",
+            ):
+                TranscriptionConfig.from_env()
+
+        # Valid env var parses correctly
+        monkeypatch.setenv("STT_CONFIDENCE_THRESHOLD", "0.85")
+        cfg_valid = TranscriptionConfig.from_env()
+        assert cfg_valid.confidence_threshold == 0.85
+
+        # Unset env var uses default 0.4
+        monkeypatch.delenv("STT_CONFIDENCE_THRESHOLD", raising=False)
+        cfg_default = TranscriptionConfig.from_env()
+        assert cfg_default.confidence_threshold == 0.4
 
 
 class TestCancellationAndFailureRecovery:
@@ -1002,6 +1048,128 @@ class TestSpeechEventsAndEventStreamIntegration:
         stream_seg = published_events[0].payload
         assert stream_seg.is_final is False
         assert stream_seg.confidence == 0.1
+
+    def test_process_speech_session_unclosed_speech_start_emits_normalized_error(
+        self,
+    ) -> None:
+        """speech_start without speech_end emits a normalized error event."""
+        published_events: list[TranscriptEvent] = []
+
+        def sink(sid: str, evt: TranscriptEvent) -> None:
+            published_events.append(evt)
+
+        orchestrator = TranscriptionOrchestrator(event_sink=sink)
+        session_id = "sess-unclosed-start"
+        corr_id = "corr-unclosed"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        pcm = make_fake_pcm(duration_ms=500)
+        chunks = chunk_pcm(pcm, session_id=session_id, chunk_ms=20)
+
+        # Only speech_start, no matching speech_end
+        speech_events = [
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=0,
+                at_ms=100,
+            ),
+        ]
+
+        events = orchestrator.process_speech_session(
+            speech_events,
+            chunks,
+            session_id=session_id,
+            correlation_id=corr_id,
+            timestamp=ts,
+        )
+
+        assert len(events) == 1
+        assert events[0].event_type == "transcript.error"
+        err = events[0].payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY"
+        assert err.details_redacted["reason"] == "unclosed_speech_start"
+        assert err.details_redacted["at_ms"] == "100"
+
+        # Also published to W5 event sink
+        assert len(published_events) == 1
+        err_sink = published_events[0].payload
+        assert err_sink.code == "TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY"
+
+    def test_process_speech_session_duplicate_speech_start_emits_error(
+        self,
+    ) -> None:
+        """Second speech_start does not overwrite first, emits normalized error."""
+        published_events: list[TranscriptEvent] = []
+
+        def sink(sid: str, evt: TranscriptEvent) -> None:
+            published_events.append(evt)
+
+        orchestrator = TranscriptionOrchestrator(event_sink=sink)
+        session_id = "sess-dup-start"
+        corr_id = "corr-dup"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        pcm = make_fake_pcm(duration_ms=1000)
+        chunks = chunk_pcm(pcm, session_id=session_id, chunk_ms=20)
+
+        # Duplicate speech_start at 100ms and 200ms, followed by speech_end at 500ms
+        speech_events = [
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=0,
+                at_ms=100,
+            ),
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=1,
+                at_ms=200,
+            ),
+            SpeechEvent(
+                kind="speech_end",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=2,
+                at_ms=500,
+            ),
+        ]
+
+        events = orchestrator.process_speech_session(
+            speech_events,
+            chunks,
+            session_id=session_id,
+            correlation_id=corr_id,
+            timestamp=ts,
+        )
+
+        # Contains transcribed segment (based on 100ms start) and boundary error event
+        assert len(events) == 2
+        seg_event = next(e for e in events if e.event_type == "transcript.segment")
+        err_event = next(e for e in events if e.event_type == "transcript.error")
+
+        # First start (100ms) was preserved and not overwritten by second start (200ms)
+        assert seg_event.payload.start_ms == 100
+        assert seg_event.payload.end_ms >= 500
+
+        # Error event for duplicate start
+        err = err_event.payload
+        assert isinstance(err, ErrorEnvelope)
+        assert err.code == "TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY"
+        assert err.details_redacted["reason"] == "duplicate_speech_start"
+        assert err.details_redacted["at_ms"] == "200"
+
+        # Published to event sink
+        assert any(
+            e.event_type == "transcript.error"
+            and e.payload.code == "TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY"
+            for e in published_events
+        )
 
 
 class TestAudioChunkIntegrity:

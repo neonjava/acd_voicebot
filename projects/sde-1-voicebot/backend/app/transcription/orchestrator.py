@@ -1,9 +1,11 @@
 """Transcription orchestrator: chunks, preprocessing, adapter, accumulator."""
 
+import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from app.contracts.audio import AudioChunk, SpeechEvent
+from app.contracts.common import ErrorEnvelope
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
 from app.transcription.accumulator import SegmentAccumulator
 from app.transcription.adapter import TranscriptionAdapter
@@ -173,17 +175,114 @@ class TranscriptionOrchestrator:
 
         # Pair speech_start and speech_end events to process each utterance separately
         utterance_intervals: list[tuple[int, int]] = []
+        boundary_events: list[TranscriptEvent] = []
         current_start: int | None = None
 
         for e in sorted(speech_events, key=lambda ev: (ev.at_ms, ev.sequence_id)):
             if e.kind == "speech_start":
-                current_start = e.at_ms
-            elif e.kind == "speech_end" and current_start is not None:
-                utterance_intervals.append((current_start, e.at_ms))
-                current_start = None
+                if current_start is not None:
+                    # Duplicate speech_start before speech_end: ignore duplicate start
+                    err_env = ErrorEnvelope(
+                        code="TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY",
+                        message_safe_for_user=(
+                            "Duplicate speech_start received before speech_end."
+                        ),
+                        retryable=False,
+                        correlation_id=correlation_id,
+                        details_redacted={
+                            "session_id": session_id,
+                            "reason": "duplicate_speech_start",
+                            "at_ms": str(e.at_ms),
+                        },
+                    )
+                    boundary_events.append(
+                        TranscriptEvent(
+                            event_id=(
+                                f"event-transcript-err-{session_id}-"
+                                f"{uuid.uuid4().hex[:8]}"
+                            ),
+                            event_type="transcript.error",
+                            schema_version="1.0",
+                            session_id=session_id,
+                            correlation_id=correlation_id,
+                            timestamp=timestamp,
+                            producer="transcription",
+                            payload=err_env,
+                        )
+                    )
+                else:
+                    current_start = e.at_ms
+            elif e.kind == "speech_end":
+                if current_start is not None:
+                    utterance_intervals.append((current_start, e.at_ms))
+                    current_start = None
+                else:
+                    err_env = ErrorEnvelope(
+                        code="TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY",
+                        message_safe_for_user=(
+                            "speech_end received without matching speech_start."
+                        ),
+                        retryable=False,
+                        correlation_id=correlation_id,
+                        details_redacted={
+                            "session_id": session_id,
+                            "reason": "unmatched_speech_end",
+                            "at_ms": str(e.at_ms),
+                        },
+                    )
+                    boundary_events.append(
+                        TranscriptEvent(
+                            event_id=(
+                                f"event-transcript-err-{session_id}-"
+                                f"{uuid.uuid4().hex[:8]}"
+                            ),
+                            event_type="transcript.error",
+                            schema_version="1.0",
+                            session_id=session_id,
+                            correlation_id=correlation_id,
+                            timestamp=timestamp,
+                            producer="transcription",
+                            payload=err_env,
+                        )
+                    )
+
+        if current_start is not None:
+            # speech_start with no speech_end: emit normalized error event
+            err_env = ErrorEnvelope(
+                code="TRANSCRIPTION_UNMATCHED_SPEECH_BOUNDARY",
+                message_safe_for_user=(
+                    "speech_start received without matching speech_end."
+                ),
+                retryable=False,
+                correlation_id=correlation_id,
+                details_redacted={
+                    "session_id": session_id,
+                    "reason": "unclosed_speech_start",
+                    "at_ms": str(current_start),
+                },
+            )
+            boundary_events.append(
+                TranscriptEvent(
+                    event_id=(
+                        f"event-transcript-err-{session_id}-{uuid.uuid4().hex[:8]}"
+                    ),
+                    event_type="transcript.error",
+                    schema_version="1.0",
+                    session_id=session_id,
+                    correlation_id=correlation_id,
+                    timestamp=timestamp,
+                    producer="transcription",
+                    payload=err_env,
+                )
+            )
+
+        # Publish boundary error events to event sink if configured
+        if self.event_sink is not None:
+            for evt in boundary_events:
+                self.event_sink(session_id, evt)
 
         if not utterance_intervals:
-            return []
+            return boundary_events
 
         all_events: list[TranscriptEvent] = []
         for start_ms, end_ms in utterance_intervals:
@@ -202,7 +301,7 @@ class TranscriptionOrchestrator:
                 )
                 all_events.extend(evts)
 
-        return all_events
+        return [*all_events, *boundary_events]
 
     def ingest_event(self, event: TranscriptEvent) -> bool:
         """Directly add a transcript event to the accumulator."""
