@@ -296,6 +296,127 @@ describe('SessionClient implementations', () => {
       const decision = await client.decideApproval('sess-1', 'appr-1', 'reject');
       expect(decision.status).toBe('rejected');
     });
+
+    it('throws BackendError with DEPENDENCY_UNAVAILABLE when approvals endpoint returns 404 or 501', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        json: async () => ({}),
+      });
+
+      const client = new HttpSessionClient();
+      await expect(client.getPendingApprovals('sess-missing')).rejects.toThrow(BackendError);
+      try {
+        await client.getPendingApprovals('sess-missing');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+      }
+
+      await expect(client.decideApproval('sess-missing', 'appr-1', 'reject')).rejects.toThrow(BackendError);
+      try {
+        await client.decideApproval('sess-missing', 'appr-1', 'reject');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+      }
+    });
+
+    it('resolves production relative URLs to http://127.0.0.1:8000 in file:// protocol or via voicebot.getBackendUrl', () => {
+      const client = new HttpSessionClient();
+      expect(client.resolveUrl('http://custom-host:9000/api/mock')).toBe('http://custom-host:9000/api/mock');
+
+      // Test with window.voicebot.getBackendUrl
+      const originalVoicebot = (window as unknown as { voicebot?: unknown }).voicebot;
+      (window as unknown as { voicebot?: { getBackendUrl?: () => string } }).voicebot = {
+        getBackendUrl: () => 'http://127.0.0.1:8000',
+      };
+      expect(client.resolveUrl('/api/sessions/mock')).toBe('http://127.0.0.1:8000/api/sessions/mock');
+      expect(client.resolveUrl('api/sessions/1/events')).toBe('http://127.0.0.1:8000/api/sessions/1/events');
+
+      (window as unknown as { voicebot?: unknown }).voicebot = originalVoicebot;
+    });
+
+    it('subscribes to live event stream with automatic pagination and capped exponential backoff on failure', async () => {
+      let callCount = 0;
+      const mockFetch = vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          // First call: returns page 1 with has_more: true
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              session_id: 'sess-stream',
+              from_sequence: 0,
+              total_events: 2,
+              has_more: true,
+              events: [
+                {
+                  event_id: 'evt-1',
+                  event_type: 'transcript.segment',
+                  schema_version: '1.0',
+                  session_id: 'sess-stream',
+                  correlation_id: 'corr-1',
+                  timestamp: '2026-01-01T00:00:00Z',
+                  producer: 'transcription',
+                  payload: {
+                    segment_id: 'seg-1',
+                    session_id: 'sess-stream',
+                    sequence_id: 0,
+                    start_ms: 0,
+                    end_ms: 500,
+                    text: 'Hello',
+                    confidence: 0.95,
+                    language: 'en',
+                    is_final: false,
+                  },
+                },
+              ],
+            }),
+          };
+        }
+        if (callCount === 2) {
+          // Second call: network failure to test backoff reconnect
+          throw new Error('Network timeout');
+        }
+        // Subsequent calls
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            session_id: 'sess-stream',
+            from_sequence: 1,
+            total_events: 2,
+            has_more: false,
+            events: [],
+          }),
+        };
+      });
+      globalThis.fetch = mockFetch;
+
+      const client = new HttpSessionClient();
+      const receivedEvents: unknown[] = [];
+      const reconnectAttempts: { attempt: number; delayMs: number }[] = [];
+
+      const sub = client.subscribeToEvents('sess-stream', {
+        initialDelayMs: 20,
+        maxDelayMs: 50,
+        pollIntervalMs: 50,
+        onEvents: (evts) => receivedEvents.push(...evts),
+        onReconnect: (attempt, delayMs) => reconnectAttempts.push({ attempt, delayMs }),
+      });
+
+      // Wait briefly for pagination and reconnect attempt
+      await new Promise((r) => setTimeout(r, 120));
+      sub.unsubscribe();
+
+      expect(receivedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(reconnectAttempts.length).toBeGreaterThanOrEqual(1);
+      expect(reconnectAttempts[0].attempt).toBe(1);
+      expect(reconnectAttempts[0].delayMs).toBeLessThanOrEqual(50);
+    });
   });
 
   describe('FixtureSessionClient Week 3 features', () => {
@@ -337,6 +458,31 @@ describe('SessionClient implementations', () => {
         BackendError
       );
       expect(client.getExecutionCount()).toBe(0);
+    });
+
+    it('generates deterministic event IDs for approval decision audit events', async () => {
+      const initialApproval = {
+        approval_id: 'appr-det-1',
+        plan_id: 'plan-1',
+        step_id: 'step-1',
+        session_id: 'sess-det',
+        status: 'pending' as const,
+      };
+
+      const emptyFixture = {
+        session_id: 'sess-det',
+        state: 'active' as const,
+        mode: 'mock' as const,
+        events: [],
+      };
+      const client = new FixtureSessionClient(emptyFixture, 0, 'active', [initialApproval]);
+      await client.decideApproval('sess-det', 'appr-det-1', 'reject');
+      const events = await client.getEvents('sess-det');
+      const auditEvt = events.events.find(
+        (e) => e.event_type === 'workflow.audit' && (e.payload as { kind: string }).kind === 'approval_rejected'
+      );
+      expect(auditEvt).toBeDefined();
+      expect(auditEvt?.event_id).toBe('evt-audit-decision-appr-det-1-rejected');
     });
   });
 });

@@ -1,10 +1,25 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { setupPreloadBridge, VoicebotDesktopAPI } from '../preload';
-import { SidecarOptions, startBackendSidecar } from '../sidecar';
+import { startBackendSidecar } from '../sidecar';
 import { generateLaunchToken, sanitizeLogOutput } from '../token';
 
-describe('Token Generation and Sanitization', () => {
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const mainCjs = require('../main.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const sidecarCjs = require('../sidecar.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const tokenCjs = require('../token.cjs');
+
+describe('Token Generation and Sanitization (Finding 11)', () => {
+  it('guarantees token.ts re-exports the exact implementation from token.cjs', () => {
+    const t = generateLaunchToken();
+    expect(t).toMatch(/^vbt-[0-9a-f]{48}$/);
+    const sanitized = sanitizeLogOutput(`secret ${t}`, t);
+    expect(sanitized).toBe('secret [REDACTED_LAUNCH_TOKEN]');
+    expect(tokenCjs.sanitizeLogOutput(`secret ${t}`, t)).toBe('secret [REDACTED_LAUNCH_TOKEN]');
+  });
+
   it('generates random launch tokens with vbt- prefix and high entropy', () => {
     const t1 = generateLaunchToken();
     const t2 = generateLaunchToken();
@@ -50,7 +65,10 @@ describe('Preload Bridge Setup', () => {
     expect(exposedKey).toBe('voicebot');
     expect(exposedApi).not.toBeNull();
     expect(exposedApi!.isElectron).toBe(true);
+    expect(exposedApi!.backendUrl).toBe('http://127.0.0.1:8000');
+    expect(exposedApi!.getBackendUrl?.()).toBe('http://127.0.0.1:8000');
     expect(exposedApi!.getToken()).toBe(token);
+    expect(exposedApi!.isBackendReady?.()).toBe(true);
 
     // Call setWindowExpanded
     await exposedApi!.setWindowExpanded(true);
@@ -65,13 +83,55 @@ describe('Preload Bridge Setup', () => {
   });
 });
 
-describe('Backend Sidecar Process Manager', () => {
+describe('Backend Sidecar Process Manager & Readiness (Finding 10 & 11)', () => {
+  it('guarantees sidecar.ts re-exports sidecar.cjs used by main.cjs', () => {
+    expect(startBackendSidecar).toBe(sidecarCjs.startBackendSidecar);
+  });
+
   it('throws when launch token is empty', () => {
     expect(() =>
       startBackendSidecar({
         token: '',
       })
     ).toThrow('A non-empty launch token is required');
+  });
+
+  it('does NOT trigger readiness on port conflict line ("address already in use") (Finding 10)', () => {
+    const token = generateLaunchToken();
+    const stdoutEmitter = new EventEmitter();
+    const stderrEmitter = new EventEmitter();
+    const processEmitter = new EventEmitter() as any;
+    processEmitter.stdout = stdoutEmitter;
+    processEmitter.stderr = stderrEmitter;
+    processEmitter.kill = vi.fn();
+    processEmitter.pid = 9991;
+
+    const mockSpawn = vi.fn(() => processEmitter);
+    const onReady = vi.fn();
+
+    const handle = startBackendSidecar({
+      backendDir: '../backend',
+      token,
+      spawnFn: mockSpawn as any,
+      onReady,
+    });
+
+    expect(handle.isReady()).toBe(false);
+
+    // Emit the exact error line that previously caused false readiness
+    const bindError = "ERROR:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 8000): address already in use\n";
+    stderrEmitter.emit('data', Buffer.from(bindError));
+
+    // Must stay strictly false!
+    expect(handle.isReady()).toBe(false);
+    expect(onReady).not.toHaveBeenCalled();
+
+    // Now emit the real agreed VOICEBOT_READY line
+    stdoutEmitter.emit('data', Buffer.from('VOICEBOT_READY\n'));
+    expect(handle.isReady()).toBe(true);
+    expect(onReady).toHaveBeenCalledTimes(1);
+
+    handle.stop();
   });
 
   it('spawns backend with injected spawn, passes token in env, and detects readiness', () => {
@@ -113,17 +173,48 @@ describe('Backend Sidecar Process Manager', () => {
     expect(handle.isReady()).toBe(false);
 
     // Emit startup line
-    stdoutEmitter.emit('data', Buffer.from('INFO: Application startup complete.'));
+    stdoutEmitter.emit('data', Buffer.from('INFO:     Application startup complete.\n'));
 
     expect(handle.isReady()).toBe(true);
     expect(onReady).toHaveBeenCalledTimes(1);
 
     // Emit log with token and check redaction
-    stdoutEmitter.emit('data', Buffer.from(`Configured token is ${token}`));
-    expect(onLog).toHaveBeenCalledWith('Configured token is [REDACTED_LAUNCH_TOKEN]');
+    stdoutEmitter.emit('data', Buffer.from(`Configured token is ${token}\n`));
+    expect(onLog).toHaveBeenCalledWith('Configured token is [REDACTED_LAUNCH_TOKEN]\n');
 
     // Stop process
     handle.stop();
-    // Verify cleanup was triggered
+  });
+
+  it('verifies main.cjs uses startBackend with injected spawn and redacts tokens (Finding 11)', () => {
+    const stdoutEmitter = new EventEmitter();
+    const stderrEmitter = new EventEmitter();
+    const processEmitter = new EventEmitter() as any;
+    processEmitter.stdout = stdoutEmitter;
+    processEmitter.stderr = stderrEmitter;
+    processEmitter.kill = vi.fn();
+    processEmitter.pid = 9992;
+
+    const mockSpawn = vi.fn(() => processEmitter);
+    const onReady = vi.fn();
+    const onLog = vi.fn();
+
+    const handle = mainCjs.startBackend({
+      backendDir: '../backend',
+      spawnFn: mockSpawn,
+      onReady,
+      onLog,
+    });
+
+    expect(mockSpawn).toHaveBeenCalled();
+    expect(handle.isReady()).toBe(false);
+
+    // Emit VOICEBOT_READY
+    stdoutEmitter.emit('data', Buffer.from('VOICEBOT_READY\n'));
+    expect(handle.isReady()).toBe(true);
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(mainCjs.isBackendReady()).toBe(true);
+
+    mainCjs.cleanupBackend();
   });
 });
