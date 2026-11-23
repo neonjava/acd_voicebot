@@ -15,6 +15,7 @@ fixture stats and only records URLs. Real stats and a real browser need a
 """
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -34,6 +35,10 @@ from app.contracts.workflow import ToolSpec
 MAX_TEXT_LENGTH = 1000
 MAX_URL_LENGTH = 2048
 DEFAULT_ALLOWED_HOSTS: frozenset[str] = frozenset({"youtube.com", "github.com"})
+# Plain ASCII DNS labels only. A host with anything else ("%", ";", "_") may be
+# parsed differently by the browser than by urlsplit, so it is never opened.
+_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_HOSTNAME = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.?")
 
 ArgumentValidator = Callable[[Mapping[str, str], frozenset[str]], None]
 
@@ -77,6 +82,13 @@ def _validate_url(arguments: Mapping[str, str], allowed_hosts: frozenset[str]) -
         raise _invalid("url must be a nonblank string")
     if len(url) > MAX_URL_LENGTH or any(ch.isspace() for ch in url):
         raise _invalid("url is too long or contains whitespace")
+    if "\\" in url:
+        # Browsers read a backslash as "/" in https links, so
+        # https://evil.example\.youtube.com opens evil.example although
+        # urlsplit reports a youtube.com subdomain.
+        raise WorkflowPolicyError(
+            "WORKFLOW_URL_NOT_ALLOWED", "links with a backslash are not allowed"
+        )
     parts = urlsplit(url)
     if parts.scheme != "https":
         raise WorkflowPolicyError(
@@ -86,7 +98,11 @@ def _validate_url(arguments: Mapping[str, str], allowed_hosts: frozenset[str]) -
         raise WorkflowPolicyError(
             "WORKFLOW_URL_NOT_ALLOWED", "links with credentials are not allowed"
         )
-    if not parts.hostname or not host_is_allowed(parts.hostname, allowed_hosts):
+    if (
+        not parts.hostname
+        or not _HOSTNAME.fullmatch(parts.hostname)
+        or not host_is_allowed(parts.hostname, allowed_hosts)
+    ):
         raise WorkflowPolicyError(
             "WORKFLOW_URL_NOT_ALLOWED", "this site is not on the allow-list"
         )
