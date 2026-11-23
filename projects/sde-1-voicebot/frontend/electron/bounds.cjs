@@ -1,5 +1,6 @@
 /**
  * Pure functions for calculating Electron notch window geometry (CommonJS).
+ * Single shared implementation used by main.cjs and tested by bounds.test.ts.
  */
 
 const COLLAPSED_WIDTH = 200;
@@ -18,8 +19,12 @@ function getNotchBounds(display, expanded) {
   const width = Math.min(targetWidth, display.width, MAX_EXPANDED_WIDTH);
   const height = Math.min(targetHeight, display.height, MAX_EXPANDED_HEIGHT);
 
-  const x = Math.round((display.width - width) / 2);
-  const y = 0;
+  const displayX = typeof display.x === 'number' ? display.x : 0;
+  const displayY = typeof display.y === 'number' ? display.y : 0;
+
+  // Position at top-center of the display, taking monitor origin (x, y) into account
+  const x = displayX + Math.round((display.width - width) / 2);
+  const y = displayY;
 
   return { x, y, width, height };
 }

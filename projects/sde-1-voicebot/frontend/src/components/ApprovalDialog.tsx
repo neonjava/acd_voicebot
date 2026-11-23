@@ -34,6 +34,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
   return (
     <div
       role="dialog"
+      data-testid="approval-dialog"
       aria-modal="true"
       aria-labelledby="approval-title"
       aria-describedby="approval-desc"
@@ -78,6 +79,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
       <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
         <button
           type="button"
+          data-testid="approval-reject-button"
           onClick={() => handleDecision('reject')}
           disabled={submitting}
           aria-label="Reject action"
@@ -97,6 +99,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
         </button>
         <button
           type="button"
+          data-testid="approval-approve-button"
           onClick={() => handleDecision('approve')}
           disabled={submitting}
           aria-label="Approve action"

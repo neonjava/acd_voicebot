@@ -14,6 +14,7 @@ import {
   SessionClient,
   HttpSessionClient,
   FixtureSessionClient,
+  EventStreamSubscription,
 } from './services/sessionClient';
 import {
   baselineApprovalRequest,
@@ -68,8 +69,19 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     return !isElectronApp;
   });
 
+  // Track backend sidecar readiness before allowing the first start in Electron desktop app
+  const [isBackendReady, setIsBackendReady] = useState<boolean>(() => {
+    if (!isElectronApp) return true;
+    return Boolean(window.voicebot?.isBackendReady?.());
+  });
+
   const [uiState, setUiState] = useState<SessionUiState>('idle');
-  const [statusMessage, setStatusMessage] = useState<string | null>('Ready to start session.');
+  const [statusMessage, setStatusMessage] = useState<string | null>(() => {
+    if (isElectronApp && !Boolean(window.voicebot?.isBackendReady?.())) {
+      return 'Waiting for backend service to become ready...';
+    }
+    return 'Ready to start session.';
+  });
   const [error, setError] = useState<AppErrorState | null>(null);
   const [permission, setPermission] = useState<SimulatedPermissionState>('granted');
   const [clientMode, setClientMode] = useState<ClientSourceMode>('http');
@@ -101,6 +113,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   const currentSessionTokenRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const activeSubscriptionRef = useRef<EventStreamSubscription | null>(null);
 
   // Stable client instances maintained across Start -> Pause -> Resume
   const defaultClientsRef = useRef<{
@@ -118,6 +131,39 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
       }
       return next;
     });
+  }, []);
+
+  // Listen to backend readiness in Electron
+  useEffect(() => {
+    if (!isElectronApp) return;
+    if (window.voicebot?.isBackendReady?.()) {
+      setIsBackendReady(true);
+      setStatusMessage('Backend service ready.');
+      return;
+    }
+    if (window.voicebot?.onBackendReady) {
+      const unsub = window.voicebot.onBackendReady(() => {
+        setIsBackendReady(true);
+        setStatusMessage('Backend service ready.');
+      });
+      return () => {
+        if (unsub) unsub();
+      };
+    }
+  }, [isElectronApp]);
+
+  // Clean up active subscription on unmount
+  useEffect(() => {
+    return () => {
+      if (activeSubscriptionRef.current) {
+        activeSubscriptionRef.current.unsubscribe();
+        activeSubscriptionRef.current = null;
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
   }, []);
 
   // Listen to browser online/offline events
@@ -288,6 +334,79 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         case 'active':
           setUiState('active');
           setStatusMessage(`Session ${sid} active. Processing events...`);
+          // Live event stream subscription with capped exponential backoff and refresh approvals on audit events
+          if (client.subscribeToEvents) {
+            const sub = client.subscribeToEvents(
+              response.session_id,
+              {
+                fromSequence: seenEventIdsRef.current.size,
+                onEvents: (streamEventsList) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  let hasNewSegs = false;
+                  let hasNewAuds = false;
+                  const newAuds: AuditEvent[] = [];
+                  const newAudio: EventEnvelope<AudioChunkMetadata>[] = [];
+
+                  for (const evt of streamEventsList) {
+                    if (seenEventIdsRef.current.has(evt.event_id)) continue;
+                    seenEventIdsRef.current.add(evt.event_id);
+
+                    if (evt.event_type === 'transcript.segment') {
+                      accumulator.add(evt.payload as TranscriptSegment);
+                      hasNewSegs = true;
+                    } else if (evt.event_type === 'audio.chunk') {
+                      newAudio.push(evt as EventEnvelope<AudioChunkMetadata>);
+                    } else if (evt.event_type === 'workflow.audit') {
+                      newAuds.push(evt.payload as AuditEvent);
+                      hasNewAuds = true;
+                    }
+                  }
+
+                  if (hasNewSegs) {
+                    const updatedSegs = accumulator.getSegments();
+                    setSegments(updatedSegs);
+                    const revMap = new Map<string, number>();
+                    for (const s of updatedSegs) {
+                      revMap.set(s.segment_id, accumulator.getRevisionCount(s.segment_id));
+                    }
+                    setRevisionCounts(revMap);
+                  }
+                  if (newAudio.length > 0) {
+                    setAudioEvents((prev) => [...prev, ...newAudio]);
+                  }
+                  if (hasNewAuds && newAuds.length > 0) {
+                    setAuditEvents((prev) => {
+                      const next = [...prev];
+                      for (const a of newAuds) {
+                        const dup = next.some(
+                          (existing) =>
+                            (existing.approval_id && existing.approval_id === a.approval_id && existing.kind === a.kind) ||
+                            (existing.sequence === a.sequence && existing.step_id === a.step_id && existing.kind === a.kind)
+                        );
+                        if (!dup) next.push(a);
+                      }
+                      return next;
+                    });
+
+                    // Refresh approvals when audit events arrive
+                    if (client.getPendingApprovals) {
+                      client.getPendingApprovals(response.session_id).then((pending) => {
+                        if (sessionToken === currentSessionTokenRef.current && pending.length > 0) {
+                          setPendingApproval(pending[0]);
+                        }
+                      }).catch(() => {});
+                    }
+                  }
+                },
+                onReconnect: (attempt, delayMs) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  setStatusMessage(`Connection lost. Reconnecting (attempt ${attempt}, retry in ${delayMs}ms)...`);
+                },
+              },
+              abortController.signal
+            );
+            activeSubscriptionRef.current = sub;
+          }
           break;
         case 'paused':
           setUiState('paused');
@@ -433,6 +552,11 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   const handleStop = useCallback(() => {
     currentSessionTokenRef.current++;
 
+    if (activeSubscriptionRef.current) {
+      activeSubscriptionRef.current.unsubscribe();
+      activeSubscriptionRef.current = null;
+    }
+
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -445,15 +569,17 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     setStatusMessage('Session stopped by user. Late events ignored.');
   }, []);
 
-  // Replay missed events after a disconnect without duplicates
+  // Replay missed events after a disconnect without duplicates, paginating until has_more is false
   const handleReconnect = useCallback(async () => {
     if (!sessionId) return;
     const client = getClient();
     if (!client.getEvents) return;
 
+    const sessionToken = currentSessionTokenRef.current;
     setStatusMessage('Reconnecting to event stream...');
     try {
-      const streamRes = await client.getEvents(sessionId, seenEventIdsRef.current.size);
+      let fromSequence = seenEventIdsRef.current.size;
+      let hasMore = true;
       const newAudits: AuditEvent[] = [];
       const newAudioChunks: EventEnvelope<AudioChunkMetadata>[] = [];
       let hasNewSegments = false;
@@ -463,35 +589,78 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         accumulator.add(seg);
       }
 
-      for (const evt of streamRes.events) {
-        if (seenEventIdsRef.current.has(evt.event_id)) {
-          // Strictly deduplicate missed / replayed events
-          continue;
-        }
-        seenEventIdsRef.current.add(evt.event_id);
+      while (hasMore) {
+        const streamRes = await client.getEvents(sessionId, fromSequence);
+        if (sessionToken !== currentSessionTokenRef.current) return;
 
-        if (evt.event_type === 'transcript.segment') {
-          accumulator.add(evt.payload as TranscriptSegment);
-          hasNewSegments = true;
-        } else if (evt.event_type === 'audio.chunk') {
-          newAudioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
-        } else if (evt.event_type === 'workflow.audit') {
-          newAudits.push(evt.payload as AuditEvent);
+        if (!streamRes.events || streamRes.events.length === 0) {
+          break;
         }
+
+        for (const evt of streamRes.events) {
+          if (seenEventIdsRef.current.has(evt.event_id)) {
+            // Strictly deduplicate missed / replayed events
+            continue;
+          }
+          seenEventIdsRef.current.add(evt.event_id);
+
+          if (evt.event_type === 'transcript.segment') {
+            accumulator.add(evt.payload as TranscriptSegment);
+            hasNewSegments = true;
+          } else if (evt.event_type === 'audio.chunk') {
+            newAudioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
+          } else if (evt.event_type === 'workflow.audit') {
+            newAudits.push(evt.payload as AuditEvent);
+          }
+        }
+
+        fromSequence = streamRes.from_sequence + streamRes.events.length;
+        hasMore = Boolean(streamRes.has_more);
       }
 
       if (hasNewSegments) {
-        setSegments(accumulator.getSegments());
+        const updatedSegs = accumulator.getSegments();
+        setSegments(updatedSegs);
+        // Recompute revisionCounts from accumulator after replay
+        const revMap = new Map<string, number>();
+        for (const seg of updatedSegs) {
+          revMap.set(seg.segment_id, accumulator.getRevisionCount(seg.segment_id));
+        }
+        setRevisionCounts(revMap);
       }
       if (newAudioChunks.length > 0) {
         setAudioEvents((prev) => [...prev, ...newAudioChunks]);
       }
       if (newAudits.length > 0) {
-        setAuditEvents((prev) => [...prev, ...newAudits]);
+        setAuditEvents((prev) => {
+          const next = [...prev];
+          for (const na of newAudits) {
+            const exists = next.some(
+              (a) =>
+                (a.approval_id && a.approval_id === na.approval_id && a.kind === na.kind) ||
+                (a.step_id && a.step_id === na.step_id && a.kind === na.kind && a.sequence === na.sequence)
+            );
+            if (!exists) next.push(na);
+          }
+          return next;
+        });
+
+        // Refresh pending approvals if new audits arrived
+        if (client.getPendingApprovals) {
+          try {
+            const pending = await client.getPendingApprovals(sessionId);
+            if (sessionToken === currentSessionTokenRef.current && pending.length > 0) {
+              setPendingApproval(pending[0]);
+            }
+          } catch {
+            // non-blocking
+          }
+        }
       }
 
       setStatusMessage('Reconnected and replayed event stream with zero duplicates.');
     } catch (err) {
+      if (sessionToken !== currentSessionTokenRef.current) return;
       const formatted = formatErrorToState(err);
       setError(formatted);
       setStatusMessage(`Reconnection failed: ${formatted.message}`);
@@ -501,25 +670,51 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   const handleApprove = useCallback(
     async (approvalId: string) => {
       if (!sessionId) return;
+      const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
 
       try {
         const updated = await client.decideApproval(sessionId, approvalId, 'approve');
+        if (requestSessionToken !== currentSessionTokenRef.current) {
+          return;
+        }
+
+        if (updated.status !== 'approved') {
+          setError({
+            type: 'backend',
+            title: 'Approval Decision Mismatch',
+            message: `Expected approval status 'approved' but received '${updated.status}'. Dialog kept open.`,
+            code: 'STATUS_MISMATCH',
+          });
+          return;
+        }
+
         setPendingApproval(null);
         setStatusMessage(`Approval granted for step ${updated.step_id}.`);
-        setAuditEvents((prev) => [
-          ...prev,
-          {
-            sequence: prev.length,
-            kind: 'approval_granted',
-            plan_id: updated.plan_id,
-            session_id: sessionId,
-            step_id: updated.step_id,
-            approval_id: updated.approval_id,
-          },
-        ]);
+
+        const decisionEvtId = `evt-audit-decision-${updated.approval_id}-approved`;
+        seenEventIdsRef.current.add(decisionEvtId);
+
+        setAuditEvents((prev) => {
+          const exists = prev.some(
+            (a) => a.approval_id === updated.approval_id && a.kind === 'approval_granted'
+          );
+          if (exists) return prev;
+          return [
+            ...prev,
+            {
+              sequence: prev.length,
+              kind: 'approval_granted',
+              plan_id: updated.plan_id,
+              session_id: sessionId,
+              step_id: updated.step_id,
+              approval_id: updated.approval_id,
+            },
+          ];
+        });
       } catch (err) {
+        if (requestSessionToken !== currentSessionTokenRef.current) return;
         const formatted = formatErrorToState(err);
         setError(formatted);
       }
@@ -530,25 +725,51 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   const handleReject = useCallback(
     async (approvalId: string) => {
       if (!sessionId) return;
+      const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
 
       try {
         const updated = await client.decideApproval(sessionId, approvalId, 'reject');
+        if (requestSessionToken !== currentSessionTokenRef.current) {
+          return;
+        }
+
+        if (updated.status !== 'rejected') {
+          setError({
+            type: 'backend',
+            title: 'Approval Rejection Mismatch',
+            message: `Expected approval status 'rejected' but received '${updated.status}'. Dialog kept open.`,
+            code: 'STATUS_MISMATCH',
+          });
+          return;
+        }
+
         setPendingApproval(null);
         setStatusMessage(`Approval rejected for step ${updated.step_id}. Step execution prevented.`);
-        setAuditEvents((prev) => [
-          ...prev,
-          {
-            sequence: prev.length,
-            kind: 'approval_rejected',
-            plan_id: updated.plan_id,
-            session_id: sessionId,
-            step_id: updated.step_id,
-            approval_id: updated.approval_id,
-          },
-        ]);
+
+        const decisionEvtId = `evt-audit-decision-${updated.approval_id}-rejected`;
+        seenEventIdsRef.current.add(decisionEvtId);
+
+        setAuditEvents((prev) => {
+          const exists = prev.some(
+            (a) => a.approval_id === updated.approval_id && a.kind === 'approval_rejected'
+          );
+          if (exists) return prev;
+          return [
+            ...prev,
+            {
+              sequence: prev.length,
+              kind: 'approval_rejected',
+              plan_id: updated.plan_id,
+              session_id: sessionId,
+              step_id: updated.step_id,
+              approval_id: updated.approval_id,
+            },
+          ];
+        });
       } catch (err) {
+        if (requestSessionToken !== currentSessionTokenRef.current) return;
         const formatted = formatErrorToState(err);
         setError(formatted);
       }
@@ -626,7 +847,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     toggleExpanded,
   ]);
 
-  const isStartDisabled = isSessionInProgress;
+  const isStartDisabled = isSessionInProgress || (isElectronApp && !isBackendReady);
   const isPauseDisabled = backendSessionState !== 'active' || isTransitioning;
   const isResumeDisabled = backendSessionState !== 'paused' || isTransitioning;
   const isStopDisabled = !isSessionInProgress;
@@ -845,6 +1066,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               data-testid="start-button"
               onClick={handleStart}
               disabled={isStartDisabled}
+              title={isElectronApp && !isBackendReady ? 'Waiting for backend sidecar to be ready...' : undefined}
               aria-label="Start Session"
               style={{
                 flex: 1,
