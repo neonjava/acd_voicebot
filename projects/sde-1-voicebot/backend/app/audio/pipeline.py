@@ -296,22 +296,18 @@ class SpeechPipeline:
             )
             if has_gap:
                 if self._active_span_start is not None:
+                    # Lost audio (overrun, reconnect) is not the user finishing:
+                    # keep listening so speech after the gap becomes the next
+                    # utterance; the silence timeout still closes listening.
                     self._close_active_span(
                         timestamp=timestamp,
                         out_events=out_events,
                         out_chunks=out_chunks,
                         out_transcripts=out_transcripts,
+                        keep_listening=True,
                     )
                 else:
                     self._vad_window.clear()
-
-                if self.config.wake_required and not self._listening:
-                    self._handle_wake_gate(chunk, detection, out_events)
-                    return PipelineStepResult(
-                        speech_events=out_events,
-                        utterance_chunks=out_chunks,
-                        transcript_events=out_transcripts,
-                    )
 
         self._vad_window.append(chunk)
         spans = self.vad.detect(self._vad_window)
