@@ -481,6 +481,34 @@ def test_open_url_rejects_non_allow_listed_links_without_opening(url: str) -> No
     assert list(runtime.opener.opened) == []
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Browsers read "\" as "/" in https links, so this opens evil.example.
+        "https://evil.example\\.youtube.com/",
+        "https://evil.example\\@www.youtube.com/",
+        "https://www.youtube.com\\..evil.example/",
+        # Characters that are never part of a real host name.
+        "https://evil.example%2f.youtube.com/",
+        "https://evil.example;.youtube.com/",
+        "https://evil_example.youtube.com/",
+    ],
+)
+def test_open_url_rejects_hosts_a_browser_would_read_differently(url: str) -> None:
+    runtime = tools.ToolRuntime(opener=RecordingUrlOpener())
+    with pytest.raises(WorkflowPolicyError) as err:
+        runtime.invoke("open_url", {"url": url})
+    assert err.value.code == "WORKFLOW_URL_NOT_ALLOWED"
+    assert list(runtime.opener.opened) == []
+
+
+def test_open_url_still_opens_allow_listed_url_with_port_and_path() -> None:
+    runtime = tools.ToolRuntime(opener=RecordingUrlOpener())
+    url = "https://GitHub.com:443/neonjava/acd_voicebot?tab=readme#top"
+    assert runtime.invoke("open_url", {"url": url}) == "Opened github.com"
+    assert list(runtime.opener.opened) == [url]
+
+
 def test_open_url_opens_exact_allow_listed_url() -> None:
     runtime = tools.ToolRuntime(opener=RecordingUrlOpener())
     url = "https://www.youtube.com/results?search_query=avengers+trailer"
