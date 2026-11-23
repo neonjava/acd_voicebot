@@ -122,16 +122,23 @@ class TranscriptionOrchestrator:
         )
 
         # Ingest successful segment events into accumulator
+        processed_events: list[TranscriptEvent] = []
         for evt in events:
             if evt.event_type == "transcript.segment":
+                seg = evt.payload
+                # Keep low-confidence segments interim (not final)
+                if self.accumulator.is_low_confidence(seg) and seg.is_final:
+                    seg = seg.model_copy(update={"is_final": False})
+                    evt = evt.model_copy(update={"payload": seg})
                 self.accumulator.add(evt)
+            processed_events.append(evt)
 
         # Publish to external session event stream if sink is configured
         if self.event_sink is not None:
-            for evt in events:
+            for evt in processed_events:
                 self.event_sink(session_id, evt)
 
-        return events
+        return processed_events
 
     def process_speech_session(
         self,
@@ -235,8 +242,13 @@ class TranscriptionOrchestrator:
         """Return detected chronological gaps between segments."""
         return self.accumulator.gaps(min_gap_ms)
 
-    def reset(self) -> None:
-        """Clear the accumulator and reset session state."""
+    def reset(self, session_id: str | None = None) -> None:
+        """Clear the accumulator and reset session state in orchestrator and adapter."""
         self.accumulator.clear()
         self._batch_counter = 0
-        self._cancelled_sessions.clear()
+        if session_id:
+            self._cancelled_sessions.discard(session_id)
+        else:
+            self._cancelled_sessions.clear()
+        if hasattr(self.adapter, "reset"):
+            self.adapter.reset(session_id)

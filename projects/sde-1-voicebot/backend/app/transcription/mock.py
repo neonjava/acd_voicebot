@@ -49,6 +49,14 @@ class FakeTranscriber:
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
 
+    def reset(self, session_id: str | None = None) -> None:
+        """Reset state and clear cancellations."""
+        if session_id:
+            self._cancelled_sessions.discard(session_id)
+        else:
+            self._cancelled_sessions.clear()
+            self._segment_indices.clear()
+
     def transcribe(
         self,
         chunks: Sequence[AudioChunk],

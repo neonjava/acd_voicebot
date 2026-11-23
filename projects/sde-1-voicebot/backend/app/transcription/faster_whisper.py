@@ -2,6 +2,7 @@
 
 import io
 import math
+import os
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -60,12 +61,13 @@ class FasterWhisperAdapter:
 
         device, compute_type = self.config.resolve_device_and_compute()
 
-        try:
-            import truststore
+        if os.getenv("STT_USE_SYSTEM_CERTS") == "1":
+            try:
+                import truststore
 
-            truststore.inject_into_ssl()
-        except Exception:
-            pass
+                truststore.inject_into_ssl()
+            except Exception:
+                pass
 
         try:
             self._model = WhisperModel(
@@ -92,6 +94,18 @@ class FasterWhisperAdapter:
         self._fallback_announced.discard(session_id)
         self._fallback_transcriber.cancel(session_id)
 
+    def reset(self, session_id: str | None = None) -> None:
+        """Reset state and clear cancellations."""
+        if session_id:
+            self._cancelled_sessions.discard(session_id)
+            self._fallback_announced.discard(session_id)
+        else:
+            self._cancelled_sessions.clear()
+            self._fallback_announced.clear()
+            self._segment_indices.clear()
+        if hasattr(self._fallback_transcriber, "reset"):
+            self._fallback_transcriber.reset(session_id)
+
     def transcribe(
         self,
         chunks: Sequence[AudioChunk],
@@ -117,6 +131,90 @@ class FasterWhisperAdapter:
 
         if not chunks:
             return []
+
+        # Validate chunks consistency and ordering
+        expected_seq = chunks[0].sequence_id
+        prev_start = -1
+        for chunk in chunks:
+            if chunk.session_id != session_id:
+                self._error_counter += 1
+                error_payload = ErrorEnvelope(
+                    code="TRANSCRIPTION_MIXED_SESSION",
+                    message_safe_for_user=(
+                        "Audio chunks belong to mixed or mismatched sessions."
+                    ),
+                    retryable=False,
+                    correlation_id=correlation_id,
+                    details_redacted={
+                        "expected_session": session_id,
+                        "received_session": chunk.session_id,
+                    },
+                )
+                return [
+                    TranscriptEvent(
+                        event_id=f"evt-stt-err-{session_id}-{self._error_counter}",
+                        event_type="transcript.error",
+                        schema_version="1.0",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        timestamp=timestamp,
+                        producer="transcription",
+                        payload=error_payload,
+                    )
+                ]
+
+            if chunk.sequence_id < expected_seq or chunk.start_ms < prev_start:
+                self._error_counter += 1
+                error_payload = ErrorEnvelope(
+                    code="TRANSCRIPTION_INVALID_ORDERING",
+                    message_safe_for_user="Audio chunks are out of order.",
+                    retryable=False,
+                    correlation_id=correlation_id,
+                    details_redacted={
+                        "sequence_id": str(chunk.sequence_id),
+                        "start_ms": str(chunk.start_ms),
+                    },
+                )
+                return [
+                    TranscriptEvent(
+                        event_id=f"evt-stt-err-{session_id}-{self._error_counter}",
+                        event_type="transcript.error",
+                        schema_version="1.0",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        timestamp=timestamp,
+                        producer="transcription",
+                        payload=error_payload,
+                    )
+                ]
+
+            if chunk.sequence_id > expected_seq + 1:
+                self._error_counter += 1
+                error_payload = ErrorEnvelope(
+                    code="TRANSCRIPTION_MISSING_CHUNKS",
+                    message_safe_for_user="Detected missing audio chunks in stream.",
+                    retryable=False,
+                    correlation_id=correlation_id,
+                    details_redacted={
+                        "expected_sequence": str(expected_seq + 1),
+                        "received_sequence": str(chunk.sequence_id),
+                    },
+                )
+                return [
+                    TranscriptEvent(
+                        event_id=f"evt-stt-err-{session_id}-{self._error_counter}",
+                        event_type="transcript.error",
+                        schema_version="1.0",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        timestamp=timestamp,
+                        producer="transcription",
+                        payload=error_payload,
+                    )
+                ]
+
+            expected_seq = chunk.sequence_id
+            prev_start = chunk.start_ms
 
         try:
             model = self._ensure_model_loaded()

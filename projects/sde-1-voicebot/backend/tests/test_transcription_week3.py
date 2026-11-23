@@ -255,6 +255,72 @@ class TestCancellationAndFailureRecovery:
         )
         assert evts_after == []
 
+    def test_cancel_then_reset_allows_subsequent_utterance_processing(
+        self,
+    ) -> None:
+        """Cancel cancels current utterance; reset clears cancel in adapter too."""
+        orchestrator = TranscriptionOrchestrator()
+        chunks = [_make_chunk("sess-rst", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Normal process -> returns events
+        evts1 = orchestrator.process_chunks(
+            chunks, session_id="sess-rst", correlation_id="c1", timestamp=ts
+        )
+        assert len(evts1) == 1
+
+        # 2. Cancel session -> returns 0 events
+        orchestrator.cancel("sess-rst")
+        evts_cancelled = orchestrator.process_chunks(
+            chunks, session_id="sess-rst", correlation_id="c2", timestamp=ts
+        )
+        assert evts_cancelled == []
+
+        # 3. Reset session -> clears cancelled state in orchestrator and adapter
+        orchestrator.reset("sess-rst")
+        evts_after_reset = orchestrator.process_chunks(
+            chunks, session_id="sess-rst", correlation_id="c3", timestamp=ts
+        )
+        assert len(evts_after_reset) == 1
+        assert evts_after_reset[0].payload.session_id == "sess-rst"
+
+    def test_system_certs_opt_in_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """truststore.inject_into_ssl is called only when STT_USE_SYSTEM_CERTS=1."""
+        injected = False
+
+        class MockTruststore:
+            @staticmethod
+            def inject_into_ssl() -> None:
+                nonlocal injected
+                injected = True
+
+        monkeypatch.setitem(sys.modules, "truststore", MockTruststore)
+
+        # 1. By default: NOT injected
+        monkeypatch.delenv("STT_USE_SYSTEM_CERTS", raising=False)
+        injected = False
+        adapter_default = FasterWhisperAdapter(model=object())
+        adapter_default._ensure_model_loaded()
+        assert injected is False
+
+        # 2. When STT_USE_SYSTEM_CERTS=1: injected
+        monkeypatch.setenv("STT_USE_SYSTEM_CERTS", "1")
+        injected = False
+        adapter_opt_in = FasterWhisperAdapter()
+
+        class DummyWhisper:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+        class MockFW:
+            WhisperModel = DummyWhisper
+
+        monkeypatch.setitem(sys.modules, "faster_whisper", MockFW)
+        adapter_opt_in._ensure_model_loaded()
+        assert injected is True
+
     def test_faster_whisper_load_failure_falls_back_to_mock_with_normalized_error(
         self,
     ) -> None:
@@ -894,6 +960,49 @@ class TestSpeechEventsAndEventStreamIntegration:
         # Segment end must cover through chunk 15 (ends at 320ms)
         assert seg.end_ms == 320
 
+    def test_low_confidence_segment_remains_interim_in_w5_stream(self) -> None:
+        """Low-confidence segments are kept interim (is_final=False) in W5 stream."""
+        published_events: list[TranscriptEvent] = []
+
+        def sink(sid: str, evt: TranscriptEvent) -> None:
+            published_events.append(evt)
+
+        # Model that emits 0.1 confidence segment with is_final=True
+        class LowConfModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> tuple[list[Any], Any]:
+                class LowConfSeg:
+                    start = 0.0
+                    end = 1.0
+                    text = "barely audible mumble"
+                    confidence = 0.1
+
+                return [LowConfSeg()], None
+
+        adapter = FasterWhisperAdapter(model=LowConfModel())
+        orchestrator = TranscriptionOrchestrator(
+            adapter=adapter,
+            accumulator=SegmentAccumulator(confidence_threshold=0.4),
+            event_sink=sink,
+        )
+        chunks = [_make_chunk("sess-lowconf", 0)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        events = orchestrator.process_chunks(
+            chunks, session_id="sess-lowconf", correlation_id="c-low", timestamp=ts
+        )
+
+        assert len(events) == 1
+        seg = events[0].payload
+        assert seg.confidence == 0.1
+        # Must be kept interim, not final
+        assert seg.is_final is False
+
+        # W5 stream event must also have is_final=False
+        assert len(published_events) == 1
+        stream_seg = published_events[0].payload
+        assert stream_seg.is_final is False
+        assert stream_seg.confidence == 0.1
+
 
 class TestAudioChunkIntegrity:
     """Acceptance criteria: out-of-order and missing chunks produce safe errors."""
@@ -960,3 +1069,48 @@ class TestAudioChunkIntegrity:
         err = events[0].payload
         assert isinstance(err, ErrorEnvelope)
         assert err.code == "TRANSCRIPTION_MISSING_CHUNKS"
+
+    def test_faster_whisper_validates_order_gaps_and_session(self) -> None:
+        """FasterWhisperAdapter validates chunk ordering, gaps, and sessions."""
+        adapter = FasterWhisperAdapter(
+            config=TranscriptionConfig(fallback_to_mock=False)
+        )
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Out of order
+        chunk1 = _make_chunk("sess-fw-val", 1, start_ms=100)
+        chunk0 = _make_chunk("sess-fw-val", 0, start_ms=0)
+        events_ooo = adapter.transcribe(
+            [chunk1, chunk0],
+            session_id="sess-fw-val",
+            correlation_id="c-val-1",
+            timestamp=ts,
+        )
+        assert len(events_ooo) == 1
+        assert events_ooo[0].event_type == "transcript.error"
+        assert events_ooo[0].payload.code == "TRANSCRIPTION_INVALID_ORDERING"
+
+        # 2. Missing chunks
+        chunk_gap0 = _make_chunk("sess-fw-val", 0, start_ms=0)
+        chunk_gap3 = _make_chunk("sess-fw-val", 3, start_ms=60)
+        events_gap = adapter.transcribe(
+            [chunk_gap0, chunk_gap3],
+            session_id="sess-fw-val",
+            correlation_id="c-val-2",
+            timestamp=ts,
+        )
+        assert len(events_gap) == 1
+        assert events_gap[0].event_type == "transcript.error"
+        assert events_gap[0].payload.code == "TRANSCRIPTION_MISSING_CHUNKS"
+
+        # 3. Mismatched session
+        chunk_mismatch = _make_chunk("other-session", 0, start_ms=0)
+        events_mis = adapter.transcribe(
+            [chunk_mismatch],
+            session_id="sess-fw-val",
+            correlation_id="c-val-3",
+            timestamp=ts,
+        )
+        assert len(events_mis) == 1
+        assert events_mis[0].event_type == "transcript.error"
+        assert events_mis[0].payload.code == "TRANSCRIPTION_MIXED_SESSION"
