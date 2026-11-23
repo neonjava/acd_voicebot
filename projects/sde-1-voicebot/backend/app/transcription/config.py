@@ -1,5 +1,6 @@
 """Transcription configuration for local faster-whisper and mock fallback."""
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -32,8 +33,11 @@ class TranscriptionConfig:
     fallback_to_mock: bool = True
 
     def __post_init__(self) -> None:
-        if type(self.confidence_threshold) not in (int, float) or not (
-            0.0 <= self.confidence_threshold <= 1.0
+        if (
+            type(self.confidence_threshold) not in (int, float)
+            or math.isnan(self.confidence_threshold)
+            or math.isinf(self.confidence_threshold)
+            or not (0.0 <= self.confidence_threshold <= 1.0)
         ):
             raise ValueError("confidence_threshold must be a float between 0.0 and 1.0")
 
@@ -65,11 +69,25 @@ class TranscriptionConfig:
         compute_type = os.getenv("STT_COMPUTE_TYPE", "auto")
         language = os.getenv("STT_LANGUAGE", "en")
 
-        try:
-            conf_thresh = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.4"))
-            if not (0.0 <= conf_thresh <= 1.0):
-                conf_thresh = 0.4
-        except ValueError:
+        raw_conf = os.getenv("STT_CONFIDENCE_THRESHOLD")
+        if raw_conf is not None:
+            try:
+                conf_thresh = float(raw_conf)
+            except (ValueError, TypeError) as err:
+                raise ValueError(
+                    f"Invalid STT_CONFIDENCE_THRESHOLD '{raw_conf}': "
+                    "confidence_threshold must be a float between 0.0 and 1.0"
+                ) from err
+            if (
+                math.isnan(conf_thresh)
+                or math.isinf(conf_thresh)
+                or not (0.0 <= conf_thresh <= 1.0)
+            ):
+                raise ValueError(
+                    f"Invalid STT_CONFIDENCE_THRESHOLD '{raw_conf}': "
+                    "confidence_threshold must be a float between 0.0 and 1.0"
+                )
+        else:
             conf_thresh = 0.4
 
         raw_fallback = os.getenv("STT_FALLBACK_TO_MOCK", "true").lower()
