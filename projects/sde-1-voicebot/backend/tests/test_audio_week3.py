@@ -1,5 +1,6 @@
 """Week 3 audio tests: speech events, wake gate, recovery, lazy extras, W2 handoff."""
 
+import os
 import subprocess
 import sys
 import types
@@ -41,6 +42,27 @@ from app.transcription.orchestrator import TranscriptionOrchestrator
 FIXED_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SESSION_ID = "session-w3"
 CORRELATION_ID = "correlation-w3"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_real_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in mock mode, even on a machine set up for the real mic.
+
+    Clears AUDIO_* overrides (for example an exported AUDIO_SOURCE=mic) and hides
+    the optional audio extra, so no test can open a microphone or download a
+    wake-word model. Tests that need fakes install them with monkeypatch.setitem.
+    """
+    for name in list(os.environ):
+        if name.startswith("AUDIO_"):
+            monkeypatch.delenv(name)
+    for module in (
+        "sounddevice",
+        "openwakeword",
+        "openwakeword.model",
+        "openwakeword.utils",
+        "openwakeword.vad",
+    ):
+        monkeypatch.setitem(sys.modules, module, None)
 
 
 def make_chunk(
@@ -1261,3 +1283,33 @@ def test_mic_demo_reads_with_configured_chunk_size(
 
     assert demo.run_mic_demo(duration_ms=200, config=config) == 0
     assert reads == [(40, 40)] * 5
+
+
+def test_gap_mid_command_keeps_listening_with_wake_required() -> None:
+    """An overrun or reconnect gap must not drop the rest of a woken command."""
+    pipeline, orch = build_pipeline(wake_required=True)
+    assert orch is not None
+    before_gap = [wake_chunk(0, 0)] + [make_chunk(i, 20 * i) for i in range(1, 4)]
+    # seq 4 (80-100 ms) was lost: the capture controller marked a gap.
+    after_gap = [make_chunk(i, 20 * i) for i in range(5, 8)]  # speech 100-160 ms
+
+    first = pipeline.process_chunks(before_gap + after_gap, timestamp=FIXED_TS)
+    # The gap ends the first part, but listening stays open for the rest.
+    assert pipeline.listening is True
+    assert [(e.kind, e.at_ms) for e in first.speech_events] == [
+        ("wake", 0),
+        ("speech_start", 20),
+        ("speech_end", 80),
+        ("speech_start", 100),
+    ]
+
+    rest = pipeline.process_chunks([silence_chunk(8, 160)], timestamp=FIXED_TS)
+    assert [(e.kind, e.sequence_id, e.at_ms) for e in rest.speech_events] == [
+        ("speech_end", 4, 160)
+    ]
+    # Every captured speech chunk reaches the real W2 orchestrator, in two parts.
+    handed_off = first.utterance_chunks + rest.utterance_chunks
+    assert [c.sequence_id for c in handed_off] == [1, 2, 3, 5, 6, 7]
+    assert len(orch.get_segments()) == 2
+    # A normal speech_end still closes listening.
+    assert pipeline.listening is False
