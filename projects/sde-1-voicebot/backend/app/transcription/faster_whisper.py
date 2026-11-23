@@ -39,6 +39,7 @@ class FasterWhisperAdapter:
             else FakeTranscriber()
         )
         self._cancelled_sessions: set[str] = set()
+        self._fallback_announced: set[str] = set()
         self._load_error: str | None = None
         self._segment_indices: dict[str, int] = {}
         self._error_counter: int = 0
@@ -58,6 +59,13 @@ class FasterWhisperAdapter:
             raise RuntimeError(self._load_error) from err
 
         device, compute_type = self.config.resolve_device_and_compute()
+
+        try:
+            import truststore
+
+            truststore.inject_into_ssl()
+        except Exception:
+            pass
 
         try:
             self._model = WhisperModel(
@@ -81,6 +89,7 @@ class FasterWhisperAdapter:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
+        self._fallback_announced.discard(session_id)
         self._fallback_transcriber.cancel(session_id)
 
     def transcribe(
@@ -174,7 +183,10 @@ class FasterWhisperAdapter:
                 correlation_id=correlation_id,
                 timestamp=timestamp,
             )
-            return [fallback_event, *mock_events]
+            if session_id not in self._fallback_announced:
+                self._fallback_announced.add(session_id)
+                return [fallback_event, *mock_events]
+            return list(mock_events)
 
     def _prepare_audio_input(self, raw_pcm: bytes) -> Any:
         """Prepare audio input for Whisper: normalized float32 array or WAV buffer."""

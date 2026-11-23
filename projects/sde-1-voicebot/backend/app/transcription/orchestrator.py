@@ -183,8 +183,7 @@ class TranscriptionOrchestrator:
             utterance_chunks = [
                 c
                 for c in chunks
-                if c.start_ms >= start_ms
-                and (c.start_ms + c.duration_ms) <= end_ms + 40
+                if c.start_ms < end_ms and (c.start_ms + c.duration_ms) > start_ms
             ]
             if utterance_chunks:
                 evts = self.process_chunks(

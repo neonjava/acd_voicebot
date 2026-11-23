@@ -487,28 +487,28 @@ class TestCancellationAndFailureRecovery:
     ) -> None:
         """TranscriptionConfig resolves device and compute respecting CUDA."""
 
-        class MockCuda:
-            @staticmethod
-            def is_available() -> bool:
-                return True
+        class MockCTranslate2:
+            device_count: int = 1
 
-        class MockTorch:
-            cuda = MockCuda
+            @classmethod
+            def get_cuda_device_count(cls) -> int:
+                return cls.device_count
 
-        # 1. When torch is installed and CUDA is available
-        monkeypatch.setitem(sys.modules, "torch", MockTorch)
+        # 1. When ctranslate2 detects CUDA device
+        monkeypatch.setitem(sys.modules, "ctranslate2", MockCTranslate2)
+        MockCTranslate2.device_count = 1
         cfg_cuda = TranscriptionConfig(device="auto", compute_type="auto")
         assert cfg_cuda.resolve_device_and_compute() == ("cuda", "float16")
 
-        # 2. When torch is installed but CUDA is unavailable
-        MockCuda.is_available = staticmethod(lambda: False)
+        # 2. When ctranslate2 reports 0 CUDA devices
+        MockCTranslate2.device_count = 0
         cfg_cpu = TranscriptionConfig(device="auto", compute_type="auto")
         assert cfg_cpu.resolve_device_and_compute() == ("cpu", "int8")
 
-        # 3. When torch is not installed at all
-        monkeypatch.setitem(sys.modules, "torch", None)
-        cfg_no_torch = TranscriptionConfig(device="auto", compute_type="auto")
-        assert cfg_no_torch.resolve_device_and_compute() == ("cpu", "int8")
+        # 3. When ctranslate2 is not installed
+        monkeypatch.setitem(sys.modules, "ctranslate2", None)
+        cfg_no_ct2 = TranscriptionConfig(device="auto", compute_type="auto")
+        assert cfg_no_ct2.resolve_device_and_compute() == ("cpu", "int8")
 
         # 4. Explicit override
         cfg_custom = TranscriptionConfig(device="cpu", compute_type="int8")
@@ -517,6 +517,38 @@ class TestCancellationAndFailureRecovery:
         # 5. Guard against float16 on CPU
         cfg_cpu_f16 = TranscriptionConfig(device="cpu", compute_type="float16")
         assert cfg_cpu_f16.resolve_device_and_compute() == ("cpu", "int8")
+
+    def test_faster_whisper_fallback_error_emitted_once_per_session(self) -> None:
+        """Fallback error emitted once per session; later batches return mock."""
+
+        class FailingModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("model error")
+
+        adapter = FasterWhisperAdapter(
+            config=TranscriptionConfig(fallback_to_mock=True),
+            model=FailingModel(),
+        )
+        chunks1 = [_make_chunk("sess-once", 0)]
+        chunks2 = [_make_chunk("sess-once", 1, start_ms=20)]
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # First batch in session: emits fallback error event + mock segment
+        events1 = adapter.transcribe(
+            chunks1, session_id="sess-once", correlation_id="c1", timestamp=ts
+        )
+        assert len(events1) >= 2
+        assert events1[0].event_type == "transcript.error"
+        assert events1[0].payload.code == "TRANSCRIPTION_FALLBACK_TO_MOCK"
+        assert events1[1].event_type == "transcript.segment"
+
+        # Second batch in same session: returns ONLY mock segments
+        events2 = adapter.transcribe(
+            chunks2, session_id="sess-once", correlation_id="c2", timestamp=ts
+        )
+        assert len(events2) == 1
+        assert events2[0].event_type == "transcript.segment"
+        assert events2[0].payload.text == "Hello from the mock voicebot."
 
     def test_faster_whisper_numpy_missing_wave_fallback(
         self, monkeypatch: pytest.MonkeyPatch
@@ -815,6 +847,52 @@ class TestSpeechEventsAndEventStreamIntegration:
                 correlation_id=corr_id,
                 timestamp=ts,
             )
+
+    def test_utterance_chunk_overlap_boundary(self) -> None:
+        """Chunks overlapping speech boundaries are kept, including mid-chunk starts."""
+        orchestrator = TranscriptionOrchestrator()
+        session_id = "sess-overlap"
+        corr_id = "corr-overlap"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # 50 chunks of 20ms: chunk 5 is 100-120ms, chunk 15 is 300-320ms
+        pcm = make_fake_pcm(duration_ms=1000)
+        chunks = chunk_pcm(pcm, session_id=session_id, chunk_ms=20)
+
+        # speech_start at 110ms (inside chunk 5 [100-120ms])
+        # speech_end at 310ms (inside chunk 15 [300-320ms])
+        speech_events = [
+            SpeechEvent(
+                kind="speech_start",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=0,
+                at_ms=110,
+            ),
+            SpeechEvent(
+                kind="speech_end",
+                session_id=session_id,
+                correlation_id=corr_id,
+                sequence_id=1,
+                at_ms=310,
+            ),
+        ]
+
+        events = orchestrator.process_speech_session(
+            speech_events,
+            chunks,
+            session_id=session_id,
+            correlation_id=corr_id,
+            timestamp=ts,
+        )
+
+        assert len(events) == 1
+        seg = events[0].payload
+        assert isinstance(seg, TranscriptSegment)
+        # Segment start must be 100ms (start of overlapping chunk 5)
+        assert seg.start_ms == 100
+        # Segment end must cover through chunk 15 (ends at 320ms)
+        assert seg.end_ms == 320
 
 
 class TestAudioChunkIntegrity:
