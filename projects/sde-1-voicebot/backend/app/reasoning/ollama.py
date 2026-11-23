@@ -5,8 +5,8 @@ It implements the same ``LLMProvider`` interface as the mock, so
 strict validation of the returned JSON. The trusted system prompt and the
 untrusted request JSON are sent as separate chat messages.
 
-Only a loopback address is accepted: nothing leaves the machine. Uses the
-existing ``httpx`` dependency.
+Only a loopback address is accepted and proxy environment variables are
+ignored, so nothing leaves the machine. Uses the existing ``httpx`` dependency.
 
 Errors map onto the adapter's safe errors:
 - timeout -> ``TimeoutError`` (retried, then ``REASONING_RETRY_EXHAUSTED``)
@@ -46,7 +46,9 @@ class OllamaLLMProvider:
             raise ValueError("Ollama must run on this machine (http://127.0.0.1)")
         self.model = model.strip()
         self.base_url = base_url.rstrip("/")
-        self._client = client if client is not None else httpx.Client()
+        # trust_env=False: an HTTP(S)_PROXY or ALL_PROXY setting must never route
+        # the prompt (screen text, conversation) to a proxy off this machine.
+        self._client = client if client is not None else httpx.Client(trust_env=False)
         self.calls = 0
 
     def complete(

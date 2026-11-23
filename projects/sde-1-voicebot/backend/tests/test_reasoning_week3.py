@@ -441,6 +441,24 @@ def test_ollama_must_run_on_this_machine(url: str) -> None:
         OllamaLLMProvider(base_url=url)
 
 
+def test_ollama_requests_ignore_proxy_settings_and_stay_on_this_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A system proxy must never receive the prompt (screen text, conversation).
+    # 192.0.2.1 is a documentation address; nothing is contacted here.
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://192.0.2.1:3128")
+    provider = OllamaLLMProvider()
+    client = provider._client
+    chat_url = httpx.URL(f"{provider.base_url}/api/chat")
+    # The transport httpx would use for the chat request is the direct one,
+    # not a proxy transport built from the environment.
+    assert client._transport_for_url(chat_url) is client._transport
+    client.close()
+
+
 def test_provider_is_mock_unless_ollama_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
