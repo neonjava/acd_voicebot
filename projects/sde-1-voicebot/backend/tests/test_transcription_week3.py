@@ -1489,3 +1489,51 @@ class TestSystemCertsOptInLoadPath:
         assert isinstance(model, FakeWhisperModel)
         assert loaded == [("base",)]
         assert injected == []
+
+
+class TestFallbackAnnouncementAfterCancel:
+    """A cancelled utterance does not re-announce the mock fallback."""
+
+    def test_fallback_error_stays_once_per_session_across_cancel(self) -> None:
+        from app.sessions.service import SessionService
+
+        class BrokenModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("model unavailable")
+
+        service = SessionService()
+        session_id = "sess-fallback-cancel"
+        service.create_session(session_id)
+        orchestrator = TranscriptionOrchestrator(
+            adapter=FasterWhisperAdapter(
+                config=TranscriptionConfig(provider="faster_whisper"),
+                model=BrokenModel(),
+            ),
+            event_sink=service.add_event,
+        )
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        def utterance(n: int) -> list[TranscriptEvent]:
+            return orchestrator.process_chunks(
+                [
+                    _make_chunk(session_id, i, start_ms=i * 20)
+                    for i in (2 * n, 2 * n + 1)
+                ],
+                session_id=session_id,
+                correlation_id=f"c{n}",
+                timestamp=ts,
+            )
+
+        utterance(0)
+        orchestrator.cancel(session_id)
+        assert utterance(1) == []
+        last = utterance(2)
+
+        assert [e.event_type for e in last] == ["transcript.segment"]
+        assert last[0].payload.start_ms == 80
+        codes = [
+            e.payload.code
+            for e in service.get_events(session_id)
+            if e.event_type == "transcript.error"
+        ]
+        assert codes == ["TRANSCRIPTION_FALLBACK_TO_MOCK"]
