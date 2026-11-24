@@ -133,6 +133,15 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     });
   }, []);
 
+  // A pending approval lives in the expanded notch: open it so the request is seen
+  // (and its dialog is reachable by keyboard and screen readers) even when the
+  // notch was collapsed when the approval arrived.
+  useEffect(() => {
+    if (pendingApproval && !isExpanded) {
+      toggleExpanded(true);
+    }
+  }, [pendingApproval, isExpanded, toggleExpanded]);
+
   // Listen to backend readiness in Electron
   useEffect(() => {
     if (!isElectronApp) return;
@@ -209,6 +218,17 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   }, [customClient, clientMode]);
 
   const handleStart = useCallback(async () => {
+    // A previous session's live poller (for example one left after a failure) must
+    // not keep running next to the new session's poller.
+    if (activeSubscriptionRef.current) {
+      activeSubscriptionRef.current.unsubscribe();
+      activeSubscriptionRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
     // Clear prior session results, errors and audit progress immediately
     setSegments([]);
     setRevisionCounts(new Map());
@@ -366,6 +386,9 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                   }
 
                   if (streamTranscriptError) {
+                    // The session failed: stop polling it.
+                    activeSubscriptionRef.current?.unsubscribe();
+                    activeSubscriptionRef.current = null;
                     setError({
                       type: 'backend',
                       title: 'Transcript Error',
@@ -418,6 +441,14 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                 onReconnect: (attempt, delayMs) => {
                   if (sessionToken !== currentSessionTokenRef.current) return;
                   setStatusMessage(`Connection lost. Reconnecting (attempt ${attempt}, retry in ${delayMs}ms)...`);
+                },
+                onStopped: (stopError) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  activeSubscriptionRef.current = null;
+                  const formatted = formatErrorToState(stopError);
+                  setError(formatted);
+                  setUiState(formatted.code === 'SESSION_EXPIRED' ? 'expired' : 'failed');
+                  setStatusMessage(`Live updates stopped: ${formatted.message}`);
                 },
               },
               abortController.signal
@@ -727,9 +758,9 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         setPendingApproval(null);
         setStatusMessage(`Approval granted for step ${updated.step_id}.`);
 
-        const decisionEvtId = `evt-audit-decision-${updated.approval_id}-approved`;
-        seenEventIdsRef.current.add(decisionEvtId);
-
+        // Do not mark a synthetic event ID as seen: the seen-set size is the replay
+        // from_sequence, so a fake entry would skip one real event on reconnect.
+        // A replayed decision event is de-duplicated by approval_id + kind below.
         setAuditEvents((prev) => {
           const exists = prev.some(
             (a) => a.approval_id === updated.approval_id && a.kind === 'approval_granted'
@@ -782,9 +813,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         setPendingApproval(null);
         setStatusMessage(`Approval rejected for step ${updated.step_id}. Step execution prevented.`);
 
-        const decisionEvtId = `evt-audit-decision-${updated.approval_id}-rejected`;
-        seenEventIdsRef.current.add(decisionEvtId);
-
+        // See handleApprove: no synthetic seen IDs (they shift from_sequence).
         setAuditEvents((prev) => {
           const exists = prev.some(
             (a) => a.approval_id === updated.approval_id && a.kind === 'approval_rejected'
@@ -949,6 +978,26 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               {latestCaption || (uiState === 'active' ? 'Listening...' : 'Voicebot Notch')}
             </span>
           </div>
+          {/* The expanded console's aria-live regions are unmounted while collapsed;
+              keep status and errors announced from the pill. */}
+          <span
+            data-testid="notch-pill-live-status"
+            role="status"
+            aria-live="polite"
+            style={{
+              position: 'absolute',
+              width: '1px',
+              height: '1px',
+              padding: 0,
+              margin: '-1px',
+              overflow: 'hidden',
+              clip: 'rect(0, 0, 0, 0)',
+              whiteSpace: 'nowrap',
+              border: 0,
+            }}
+          >
+            {error ? `${error.title}: ${error.message}` : statusMessage}
+          </span>
           <button
             type="button"
             data-testid="notch-expand-button"

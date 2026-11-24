@@ -204,8 +204,6 @@ export interface SessionEventStreamResponse {
 
 export interface VoicebotDesktopBridge {
   isElectron: true;
-  backendUrl?: string;
-  getBackendUrl?: () => string;
   getToken: () => string;
   setWindowExpanded: (expanded: boolean) => Promise<void>;
   isBackendReady?: () => boolean;

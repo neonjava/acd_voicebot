@@ -11,6 +11,7 @@ const sidecarCjs = require('./sidecar.cjs');
 export interface SidecarOptions {
   backendDir?: string;
   token: string;
+  port?: number;
   spawnFn?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
   onReady?: () => void;
   onError?: (error: Error) => void;
@@ -19,8 +20,14 @@ export interface SidecarOptions {
 
 export interface SidecarHandle {
   process: ChildProcess;
+  port: number;
   isReady: () => boolean;
   stop: () => void;
 }
 
 export const startBackendSidecar: (options: SidecarOptions) => SidecarHandle = sidecarCjs.startBackendSidecar;
+
+export const parseReadyLine: (
+  line: string,
+  expectedPort: number
+) => { ready: boolean; error?: string } = sidecarCjs.parseReadyLine;
