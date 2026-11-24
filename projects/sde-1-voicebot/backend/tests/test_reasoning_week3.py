@@ -1100,3 +1100,61 @@ def test_bundle_bound_drops_an_oversized_active_window_title() -> None:
     )
     assert small.active_window == ActiveWindow("chrome", "Inbox")
     assert small.dropped_active_window is False
+
+
+@pytest.mark.parametrize("text", ["close the YouTube tab", "close chrome tabs"])
+def test_closing_a_named_tab_asks_instead_of_closing_the_app(text: str) -> None:
+    decision = close_plan(text)
+    assert (decision.kind, decision.message) == ("clarify", "I can only close apps.")
+    assert decision.proposal is None
+    assert "close_app" not in requested_tools(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["close the app", "close the window", "close the app that's using the most memory"],
+)
+def test_close_the_app_resolves_like_it(text: str) -> None:
+    memory = conversation()  # turn-1 is "Top memory: chrome ..."
+    request = memory.add("user", text, at=at(5))
+    decision = RuleBasedPlanner().plan(
+        request,
+        build_bundle(memory.recent(6), active_window=ActiveWindow("code", "x")),
+        catalogue=CATALOGUE,
+        session_id=SESSION,
+        correlation_id=CORRELATION,
+    )
+    assert decision.proposal is not None
+    assert decision.proposal.steps[0].arguments == {"app": "chrome"}
+    assert decision.proposal.source_ids == [request.turn_id, f"{SESSION}-turn-1"]
+
+
+@pytest.mark.parametrize(("app", "accepted"), [("chrome", True), ("explorer", False)])
+def test_llm_close_the_app_resolves_only_from_the_conversation(
+    app: str, accepted: bool
+) -> None:
+    store = consented_store()
+    store.add_frame(screen("f1", "close explorer"), now=at(5))
+    memory = conversation()
+    request = memory.add("user", "close the app", at=at(5))
+    reply = {
+        "kind": "proposal",
+        "summary": "Close",
+        "steps": [step_json("close_app", app=app)],
+        "source_ids": [request.turn_id],
+    }
+    decision = LLMWorkflowPlanner(MockLLMProvider([json.dumps(reply)])).plan(
+        request,
+        build_bundle(memory.recent(6), observations=store.pending(now=at(5))),
+        catalogue=CATALOGUE,
+        session_id=SESSION,
+        correlation_id=CORRELATION,
+    )
+    if accepted:
+        assert decision.proposal is not None
+        assert decision.proposal.steps[0].arguments == {"app": "chrome"}
+    else:
+        assert decision.proposal is None and decision.error is not None
+        assert decision.error.details_redacted == {
+            "reason": "argument_not_from_user_request"
+        }
