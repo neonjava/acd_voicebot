@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
+  ApprovalRequest,
+  AuditEvent,
   AudioChunkMetadata,
   ErrorEnvelope,
   EventEnvelope,
@@ -12,8 +14,14 @@ import {
   SessionClient,
   HttpSessionClient,
   FixtureSessionClient,
+  EventStreamSubscription,
 } from './services/sessionClient';
-import { baselineSessionResponse, week2StreamingSessionResponse } from './fixtures/baselineSession';
+import {
+  baselineApprovalRequest,
+  baselineSessionResponse,
+  week2StreamingSessionResponse,
+  week3NotchSessionResponse,
+} from './fixtures/baselineSession';
 import { TranscriptAccumulator } from './utils/transcriptAccumulator';
 import { MockModeBanner } from './components/MockModeBanner';
 import { PermissionControl } from './components/PermissionControl';
@@ -21,6 +29,8 @@ import { TranscriptTimeline } from './components/TranscriptTimeline';
 import { AudioEventsSummary } from './components/AudioEventsSummary';
 import { ScreenContextPanel } from './components/ScreenContextPanel';
 import { StatusAlert, AppErrorState, formatErrorToState } from './components/StatusAlert';
+import { ApprovalDialog } from './components/ApprovalDialog';
+import { WorkflowProgressPanel } from './components/WorkflowProgressPanel';
 
 export type SessionUiState =
   | 'idle'
@@ -32,15 +42,46 @@ export type SessionUiState =
   | 'failed'
   | 'expired';
 
-export type ClientSourceMode = 'http' | 'fixture-week2' | 'fixture-canonical';
+export type ClientSourceMode = 'http' | 'fixture-week3' | 'fixture-week2' | 'fixture-canonical';
 
 export interface AppProps {
   customClient?: SessionClient;
+  initialExpanded?: boolean;
 }
 
-export const App: React.FC<AppProps> = ({ customClient }) => {
+function getStatusColor(uiState: SessionUiState, backendState: SessionLifecycleState | null): string {
+  if (uiState === 'failed') return '#ef4444';
+  if (backendState === 'paused' || uiState === 'paused') return '#f59e0b';
+  if (uiState === 'connecting' || uiState === 'stopping') return '#3b82f6';
+  if (backendState === 'active' || uiState === 'active') return '#10b981';
+  if (backendState === 'completed' || uiState === 'completed') return '#10b981';
+  return '#94a3b8';
+}
+
+export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
+  // Determine if running inside Electron desktop shell
+  const isElectronApp = typeof window !== 'undefined' && Boolean(window.voicebot?.isElectron);
+
+  // In Electron, default to collapsed notch unless initialExpanded is explicitly specified.
+  // In tests and web browser, default to expanded so all controls are immediately active.
+  const [isExpanded, setIsExpanded] = useState<boolean>(() => {
+    if (initialExpanded !== undefined) return initialExpanded;
+    return !isElectronApp;
+  });
+
+  // Track backend sidecar readiness before allowing the first start in Electron desktop app
+  const [isBackendReady, setIsBackendReady] = useState<boolean>(() => {
+    if (!isElectronApp) return true;
+    return Boolean(window.voicebot?.isBackendReady?.());
+  });
+
   const [uiState, setUiState] = useState<SessionUiState>('idle');
-  const [statusMessage, setStatusMessage] = useState<string | null>('Ready to start session.');
+  const [statusMessage, setStatusMessage] = useState<string | null>(() => {
+    if (isElectronApp && !Boolean(window.voicebot?.isBackendReady?.())) {
+      return 'Waiting for backend service to become ready...';
+    }
+    return 'Ready to start session.';
+  });
   const [error, setError] = useState<AppErrorState | null>(null);
   const [permission, setPermission] = useState<SimulatedPermissionState>('granted');
   const [clientMode, setClientMode] = useState<ClientSourceMode>('http');
@@ -61,28 +102,80 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   const [isTransitioning, setIsTransitioning] = useState<boolean>(false);
 
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
-
-  // A session is in progress until it reaches a terminal or idle state. 'stopping' counts:
-  // it can still become completed or failed, so Start stays disabled while local Stop
-  // remains available to reset the view.
-  const isSessionInProgress =
-    uiState === 'connecting' ||
-    uiState === 'active' ||
-    uiState === 'paused' ||
-    uiState === 'stopping';
   const [revisionCounts, setRevisionCounts] = useState<Map<string, number>>(new Map());
   const [audioEvents, setAudioEvents] = useState<EventEnvelope<AudioChunkMetadata>[]>([]);
 
-  // Track active session token and abort controller to ignore late responses after Stop
+  // Week 3 Workflow & Approvals State
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+
+  // Track active session token, abort controller, and seen event IDs for deduplication
   const currentSessionTokenRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const activeSubscriptionRef = useRef<EventStreamSubscription | null>(null);
 
   // Stable client instances maintained across Start -> Pause -> Resume
   const defaultClientsRef = useRef<{
     http?: HttpSessionClient;
+    'fixture-week3'?: FixtureSessionClient;
     'fixture-week2'?: FixtureSessionClient;
     'fixture-canonical'?: FixtureSessionClient;
   }>({});
+
+  const toggleExpanded = useCallback((force?: boolean) => {
+    setIsExpanded((prev) => {
+      const next = force !== undefined ? force : !prev;
+      if (typeof window !== 'undefined' && window.voicebot?.setWindowExpanded) {
+        window.voicebot.setWindowExpanded(next);
+      }
+      return next;
+    });
+  }, []);
+
+  // A pending approval lives in the expanded notch: open it so the request is seen
+  // (and its dialog is reachable by keyboard and screen readers) even when the
+  // notch was collapsed when the approval arrived.
+  // Expand once per new approval, so the user can still collapse the notch.
+  const pendingApprovalId = pendingApproval?.approval_id ?? null;
+  useEffect(() => {
+    if (pendingApprovalId) {
+      toggleExpanded(true);
+    }
+  }, [pendingApprovalId, toggleExpanded]);
+
+  // Listen to backend readiness in Electron
+  useEffect(() => {
+    if (!isElectronApp) return;
+    if (window.voicebot?.isBackendReady?.()) {
+      setIsBackendReady(true);
+      setStatusMessage('Backend service ready.');
+      return;
+    }
+    if (window.voicebot?.onBackendReady) {
+      const unsub = window.voicebot.onBackendReady(() => {
+        setIsBackendReady(true);
+        setStatusMessage('Backend service ready.');
+      });
+      return () => {
+        if (unsub) unsub();
+      };
+    }
+  }, [isElectronApp]);
+
+  // Clean up active subscription on unmount
+  useEffect(() => {
+    return () => {
+      if (activeSubscriptionRef.current) {
+        activeSubscriptionRef.current.unsubscribe();
+        activeSubscriptionRef.current = null;
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, []);
 
   // Listen to browser online/offline events
   useEffect(() => {
@@ -108,7 +201,14 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       return customClient;
     }
     if (!defaultClientsRef.current[clientMode]) {
-      if (clientMode === 'fixture-week2') {
+      if (clientMode === 'fixture-week3') {
+        defaultClientsRef.current[clientMode] = new FixtureSessionClient(
+          week3NotchSessionResponse,
+          0,
+          'active',
+          [baselineApprovalRequest]
+        );
+      } else if (clientMode === 'fixture-week2') {
         defaultClientsRef.current[clientMode] = new FixtureSessionClient(week2StreamingSessionResponse);
       } else if (clientMode === 'fixture-canonical') {
         defaultClientsRef.current[clientMode] = new FixtureSessionClient(baselineSessionResponse);
@@ -120,10 +220,24 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   }, [customClient, clientMode]);
 
   const handleStart = useCallback(async () => {
-    // Clear prior session results and errors immediately
+    // A previous session's live poller (for example one left after a failure) must
+    // not keep running next to the new session's poller.
+    if (activeSubscriptionRef.current) {
+      activeSubscriptionRef.current.unsubscribe();
+      activeSubscriptionRef.current = null;
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    // Clear prior session results, errors and audit progress immediately
     setSegments([]);
     setRevisionCounts(new Map());
     setAudioEvents([]);
+    setAuditEvents([]);
+    setPendingApproval(null);
+    seenEventIdsRef.current.clear();
     setSessionId(null);
     setBackendSessionState(null);
     setError(null);
@@ -171,7 +285,6 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
 
       // Check if session was stopped or superseded while request was in-flight
       if (sessionToken !== currentSessionTokenRef.current) {
-        // Late response received after Stop — strictly ignore it
         return;
       }
 
@@ -181,13 +294,22 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       // Accumulate transcript events and check for transcript errors
       const accumulator = new TranscriptAccumulator(response.session_id);
       const audioChunks: EventEnvelope<AudioChunkMetadata>[] = [];
+      const audits: AuditEvent[] = [];
       let transcriptErrorEnvelope: ErrorEnvelope | null = null;
 
       for (const evt of response.events) {
+        // Enforce deduplication
+        if (seenEventIdsRef.current.has(evt.event_id)) {
+          continue;
+        }
+        seenEventIdsRef.current.add(evt.event_id);
+
         if (evt.event_type === 'transcript.segment') {
           accumulator.add(evt.payload as TranscriptSegment);
         } else if (evt.event_type === 'audio.chunk') {
           audioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
+        } else if (evt.event_type === 'workflow.audit') {
+          audits.push(evt.payload as AuditEvent);
         } else if (evt.event_type === 'transcript.error') {
           transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
         }
@@ -200,6 +322,19 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
       setRevisionCounts(revMap);
       setSegments(accumulator.getSegments());
       setAudioEvents(audioChunks);
+      setAuditEvents(audits);
+
+      // Check for pending approvals
+      if (client.getPendingApprovals) {
+        try {
+          const pending = await client.getPendingApprovals(response.session_id, abortController.signal);
+          if (sessionToken === currentSessionTokenRef.current && pending.length > 0) {
+            setPendingApproval(pending[0]);
+          }
+        } catch {
+          // Non-blocking if approvals endpoint is not configured
+        }
+      }
 
       // If transcript.error was received, surface it and report failure instead of success
       if (transcriptErrorEnvelope) {
@@ -216,12 +351,112 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      // Map every backend lifecycle state explicitly; only 'completed' reports success
       const sid = response.session_id;
       switch (response.state) {
         case 'active':
           setUiState('active');
           setStatusMessage(`Session ${sid} active. Processing events...`);
+          // Live event stream subscription with capped exponential backoff and refresh approvals on audit events
+          if (client.subscribeToEvents) {
+            const sub = client.subscribeToEvents(
+              response.session_id,
+              {
+                fromSequence: seenEventIdsRef.current.size,
+                onEvents: (streamEventsList) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  let hasNewSegs = false;
+                  let hasNewAuds = false;
+                  let streamTranscriptError: ErrorEnvelope | null = null;
+                  const newAuds: AuditEvent[] = [];
+                  const newAudio: EventEnvelope<AudioChunkMetadata>[] = [];
+
+                  for (const evt of streamEventsList) {
+                    if (seenEventIdsRef.current.has(evt.event_id)) continue;
+                    seenEventIdsRef.current.add(evt.event_id);
+
+                    if (evt.event_type === 'transcript.segment') {
+                      accumulator.add(evt.payload as TranscriptSegment);
+                      hasNewSegs = true;
+                    } else if (evt.event_type === 'audio.chunk') {
+                      newAudio.push(evt as EventEnvelope<AudioChunkMetadata>);
+                    } else if (evt.event_type === 'workflow.audit') {
+                      newAuds.push(evt.payload as AuditEvent);
+                      hasNewAuds = true;
+                    } else if (evt.event_type === 'transcript.error') {
+                      streamTranscriptError = evt.payload as ErrorEnvelope;
+                    }
+                  }
+
+                  if (streamTranscriptError) {
+                    // The session failed: stop polling it.
+                    activeSubscriptionRef.current?.unsubscribe();
+                    activeSubscriptionRef.current = null;
+                    setError({
+                      type: 'backend',
+                      title: 'Transcript Error',
+                      message: streamTranscriptError.message_safe_for_user,
+                      code: streamTranscriptError.code,
+                      correlationId: streamTranscriptError.correlation_id,
+                      retryable: streamTranscriptError.retryable,
+                    });
+                    setUiState('failed');
+                    setStatusMessage(`Session transcription failed: ${streamTranscriptError.message_safe_for_user}`);
+                    return;
+                  }
+
+                  if (hasNewSegs) {
+                    const updatedSegs = accumulator.getSegments();
+                    setSegments(updatedSegs);
+                    const revMap = new Map<string, number>();
+                    for (const s of updatedSegs) {
+                      revMap.set(s.segment_id, accumulator.getRevisionCount(s.segment_id));
+                    }
+                    setRevisionCounts(revMap);
+                  }
+                  if (newAudio.length > 0) {
+                    setAudioEvents((prev) => [...prev, ...newAudio]);
+                  }
+                  if (hasNewAuds && newAuds.length > 0) {
+                    setAuditEvents((prev) => {
+                      const next = [...prev];
+                      for (const a of newAuds) {
+                        const dup = next.some(
+                          (existing) =>
+                            (existing.approval_id && existing.approval_id === a.approval_id && existing.kind === a.kind) ||
+                            (existing.sequence === a.sequence && existing.step_id === a.step_id && existing.kind === a.kind)
+                        );
+                        if (!dup) next.push(a);
+                      }
+                      return next;
+                    });
+
+                    // Refresh approvals when audit events arrive
+                    if (client.getPendingApprovals) {
+                      client.getPendingApprovals(response.session_id).then((pending) => {
+                        if (sessionToken === currentSessionTokenRef.current && pending.length > 0) {
+                          setPendingApproval(pending[0]);
+                        }
+                      }).catch(() => {});
+                    }
+                  }
+                },
+                onReconnect: (attempt, delayMs) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  setStatusMessage(`Connection lost. Reconnecting (attempt ${attempt}, retry in ${delayMs}ms)...`);
+                },
+                onStopped: (stopError) => {
+                  if (sessionToken !== currentSessionTokenRef.current) return;
+                  activeSubscriptionRef.current = null;
+                  const formatted = formatErrorToState(stopError);
+                  setError(formatted);
+                  setUiState(formatted.code === 'SESSION_EXPIRED' ? 'expired' : 'failed');
+                  setStatusMessage(`Live updates stopped: ${formatted.message}`);
+                },
+              },
+              abortController.signal
+            );
+            activeSubscriptionRef.current = sub;
+          }
           break;
         case 'paused':
           setUiState('paused');
@@ -293,24 +528,20 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
     setStatusMessage(`Requesting backend pause for session ${sessionId}...`);
     try {
       const verifiedState = await client.pauseSession(sessionId, abortController.signal);
-      // Strictly ignore delayed responses if session was stopped or superseded
       if (requestToken !== currentSessionTokenRef.current) {
         return;
       }
-      // Strictly update backend state only from verified return value
       setBackendSessionState(verifiedState);
       setUiState('paused');
       setStatusMessage(`Session ${sessionId} successfully paused.`);
       setError(null);
     } catch (err) {
-      // Strictly ignore delayed error if session was stopped or superseded
       if (requestToken !== currentSessionTokenRef.current) {
         return;
       }
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
       }
-      // Do NOT optimistically update backend state
       const formatted = formatErrorToState(err);
       setError(formatted);
       setStatusMessage(`Pause request failed: ${formatted.message}`);
@@ -344,24 +575,20 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
     setStatusMessage(`Requesting backend resume for session ${sessionId}...`);
     try {
       const verifiedState = await client.resumeSession(sessionId, abortController.signal);
-      // Strictly ignore delayed responses if session was stopped or superseded
       if (requestToken !== currentSessionTokenRef.current) {
         return;
       }
-      // Strictly update backend state only from verified return value
       setBackendSessionState(verifiedState);
       setUiState('active');
       setStatusMessage(`Session ${sessionId} successfully resumed.`);
       setError(null);
     } catch (err) {
-      // Strictly ignore delayed error if session was stopped or superseded
       if (requestToken !== currentSessionTokenRef.current) {
         return;
       }
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
       }
-      // Do NOT optimistically update backend state
       const formatted = formatErrorToState(err);
       setError(formatted);
       setStatusMessage(`Resume request failed: ${formatted.message}`);
@@ -373,26 +600,258 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
   }, [sessionId, getClient]);
 
   const handleStop = useCallback(() => {
-    // Invalidate the session token so in-flight requests (start, pause, resume) are ignored
     currentSessionTokenRef.current++;
+
+    if (activeSubscriptionRef.current) {
+      activeSubscriptionRef.current.unsubscribe();
+      activeSubscriptionRef.current = null;
+    }
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
 
-    // Do NOT show Backend: completed on local Stop — reset backend state on client abort
     setBackendSessionState(null);
+    setPendingApproval(null);
     setUiState('idle');
     setIsTransitioning(false);
     setStatusMessage('Session stopped by user. Late events ignored.');
   }, []);
 
+  // Replay missed events after a disconnect without duplicates, paginating until has_more is false
+  const handleReconnect = useCallback(async () => {
+    if (!sessionId) return;
+    const client = getClient();
+    if (!client.getEvents) return;
+
+    const sessionToken = currentSessionTokenRef.current;
+    setStatusMessage('Reconnecting to event stream...');
+    try {
+      let fromSequence = seenEventIdsRef.current.size;
+      let hasMore = true;
+      let transcriptErrorEnvelope: ErrorEnvelope | null = null;
+      const newAudits: AuditEvent[] = [];
+      const newAudioChunks: EventEnvelope<AudioChunkMetadata>[] = [];
+      let hasNewSegments = false;
+
+      const accumulator = new TranscriptAccumulator(sessionId);
+      for (const seg of segments) {
+        accumulator.add(seg);
+      }
+
+      while (hasMore) {
+        const streamRes = await client.getEvents(sessionId, fromSequence);
+        if (sessionToken !== currentSessionTokenRef.current) return;
+
+        if (!streamRes.events || streamRes.events.length === 0) {
+          break;
+        }
+
+        for (const evt of streamRes.events) {
+          if (seenEventIdsRef.current.has(evt.event_id)) {
+            // Strictly deduplicate missed / replayed events
+            continue;
+          }
+          seenEventIdsRef.current.add(evt.event_id);
+
+          if (evt.event_type === 'transcript.segment') {
+            accumulator.add(evt.payload as TranscriptSegment);
+            hasNewSegments = true;
+          } else if (evt.event_type === 'audio.chunk') {
+            newAudioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
+          } else if (evt.event_type === 'workflow.audit') {
+            newAudits.push(evt.payload as AuditEvent);
+          } else if (evt.event_type === 'transcript.error') {
+            transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
+          }
+        }
+
+        fromSequence = streamRes.from_sequence + streamRes.events.length;
+        hasMore = Boolean(streamRes.has_more);
+      }
+
+      if (transcriptErrorEnvelope) {
+        setError({
+          type: 'backend',
+          title: 'Transcript Error',
+          message: transcriptErrorEnvelope.message_safe_for_user,
+          code: transcriptErrorEnvelope.code,
+          correlationId: transcriptErrorEnvelope.correlation_id,
+          retryable: transcriptErrorEnvelope.retryable,
+        });
+        setUiState('failed');
+        setStatusMessage(`Session transcription failed: ${transcriptErrorEnvelope.message_safe_for_user}`);
+        return;
+      }
+
+      if (hasNewSegments) {
+        const updatedSegs = accumulator.getSegments();
+        setSegments(updatedSegs);
+        // Recompute revisionCounts from accumulator after replay
+        const revMap = new Map<string, number>();
+        for (const seg of updatedSegs) {
+          revMap.set(seg.segment_id, accumulator.getRevisionCount(seg.segment_id));
+        }
+        setRevisionCounts(revMap);
+      }
+      if (newAudioChunks.length > 0) {
+        setAudioEvents((prev) => [...prev, ...newAudioChunks]);
+      }
+      if (newAudits.length > 0) {
+        setAuditEvents((prev) => {
+          const next = [...prev];
+          for (const na of newAudits) {
+            const exists = next.some(
+              (a) =>
+                (a.approval_id && a.approval_id === na.approval_id && a.kind === na.kind) ||
+                (a.step_id && a.step_id === na.step_id && a.kind === na.kind && a.sequence === na.sequence)
+            );
+            if (!exists) next.push(na);
+          }
+          return next;
+        });
+
+        // Refresh pending approvals if new audits arrived
+        if (client.getPendingApprovals) {
+          try {
+            const pending = await client.getPendingApprovals(sessionId);
+            if (sessionToken === currentSessionTokenRef.current && pending.length > 0) {
+              setPendingApproval(pending[0]);
+            }
+          } catch {
+            // non-blocking
+          }
+        }
+      }
+
+      setStatusMessage('Reconnected and replayed event stream with zero duplicates.');
+    } catch (err) {
+      if (sessionToken !== currentSessionTokenRef.current) return;
+      const formatted = formatErrorToState(err);
+      setError(formatted);
+      setStatusMessage(`Reconnection failed: ${formatted.message}`);
+    }
+  }, [sessionId, segments, getClient]);
+
+  const handleApprove = useCallback(
+    async (approvalId: string) => {
+      if (!sessionId) return;
+      const requestSessionToken = currentSessionTokenRef.current;
+      const client = getClient();
+      if (!client.decideApproval) return;
+
+      try {
+        const updated = await client.decideApproval(sessionId, approvalId, 'approve');
+        if (requestSessionToken !== currentSessionTokenRef.current) {
+          return;
+        }
+
+        if (updated.status !== 'approved') {
+          setError({
+            type: 'backend',
+            title: 'Approval Decision Mismatch',
+            message: `Expected approval status 'approved' but received '${updated.status}'. Dialog kept open.`,
+            code: 'STATUS_MISMATCH',
+          });
+          return;
+        }
+
+        setPendingApproval(null);
+        setStatusMessage(`Approval granted for step ${updated.step_id}.`);
+
+        // Do not mark a synthetic event ID as seen: the seen-set size is the replay
+        // from_sequence, so a fake entry would skip one real event on reconnect.
+        // A replayed decision event is de-duplicated by approval_id + kind below.
+        setAuditEvents((prev) => {
+          const exists = prev.some(
+            (a) => a.approval_id === updated.approval_id && a.kind === 'approval_granted'
+          );
+          if (exists) return prev;
+          return [
+            ...prev,
+            {
+              sequence: prev.length,
+              kind: 'approval_granted',
+              plan_id: updated.plan_id,
+              session_id: sessionId,
+              step_id: updated.step_id,
+              approval_id: updated.approval_id,
+            },
+          ];
+        });
+      } catch (err) {
+        if (requestSessionToken !== currentSessionTokenRef.current) return;
+        const formatted = formatErrorToState(err);
+        setError(formatted);
+      }
+    },
+    [sessionId, getClient]
+  );
+
+  const handleReject = useCallback(
+    async (approvalId: string) => {
+      if (!sessionId) return;
+      const requestSessionToken = currentSessionTokenRef.current;
+      const client = getClient();
+      if (!client.decideApproval) return;
+
+      try {
+        const updated = await client.decideApproval(sessionId, approvalId, 'reject');
+        if (requestSessionToken !== currentSessionTokenRef.current) {
+          return;
+        }
+
+        if (updated.status !== 'rejected') {
+          setError({
+            type: 'backend',
+            title: 'Approval Rejection Mismatch',
+            message: `Expected approval status 'rejected' but received '${updated.status}'. Dialog kept open.`,
+            code: 'STATUS_MISMATCH',
+          });
+          return;
+        }
+
+        setPendingApproval(null);
+        setStatusMessage(`Approval rejected for step ${updated.step_id}. Step execution prevented.`);
+
+        // See handleApprove: no synthetic seen IDs (they shift from_sequence).
+        setAuditEvents((prev) => {
+          const exists = prev.some(
+            (a) => a.approval_id === updated.approval_id && a.kind === 'approval_rejected'
+          );
+          if (exists) return prev;
+          return [
+            ...prev,
+            {
+              sequence: prev.length,
+              kind: 'approval_rejected',
+              plan_id: updated.plan_id,
+              session_id: sessionId,
+              step_id: updated.step_id,
+              approval_id: updated.approval_id,
+            },
+          ];
+        });
+      } catch (err) {
+        if (requestSessionToken !== currentSessionTokenRef.current) return;
+        const formatted = formatErrorToState(err);
+        setError(formatted);
+      }
+    },
+    [sessionId, getClient]
+  );
+
+  const isSessionInProgress =
+    uiState === 'connecting' ||
+    uiState === 'active' ||
+    uiState === 'paused' ||
+    uiState === 'stopping';
+
   // Keyboard shortcut support:
-  // Alt+S: Start, Alt+P: Pause, Alt+R: Resume, Alt+X / Escape: Stop
+  // Alt+S: Start, Alt+P: Pause, Alt+R: Resume, Alt+X / Escape: Stop, Alt+N: Toggle Notch
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Escape stops active or paused session
       if (e.key === 'Escape') {
         if (isSessionInProgress) {
           e.preventDefault();
@@ -401,7 +860,12 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      // Alt+S triggers Start
+      if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+        e.preventDefault();
+        toggleExpanded();
+        return;
+      }
+
       if (e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
         if (!isSessionInProgress) {
@@ -410,7 +874,6 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      // Alt+P triggers Pause
       if (e.altKey && (e.key === 'p' || e.key === 'P')) {
         e.preventDefault();
         if (backendSessionState === 'active' && !isTransitioning) {
@@ -419,7 +882,6 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      // Alt+R triggers Resume
       if (e.altKey && (e.key === 'r' || e.key === 'R')) {
         e.preventDefault();
         if (backendSessionState === 'paused' && !isTransitioning) {
@@ -428,7 +890,6 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
         return;
       }
 
-      // Alt+X triggers Stop
       if (e.altKey && (e.key === 'x' || e.key === 'X')) {
         e.preventDefault();
         if (isSessionInProgress) {
@@ -440,328 +901,468 @@ export const App: React.FC<AppProps> = ({ customClient }) => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [uiState, backendSessionState, isTransitioning, handleStart, handlePause, handleResume, handleStop]);
+  }, [
+    isSessionInProgress,
+    backendSessionState,
+    isTransitioning,
+    handleStart,
+    handlePause,
+    handleResume,
+    handleStop,
+    toggleExpanded,
+  ]);
 
-  const isStartDisabled = isSessionInProgress;
+  const isStartDisabled = isSessionInProgress || (isElectronApp && !isBackendReady);
   const isPauseDisabled = backendSessionState !== 'active' || isTransitioning;
   const isResumeDisabled = backendSessionState !== 'paused' || isTransitioning;
   const isStopDisabled = !isSessionInProgress;
 
+  // Latest caption text preview for collapsed notch
+  const latestCaption = segments.length > 0 ? segments[segments.length - 1].text : null;
+
   return (
     <div
-      className="voicebot-app"
+      className="voicebot-notch-root"
       style={{
-        maxWidth: '860px',
-        margin: '0 auto',
-        padding: '24px 16px',
         fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-        color: '#212529',
       }}
     >
-      <header style={{ marginBottom: '20px' }}>
-        <h1 style={{ margin: '0 0 8px 0', fontSize: '1.75rem', fontWeight: 700 }}>
-          Voicebot Console
-        </h1>
-        <p style={{ margin: 0, color: '#6c757d', fontSize: '0.95rem' }}>
-          SDE 1 Voicebot mock session testing interface (Week 2).
-        </p>
-      </header>
-
-      <main>
-        {/* Banner */}
-        <MockModeBanner />
-
-        {/* Status Announcements, Loading Spinners & Alerts */}
-        <StatusAlert
-          statusMessage={statusMessage}
-          error={error}
-          isLoading={uiState === 'connecting' || isTransitioning}
-          isOffline={isOffline}
-          onDismissError={() => setError(null)}
-        />
-
-        {/* Configuration & Controls */}
+      {/* Collapsed Pill (Top Centre, 200×36 px) */}
+      {!isExpanded && (
         <div
+          data-testid="notch-pill"
+          role="region"
+          aria-label="Voicebot notch pill"
+          onClick={() => toggleExpanded(true)}
           style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-            gap: '16px',
-            marginBottom: '20px',
+            position: 'fixed',
+            top: 0,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            width: '200px',
+            height: '36px',
+            borderRadius: '0 0 18px 18px',
+            backgroundColor: '#090d16',
+            border: '1px solid #334155',
+            borderTop: 'none',
+            boxShadow: '0 4px 14px rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '0 12px',
+            cursor: 'pointer',
+            zIndex: 99999,
+            color: '#f8fafc',
+            userSelect: 'none',
+            boxSizing: 'border-box',
           }}
         >
-          {/* Simulated Permission Control */}
-          <PermissionControl
-            permission={permission}
-            onChange={(newPerm) => {
-              setPermission(newPerm);
-              setError(null);
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', overflow: 'hidden' }}>
+            <span
+              style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                backgroundColor: getStatusColor(uiState, backendSessionState),
+                flexShrink: 0,
+              }}
+            />
+            <span
+              style={{
+                fontSize: '11px',
+                fontWeight: 600,
+                color: '#e2e8f0',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {latestCaption || (uiState === 'active' ? 'Listening...' : 'Voicebot Notch')}
+            </span>
+          </div>
+          {/* The expanded console's aria-live regions are unmounted while collapsed;
+              keep status and errors announced from the pill. */}
+          <span
+            data-testid="notch-pill-live-status"
+            role="status"
+            aria-live="polite"
+            style={{
+              position: 'absolute',
+              width: '1px',
+              height: '1px',
+              padding: 0,
+              margin: '-1px',
+              overflow: 'hidden',
+              clip: 'rect(0, 0, 0, 0)',
+              whiteSpace: 'nowrap',
+              border: 0,
             }}
-            disabled={isSessionInProgress}
+          >
+            {error ? `${error.title}: ${error.message}` : statusMessage}
+          </span>
+          <button
+            type="button"
+            data-testid="notch-expand-button"
+            aria-label="Expand notch"
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleExpanded(true);
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: '#94a3b8',
+              cursor: 'pointer',
+              padding: '2px 4px',
+              fontSize: '11px',
+              display: 'flex',
+              alignItems: 'center',
+            }}
+          >
+            ▼
+          </button>
+        </div>
+      )}
+
+      {/* Expanded Notch Console (Max 480×360 px at Top Centre) */}
+      {isExpanded && (
+        <div
+          data-testid="notch-expanded"
+          role="region"
+          aria-label="Voicebot notch console"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            width: '100%',
+            maxWidth: '480px',
+            maxHeight: '360px',
+            backgroundColor: '#090d16',
+            border: '1px solid #334155',
+            borderTop: 'none',
+            borderRadius: '0 0 16px 16px',
+            boxShadow: '0 12px 28px rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflowY: 'auto',
+            zIndex: 99999,
+            color: '#f8fafc',
+            padding: '12px 14px',
+            boxSizing: 'border-box',
+          }}
+        >
+          {/* Header Row */}
+          <header
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              marginBottom: '8px',
+              paddingBottom: '6px',
+              borderBottom: '1px solid #1e293b',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span
+                style={{
+                  width: '9px',
+                  height: '9px',
+                  borderRadius: '50%',
+                  backgroundColor: getStatusColor(uiState, backendSessionState),
+                }}
+              />
+              <h2 style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>
+                Voicebot Notch
+              </h2>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <button
+                type="button"
+                data-testid="reconnect-button"
+                onClick={handleReconnect}
+                disabled={!sessionId}
+                title="Reconnect and replay missed events"
+                style={{
+                  padding: '2px 6px',
+                  fontSize: '10px',
+                  backgroundColor: '#1e293b',
+                  color: '#94a3b8',
+                  border: '1px solid #334155',
+                  borderRadius: '4px',
+                  cursor: sessionId ? 'pointer' : 'not-allowed',
+                }}
+              >
+                ↻ Reconnect
+              </button>
+              <button
+                type="button"
+                data-testid="notch-collapse-button"
+                aria-label="Collapse notch"
+                onClick={() => toggleExpanded(false)}
+                style={{
+                  background: '#1e293b',
+                  border: '1px solid #334155',
+                  borderRadius: '4px',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                  padding: '2px 8px',
+                  fontSize: '11px',
+                }}
+              >
+                ▲
+              </button>
+            </div>
+          </header>
+
+          {/* Banner */}
+          <MockModeBanner />
+
+          {/* Status, Loading & Alerts */}
+          <StatusAlert
+            statusMessage={statusMessage}
+            error={error}
+            isLoading={uiState === 'connecting' || isTransitioning}
+            isOffline={isOffline}
+            onDismissError={() => setError(null)}
           />
 
-          {/* Client Mode Selector */}
-          {!customClient && (
-            <fieldset
-              style={{
-                border: '1px solid #ced4da',
-                borderRadius: '6px',
-                padding: '12px 16px',
-                marginBottom: '20px',
-              }}
-            >
-              <legend style={{ fontWeight: 600, padding: '0 6px', fontSize: '0.95rem' }}>
-                Client Source
-              </legend>
-              <p style={{ margin: '0 0 10px 0', fontSize: '0.85rem', color: '#6c757d' }}>
-                Select HTTP proxy (<code>/api/sessions/mock</code>) or Synthetic Fixtures.
-              </p>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="client-mode"
-                    value="http"
-                    checked={clientMode === 'http'}
-                    onChange={() => setClientMode('http')}
-                    disabled={isSessionInProgress}
-                  />
-                  <span>HTTP API (Vite proxy to :8000)</span>
-                </label>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="client-mode"
-                    value="fixture-week2"
-                    checked={clientMode === 'fixture-week2'}
-                    onChange={() => setClientMode('fixture-week2')}
-                    disabled={isSessionInProgress}
-                  />
-                  <span>Synthetic Fixture (Week 2 Active Streaming)</span>
-                </label>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                  <input
-                    type="radio"
-                    name="client-mode"
-                    value="fixture-canonical"
-                    checked={clientMode === 'fixture-canonical'}
-                    onChange={() => setClientMode('fixture-canonical')}
-                    disabled={isSessionInProgress}
-                  />
-                  <span>Canonical Fixture (Week 1 Completed Run)</span>
-                </label>
-              </div>
-            </fieldset>
+          {/* Action Approval Dialog */}
+          {pendingApproval && (
+            <ApprovalDialog
+              approval={pendingApproval}
+              onApprove={handleApprove}
+              onReject={handleReject}
+            />
           )}
-        </div>
 
-        {/* Action Controls */}
-        <section
-          aria-label="Session Controls"
-          style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            gap: '12px',
-            padding: '16px',
-            backgroundColor: '#f8f9fa',
-            borderRadius: '6px',
-            border: '1px solid #dee2e6',
-          }}
-        >
-          {/* Start Button */}
-          <button
-            type="button"
-            data-testid="start-button"
-            onClick={handleStart}
-            disabled={isStartDisabled}
-            aria-label="Start mock voicebot session"
+          {/* Compact Control Buttons */}
+          <div
             style={{
-              padding: '10px 18px',
-              fontSize: '0.95rem',
-              fontWeight: 600,
-              backgroundColor: isStartDisabled ? '#6c757d' : '#0d6efd',
-              color: '#ffffff',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isStartDisabled ? 'not-allowed' : 'pointer',
-              display: 'inline-flex',
-              alignItems: 'center',
+              display: 'flex',
               gap: '6px',
+              flexWrap: 'wrap',
+              margin: '8px 0',
             }}
           >
-            {uiState === 'connecting' ? 'Connecting...' : 'Start Session'}
-          </button>
-
-          {/* Pause Button */}
-          <button
-            type="button"
-            data-testid="pause-button"
-            onClick={handlePause}
-            disabled={isPauseDisabled}
-            aria-label="Pause voicebot session"
-            style={{
-              padding: '10px 18px',
-              fontSize: '0.95rem',
-              fontWeight: 600,
-              backgroundColor: isPauseDisabled ? '#e9ecef' : '#ffc107',
-              color: isPauseDisabled ? '#adb5bd' : '#000000',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isPauseDisabled ? 'not-allowed' : 'pointer',
-            }}
-          >
-            Pause
-          </button>
-
-          {/* Resume Button */}
-          <button
-            type="button"
-            data-testid="resume-button"
-            onClick={handleResume}
-            disabled={isResumeDisabled}
-            aria-label="Resume voicebot session"
-            style={{
-              padding: '10px 18px',
-              fontSize: '0.95rem',
-              fontWeight: 600,
-              backgroundColor: isResumeDisabled ? '#e9ecef' : '#198754',
-              color: isResumeDisabled ? '#adb5bd' : '#ffffff',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isResumeDisabled ? 'not-allowed' : 'pointer',
-            }}
-          >
-            Resume
-          </button>
-
-          {/* Stop Button */}
-          <button
-            type="button"
-            data-testid="stop-button"
-            onClick={handleStop}
-            disabled={isStopDisabled}
-            aria-label="Stop mock voicebot session"
-            style={{
-              padding: '10px 18px',
-              fontSize: '0.95rem',
-              fontWeight: 600,
-              backgroundColor: isStopDisabled ? '#e9ecef' : '#dc3545',
-              color: isStopDisabled ? '#adb5bd' : '#ffffff',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isStopDisabled ? 'not-allowed' : 'pointer',
-            }}
-          >
-            Stop
-          </button>
-
-          {/* Indicators container */}
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            {/* UI Client State Indicator */}
-            <span
-              data-testid="ui-state-indicator"
+            <button
+              type="button"
+              data-testid="start-button"
+              onClick={handleStart}
+              disabled={isStartDisabled}
+              title={isElectronApp && !isBackendReady ? 'Waiting for backend sidecar to be ready...' : undefined}
+              aria-label="Start Session"
               style={{
-                fontSize: '0.8rem',
-                padding: '4px 8px',
-                borderRadius: '4px',
-                backgroundColor:
-                  uiState === 'completed'
-                    ? '#d4edda'
-                    : uiState === 'failed' || uiState === 'expired'
-                    ? '#f8d7da'
-                    : uiState === 'connecting' || uiState === 'active'
-                    ? '#cce5ff'
-                    : uiState === 'paused'
-                    ? '#fff3cd'
-                    : '#e2e3e5',
-                color:
-                  uiState === 'completed'
-                    ? '#155724'
-                    : uiState === 'failed' || uiState === 'expired'
-                    ? '#721c24'
-                    : uiState === 'connecting' || uiState === 'active'
-                    ? '#004085'
-                    : uiState === 'paused'
-                    ? '#856404'
-                    : '#383d41',
+                flex: 1,
+                padding: '6px 10px',
+                fontSize: '11px',
                 fontWeight: 600,
-                textTransform: 'uppercase',
+                backgroundColor: isStartDisabled ? '#334155' : '#10b981',
+                color: isStartDisabled ? '#64748b' : '#ffffff',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: isStartDisabled ? 'not-allowed' : 'pointer',
               }}
             >
-              UI: {uiState}
-            </span>
-
-            {/* Actual Backend Session State Indicator */}
-            <span
-              data-testid="backend-state-indicator"
+              Start
+            </button>
+            <button
+              type="button"
+              data-testid="pause-button"
+              onClick={handlePause}
+              disabled={isPauseDisabled}
+              aria-label="Pause Session"
               style={{
-                fontSize: '0.8rem',
-                padding: '4px 8px',
-                borderRadius: '4px',
-                border: '1px solid #ced4da',
-                backgroundColor:
-                  backendSessionState === 'active'
-                    ? '#d1e7dd'
-                    : backendSessionState === 'paused'
-                    ? '#fff3cd'
-                    : backendSessionState === 'completed'
-                    ? '#e2e3e5'
-                    : backendSessionState === 'failed' || backendSessionState === 'expired'
-                    ? '#f8d7da'
-                    : '#ffffff',
-                color:
-                  backendSessionState === 'active'
-                    ? '#0f5132'
-                    : backendSessionState === 'paused'
-                    ? '#664d03'
-                    : backendSessionState === 'completed'
-                    ? '#41464b'
-                    : backendSessionState === 'failed' || backendSessionState === 'expired'
-                    ? '#842029'
-                    : '#6c757d',
+                flex: 1,
+                padding: '6px 10px',
+                fontSize: '11px',
                 fontWeight: 600,
-                textTransform: 'uppercase',
+                backgroundColor: isPauseDisabled ? '#334155' : '#f59e0b',
+                color: isPauseDisabled ? '#64748b' : '#ffffff',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: isPauseDisabled ? 'not-allowed' : 'pointer',
               }}
             >
-              Backend: {backendSessionState ?? 'not_started'}
-            </span>
+              Pause
+            </button>
+            <button
+              type="button"
+              data-testid="resume-button"
+              onClick={handleResume}
+              disabled={isResumeDisabled}
+              aria-label="Resume Session"
+              style={{
+                flex: 1,
+                padding: '6px 10px',
+                fontSize: '11px',
+                fontWeight: 600,
+                backgroundColor: isResumeDisabled ? '#334155' : '#3b82f6',
+                color: isResumeDisabled ? '#64748b' : '#ffffff',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: isResumeDisabled ? 'not-allowed' : 'pointer',
+              }}
+            >
+              Resume
+            </button>
+            <button
+              type="button"
+              data-testid="stop-button"
+              onClick={handleStop}
+              disabled={isStopDisabled}
+              aria-label="Stop Session"
+              style={{
+                flex: 1,
+                padding: '6px 10px',
+                fontSize: '11px',
+                fontWeight: 600,
+                backgroundColor: isStopDisabled ? '#334155' : '#ef4444',
+                color: isStopDisabled ? '#64748b' : '#ffffff',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: isStopDisabled ? 'not-allowed' : 'pointer',
+              }}
+            >
+              Stop
+            </button>
           </div>
-        </section>
 
-        {/* Keyboard accessibility hints */}
-        <div style={{ marginTop: '8px', fontSize: '0.8rem', color: '#6c757d' }}>
-          <span>Keyboard shortcuts: </span>
-          <kbd style={{ padding: '2px 5px', border: '1px solid #ced4da', borderRadius: '3px' }}>Alt+S</kbd> Start |{' '}
-          <kbd style={{ padding: '2px 5px', border: '1px solid #ced4da', borderRadius: '3px' }}>Alt+P</kbd> Pause |{' '}
-          <kbd style={{ padding: '2px 5px', border: '1px solid #ced4da', borderRadius: '3px' }}>Alt+R</kbd> Resume |{' '}
-          <kbd style={{ padding: '2px 5px', border: '1px solid #ced4da', borderRadius: '3px' }}>Alt+X</kbd> or{' '}
-          <kbd style={{ padding: '2px 5px', border: '1px solid #ced4da', borderRadius: '3px' }}>Esc</kbd> Stop
+          {/* Session State Indicators */}
+          <div
+            style={{
+              display: 'flex',
+              gap: '8px',
+              padding: '4px 8px',
+              backgroundColor: '#0f172a',
+              borderRadius: '4px',
+              fontSize: '10px',
+              marginBottom: '8px',
+              border: '1px solid #1e293b',
+            }}
+          >
+            <span data-testid="ui-state-indicator" style={{ color: '#94a3b8' }}>
+              UI: <strong style={{ color: '#e2e8f0' }}>{uiState}</strong>
+            </span>
+            <span style={{ color: '#334155' }}>|</span>
+            <span data-testid="backend-state-indicator" style={{ color: '#94a3b8' }}>
+              Backend:{' '}
+              <strong style={{ color: backendSessionState ? '#38bdf8' : '#64748b' }}>
+                {backendSessionState ?? 'not_started'}
+              </strong>
+            </span>
+            {sessionId && (
+              <>
+                <span style={{ color: '#334155' }}>|</span>
+                <span style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  ID: <code style={{ color: '#a78bfa' }}>{sessionId}</code>
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Workflow Progress (workflow.audit events) */}
+          <WorkflowProgressPanel auditEvents={auditEvents} />
+
+          {/* Live Captions / Transcript Timeline */}
+          <div style={{ margin: '6px 0' }}>
+            <TranscriptTimeline
+              segments={segments}
+              isRevised={(id) => (revisionCounts.get(id) ?? 0) > 0}
+              revisionCount={(id) => revisionCounts.get(id) ?? 0}
+            />
+          </div>
+
+          {/* Privacy Settings / Screen-Context Panel (OFF by default) */}
+          <ScreenContextPanel
+            enabled={screenContextEnabled}
+            onToggle={(enabled) => setScreenContextEnabled(enabled)}
+            disabled={isSessionInProgress}
+            transcriptSegments={segments}
+          />
+
+          {/* Audio Chunks Summary */}
+          <div style={{ marginTop: '8px' }}>
+            <AudioEventsSummary events={audioEvents} />
+          </div>
+
+          {/* Configuration controls */}
+          <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <PermissionControl
+              permission={permission}
+              onChange={(newPerm) => {
+                setPermission(newPerm);
+                setError(null);
+              }}
+              disabled={isSessionInProgress}
+            />
+
+            {!customClient && (
+              <fieldset
+                style={{
+                  border: '1px solid #334155',
+                  borderRadius: '4px',
+                  padding: '6px 8px',
+                  backgroundColor: '#0f172a',
+                  color: '#e2e8f0',
+                  fontSize: '11px',
+                }}
+              >
+                <legend style={{ fontWeight: 600, padding: '0 4px', fontSize: '10px', color: '#94a3b8' }}>
+                  Client Source Mode
+                </legend>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px' }}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="clientMode"
+                      value="http"
+                      checked={clientMode === 'http'}
+                      onChange={() => setClientMode('http')}
+                      disabled={isSessionInProgress}
+                    />
+                    <span>Live Backend / Mock HTTP Proxy (/api/sessions/mock)</span>
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="clientMode"
+                      value="fixture-week3"
+                      checked={clientMode === 'fixture-week3'}
+                      onChange={() => setClientMode('fixture-week3')}
+                      disabled={isSessionInProgress}
+                    />
+                    <span>Synthetic Fixture (Week 3 Live Notch & Progress)</span>
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="clientMode"
+                      value="fixture-week2"
+                      checked={clientMode === 'fixture-week2'}
+                      onChange={() => setClientMode('fixture-week2')}
+                      disabled={isSessionInProgress}
+                    />
+                    <span>Synthetic Fixture (Week 2 Active Streaming)</span>
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="clientMode"
+                      value="fixture-canonical"
+                      checked={clientMode === 'fixture-canonical'}
+                      onChange={() => setClientMode('fixture-canonical')}
+                      disabled={isSessionInProgress}
+                    />
+                    <span>Synthetic Fixture (Canonical Backend)</span>
+                  </label>
+                </div>
+              </fieldset>
+            )}
+          </div>
         </div>
-
-        {/* Active Session Info */}
-        {sessionId && (
-          <div style={{ marginTop: '16px', fontSize: '0.85rem', color: '#495057' }}>
-            Session ID: <code>{sessionId}</code>
-          </div>
-        )}
-
-        {/* Screen-context Panel (OFF by default) */}
-        <ScreenContextPanel
-          enabled={screenContextEnabled}
-          onToggle={setScreenContextEnabled}
-          transcriptSegments={segments}
-        />
-
-        {/* Ordered Transcript Timeline */}
-        <TranscriptTimeline
-          segments={segments}
-          isRevised={(id) => (revisionCounts.get(id) ?? 0) > 0}
-          revisionCount={(id) => revisionCounts.get(id) ?? 0}
-        />
-
-        {/* Audio Events Summary */}
-        <AudioEventsSummary events={audioEvents} />
-      </main>
+      )}
     </div>
   );
 };
