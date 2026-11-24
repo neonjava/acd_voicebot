@@ -3,6 +3,10 @@ import {
   AuditEvent,
   AuditKind,
   AudioChunkMetadata,
+  BrowserActionEvent,
+  BrowserActionStatus,
+  CaptureOutcome,
+  CaptureStatus,
   ContextItem,
   ErrorEnvelope,
   EventEnvelope,
@@ -15,6 +19,8 @@ import {
   SpeechEvent,
   SpeechEventKind,
   TranscriptSegment,
+  TurnResponse,
+  TurnSource,
   WorkflowProposal,
   WorkflowStep,
 } from '../types/contracts';
@@ -256,6 +262,12 @@ export function validateEventEnvelope(val: unknown, expectedSessionId: string): 
     payload = validateSpeechEvent(val.payload, expectedSessionId);
   } else if (val.event_type === 'workflow.audit') {
     payload = validateAuditEvent(val.payload, expectedSessionId);
+  } else if (val.event_type === 'browser.action') {
+    payload = validateBrowserActionEvent(val.payload, expectedSessionId);
+  } else if (val.event_type === 'audio.capture') {
+    payload = validateCaptureOutcome(val.payload);
+  } else if (val.event_type === 'assistant.turn') {
+    payload = validateTurnResponse(val.payload);
   } else {
     throw new MalformedResponseError(`Unsupported event_type "${val.event_type}"`);
   }
@@ -765,5 +777,166 @@ export function validateSessionEventStreamResponse(val: unknown): SessionEventSt
     from_sequence: val.from_sequence,
     total_events: val.total_events,
     has_more: val.has_more,
+  };
+}
+
+export const VALID_CAPTURE_STATUSES: ReadonlySet<CaptureStatus> = new Set([
+  'captured',
+  'disabled',
+  'throttled',
+  'rejected',
+  'exhausted',
+]);
+
+export function validateCaptureStatus(val: unknown): CaptureStatus {
+  if (typeof val !== 'string' || !VALID_CAPTURE_STATUSES.has(val as CaptureStatus)) {
+    throw new MalformedResponseError(
+      `Invalid capture status "${String(val)}". Expected one of: ${Array.from(VALID_CAPTURE_STATUSES).join(', ')}`
+    );
+  }
+  return val as CaptureStatus;
+}
+
+export function validateCaptureOutcome(val: unknown): CaptureOutcome {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('CaptureOutcome must be an object');
+  }
+  const status = validateCaptureStatus(val.status);
+  const frame_id = typeof val.frame_id === 'string' ? val.frame_id : null;
+  const error = val.error ? validateErrorEnvelope(val.error) : null;
+  const capture_enabled = typeof val.capture_enabled === 'boolean' ? val.capture_enabled : undefined;
+
+  return { status, frame_id, error, capture_enabled };
+}
+
+export function validateTurnResponse(val: unknown): TurnResponse {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('TurnResponse must be an object');
+  }
+
+  const kind = val.kind;
+  if (typeof kind !== 'string') {
+    throw new MalformedResponseError('TurnResponse missing valid "kind"');
+  }
+
+  const session_id = typeof val.session_id === 'string' ? val.session_id : undefined;
+  const spoken_text = typeof val.spoken_text === 'string' ? val.spoken_text : undefined;
+
+  if (kind === 'answer') {
+    if (typeof val.text !== 'string') {
+      throw new MalformedResponseError('TurnAnswerResponse missing string "text"');
+    }
+    const sources: TurnSource[] = [];
+    if (Array.isArray(val.sources)) {
+      for (const s of val.sources) {
+        if (isObject(s) && isNonEmptyString(s.id) && isNonEmptyString(s.label)) {
+          sources.push({
+            id: s.id,
+            label: s.label,
+            kind: typeof s.kind === 'string' ? s.kind : 'transcript',
+            locator: typeof s.locator === 'string' ? s.locator : undefined,
+          });
+        }
+      }
+    }
+    return {
+      kind: 'answer',
+      text: val.text,
+      sources,
+      spoken_text,
+      session_id,
+    };
+  }
+
+  if (kind === 'clarify') {
+    if (typeof val.question !== 'string' || val.question.trim().length === 0) {
+      throw new MalformedResponseError('TurnClarifyResponse missing non-empty "question"');
+    }
+    return {
+      kind: 'clarify',
+      question: val.question,
+      spoken_text,
+      session_id,
+    };
+  }
+
+  if (kind === 'proposal') {
+    if (!isNonEmptyString(val.plan_id)) {
+      throw new MalformedResponseError('TurnProposalResponse missing non-empty "plan_id"');
+    }
+    if (typeof val.summary !== 'string') {
+      throw new MalformedResponseError('TurnProposalResponse missing string "summary"');
+    }
+    if (!Array.isArray(val.steps)) {
+      throw new MalformedResponseError('TurnProposalResponse steps must be an array');
+    }
+    const steps: WorkflowStep[] = val.steps.map((st) => validateWorkflowStep(st));
+    const requires_approval = typeof val.requires_approval === 'boolean' ? val.requires_approval : true;
+    const approval_id = typeof val.approval_id === 'string' ? val.approval_id : undefined;
+
+    return {
+      kind: 'proposal',
+      plan_id: val.plan_id,
+      summary: val.summary,
+      steps,
+      requires_approval,
+      approval_id,
+      spoken_text,
+      session_id,
+    };
+  }
+
+  if (kind === 'error') {
+    if (typeof val.message !== 'string') {
+      throw new MalformedResponseError('TurnErrorResponse missing string "message"');
+    }
+    return {
+      kind: 'error',
+      message: val.message,
+      code: typeof val.code === 'string' ? val.code : undefined,
+      retryable: typeof val.retryable === 'boolean' ? val.retryable : undefined,
+      session_id,
+    };
+  }
+
+  throw new MalformedResponseError(`Unknown TurnResponse kind "${String(kind)}"`);
+}
+
+export function validateBrowserActionEvent(val: unknown, expectedSessionId?: string): BrowserActionEvent {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('BrowserActionEvent must be an object');
+  }
+
+  if (!isNonEmptyString(val.action_id)) {
+    throw new MalformedResponseError('BrowserActionEvent missing non-empty "action_id"');
+  }
+
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('BrowserActionEvent missing non-empty "session_id"');
+  }
+
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `BrowserActionEvent session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+
+  if (!isNonEmptyString(val.label)) {
+    throw new MalformedResponseError('BrowserActionEvent missing non-empty "label"');
+  }
+
+  const validStatuses = new Set(['pending', 'running', 'completed', 'failed']);
+  const status = typeof val.status === 'string' && validStatuses.has(val.status)
+    ? (val.status as BrowserActionStatus)
+    : 'pending';
+
+  return {
+    action_id: val.action_id,
+    session_id: val.session_id,
+    step_id: typeof val.step_id === 'string' ? val.step_id : undefined,
+    action_type: typeof val.action_type === 'string' ? val.action_type : 'action',
+    label: val.label,
+    status,
+    target: typeof val.target === 'string' ? val.target : undefined,
   };
 }

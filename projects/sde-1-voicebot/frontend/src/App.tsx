@@ -3,12 +3,16 @@ import {
   ApprovalRequest,
   AuditEvent,
   AudioChunkMetadata,
+  BrowserActionEvent,
+  CaptureOutcome,
   ErrorEnvelope,
   EventEnvelope,
+  MascotState,
   MockSessionResponse,
   SessionLifecycleState,
   SimulatedPermissionState,
   TranscriptSegment,
+  TurnResponse,
 } from './types/contracts';
 import {
   SessionClient,
@@ -31,6 +35,8 @@ import { ScreenContextPanel } from './components/ScreenContextPanel';
 import { StatusAlert, AppErrorState, formatErrorToState } from './components/StatusAlert';
 import { ApprovalDialog } from './components/ApprovalDialog';
 import { WorkflowProgressPanel } from './components/WorkflowProgressPanel';
+import { Mascot } from './components/Mascot';
+import { SpeechBubble } from './components/SpeechBubble';
 
 export type SessionUiState =
   | 'idle'
@@ -108,6 +114,27 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   // Week 3 Workflow & Approvals State
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+
+  // Week 4 Companion & Mascot State
+  const [mascotState, setMascotState] = useState<MascotState>('idle');
+  const [userQuery, setUserQuery] = useState<string>('');
+  const [turnResponse, setTurnResponse] = useState<TurnResponse | null>(null);
+  const [stepActions, setStepActions] = useState<BrowserActionEvent[]>([]);
+  const [inputText, setInputText] = useState<string>('');
+  const [reducedMotion, setReducedMotion] = useState<boolean>(() => {
+    if (typeof window !== 'undefined' && window.matchMedia) {
+      return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+    return false;
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const handler = (e: MediaQueryListEvent) => setReducedMotion(e.matches);
+    mql.addEventListener('change', handler);
+    return () => mql.removeEventListener('change', handler);
+  }, []);
 
   // Track active session token, abort controller, and seen event IDs for deduplication
   const currentSessionTokenRef = useRef<number>(0);
@@ -218,6 +245,103 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     }
     return defaultClientsRef.current[clientMode]!;
   }, [customClient, clientMode]);
+
+  const handleTurnSubmit = useCallback(
+    async (query: string) => {
+      if (!query.trim()) return;
+      const trimmed = query.trim();
+      setUserQuery(trimmed);
+      setMascotState('thinking');
+      setStatusMessage(`Processing request: "${trimmed}"`);
+      setError(null);
+
+      const client = getClient();
+      const currentSid = sessionId || 'session-demo';
+
+      try {
+        if (client.createTurn) {
+          const response = await client.createTurn({
+            text: trimmed,
+            session_id: currentSid,
+            context_enabled: screenContextEnabled,
+          });
+          setTurnResponse(response);
+
+          if ('spoken_text' in response && response.spoken_text && client.synthesizeSpeech) {
+            try {
+              await client.synthesizeSpeech(response.spoken_text);
+            } catch {
+              // non-blocking
+            }
+          }
+
+          if (response.kind === 'proposal') {
+            if (response.requires_approval && response.approval_id) {
+              setPendingApproval({
+                approval_id: response.approval_id,
+                plan_id: response.plan_id,
+                step_id: response.steps[0]?.step_id || 'step-1',
+                session_id: currentSid,
+                status: 'pending',
+              });
+              setMascotState('idle');
+              setStatusMessage('Proposal requires approval before execution.');
+            } else {
+              setMascotState('done');
+              setStatusMessage('Plan proposed.');
+            }
+          } else if (response.kind === 'answer') {
+            setMascotState('done');
+            setStatusMessage(response.text);
+            setTimeout(() => {
+              setMascotState((curr) => (curr === 'done' ? 'idle' : curr));
+            }, 2500);
+          } else if (response.kind === 'clarify') {
+            setMascotState('idle');
+            setStatusMessage(response.question);
+          } else if (response.kind === 'error') {
+            setMascotState('idle');
+            setError({
+              type: 'backend',
+              title: 'Request Failed',
+              message: response.message,
+              code: response.code || 'TURN_ERROR',
+            });
+            setStatusMessage(`Error: ${response.message}`);
+          }
+        } else {
+          setMascotState('done');
+          setTurnResponse({
+            kind: 'answer',
+            text: `Echo: "${trimmed}".`,
+            session_id: currentSid,
+          });
+        }
+      } catch (err) {
+        setMascotState('idle');
+        const formatted = formatErrorToState(err);
+        setError(formatted);
+        setStatusMessage(`Request error: ${formatted.message}`);
+      }
+    },
+    [sessionId, screenContextEnabled, getClient]
+  );
+
+  const handleListenTrigger = useCallback(async () => {
+    setMascotState('listening');
+    setStatusMessage('Listening ("Hey Jarvis")...');
+    const client = getClient();
+    try {
+      if (client.triggerListen) {
+        const res = await client.triggerListen();
+        if (res.wake_word_detected) {
+          setStatusMessage('Wake word "Hey Jarvis" detected. Ready for your request.');
+        }
+      }
+    } catch {
+      // non-blocking
+    }
+  }, [getClient]);
 
   const handleStart = useCallback(async () => {
     // A previous session's live poller (for example one left after a failure) must
@@ -384,6 +508,39 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                       hasNewAuds = true;
                     } else if (evt.event_type === 'transcript.error') {
                       streamTranscriptError = evt.payload as ErrorEnvelope;
+                    } else if (evt.event_type === 'browser.action') {
+                      const action = evt.payload as BrowserActionEvent;
+                      setStepActions((prev) => {
+                        const idx = prev.findIndex((a) => a.action_id === action.action_id);
+                        if (idx >= 0) {
+                          const copy = [...prev];
+                          copy[idx] = action;
+                          return copy;
+                        }
+                        return [...prev, action];
+                      });
+                      if (action.status === 'running') {
+                        setMascotState('working');
+                      } else if (action.status === 'completed') {
+                        setMascotState('done');
+                      }
+                    } else if (evt.event_type === 'audio.capture') {
+                      const cap = evt.payload as CaptureOutcome;
+                      if (cap.status === 'captured') {
+                        // active frame captured
+                      }
+                    } else if (evt.event_type === 'assistant.turn') {
+                      const turn = evt.payload as TurnResponse;
+                      setTurnResponse(turn);
+                      if (turn.kind === 'proposal' && turn.requires_approval && turn.approval_id) {
+                        setPendingApproval({
+                          approval_id: turn.approval_id,
+                          plan_id: turn.plan_id,
+                          step_id: turn.steps[0]?.step_id || 'step-1',
+                          session_id: response.session_id,
+                          status: 'pending',
+                        });
+                      }
                     }
                   }
 
@@ -664,6 +821,25 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
             newAudits.push(evt.payload as AuditEvent);
           } else if (evt.event_type === 'transcript.error') {
             transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
+          } else if (evt.event_type === 'browser.action') {
+            const action = evt.payload as BrowserActionEvent;
+            setStepActions((prev) => {
+              const idx = prev.findIndex((a) => a.action_id === action.action_id);
+              if (idx >= 0) {
+                const copy = [...prev];
+                copy[idx] = action;
+                return copy;
+              }
+              return [...prev, action];
+            });
+            if (action.status === 'running') {
+              setMascotState('working');
+            } else if (action.status === 'completed') {
+              setMascotState('done');
+            }
+          } else if (evt.event_type === 'assistant.turn') {
+            const turn = evt.payload as TurnResponse;
+            setTurnResponse(turn);
           }
         }
 
@@ -736,13 +912,14 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
 
   const handleApprove = useCallback(
     async (approvalId: string) => {
-      if (!sessionId) return;
+      const sid = sessionId || 'session-demo';
       const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
 
+      setMascotState('working');
       try {
-        const updated = await client.decideApproval(sessionId, approvalId, 'approve');
+        const updated = await client.decideApproval(sid, approvalId, 'approve');
         if (requestSessionToken !== currentSessionTokenRef.current) {
           return;
         }
@@ -754,11 +931,17 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
             message: `Expected approval status 'approved' but received '${updated.status}'. Dialog kept open.`,
             code: 'STATUS_MISMATCH',
           });
+          setMascotState('idle');
           return;
         }
 
         setPendingApproval(null);
         setStatusMessage(`Approval granted for step ${updated.step_id}.`);
+
+        setMascotState('done');
+        setTimeout(() => {
+          setMascotState((c) => (c === 'done' ? 'idle' : c));
+        }, 3000);
 
         // Do not mark a synthetic event ID as seen: the seen-set size is the replay
         // from_sequence, so a fake entry would skip one real event on reconnect.
@@ -774,7 +957,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               sequence: prev.length,
               kind: 'approval_granted',
               plan_id: updated.plan_id,
-              session_id: sessionId,
+              session_id: sid,
               step_id: updated.step_id,
               approval_id: updated.approval_id,
             },
@@ -782,6 +965,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         });
       } catch (err) {
         if (requestSessionToken !== currentSessionTokenRef.current) return;
+        setMascotState('idle');
         const formatted = formatErrorToState(err);
         setError(formatted);
       }
@@ -791,13 +975,13 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
 
   const handleReject = useCallback(
     async (approvalId: string) => {
-      if (!sessionId) return;
+      const sid = sessionId || 'session-demo';
       const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
 
       try {
-        const updated = await client.decideApproval(sessionId, approvalId, 'reject');
+        const updated = await client.decideApproval(sid, approvalId, 'reject');
         if (requestSessionToken !== currentSessionTokenRef.current) {
           return;
         }
@@ -813,6 +997,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         }
 
         setPendingApproval(null);
+        setMascotState('idle');
         setStatusMessage(`Approval rejected for step ${updated.step_id}. Step execution prevented.`);
 
         // See handleApprove: no synthetic seen IDs (they shift from_sequence).
@@ -827,7 +1012,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               sequence: prev.length,
               kind: 'approval_rejected',
               plan_id: updated.plan_id,
-              session_id: sessionId,
+              session_id: sid,
               step_id: updated.step_id,
               approval_id: updated.approval_id,
             },
@@ -897,6 +1082,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         }
         return;
       }
+
+      if (e.altKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        handleListenTrigger();
+        return;
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -910,6 +1101,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     handleResume,
     handleStop,
     toggleExpanded,
+    handleListenTrigger,
   ]);
 
   const isStartDisabled = isSessionInProgress || (isElectronApp && !isBackendReady);
@@ -927,29 +1119,27 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       }}
     >
-      {/* Collapsed Pill (Top Centre, 200×36 px) */}
+      {/* Collapsed Pill (Bottom-Right, 72×72 px) */}
       {!isExpanded && (
         <div
           data-testid="notch-pill"
           role="region"
           aria-label="Voicebot notch pill"
+          title={latestCaption || `Jarvis Companion (${uiState})`}
           onClick={() => toggleExpanded(true)}
           style={{
             position: 'fixed',
-            top: 0,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            width: '200px',
-            height: '36px',
-            borderRadius: '0 0 18px 18px',
+            bottom: '16px',
+            right: '16px',
+            width: '72px',
+            height: '72px',
+            borderRadius: '50%',
             backgroundColor: '#090d16',
-            border: '1px solid #334155',
-            borderTop: 'none',
-            boxShadow: '0 4px 14px rgba(0,0,0,0.6)',
+            border: `1px solid ${getStatusColor(uiState, backendSessionState)}`,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.7)',
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '0 12px',
+            justifyContent: 'center',
             cursor: 'pointer',
             zIndex: 99999,
             color: '#f8fafc',
@@ -957,29 +1147,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
             boxSizing: 'border-box',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', overflow: 'hidden' }}>
-            <span
-              style={{
-                width: '8px',
-                height: '8px',
-                borderRadius: '50%',
-                backgroundColor: getStatusColor(uiState, backendSessionState),
-                flexShrink: 0,
-              }}
-            />
-            <span
-              style={{
-                fontSize: '11px',
-                fontWeight: 600,
-                color: '#e2e8f0',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {latestCaption || (uiState === 'active' ? 'Listening...' : 'Voicebot Notch')}
-            </span>
-          </div>
+          <Mascot
+            state={mascotState}
+            reducedMotion={reducedMotion}
+            size={52}
+            onClick={() => toggleExpanded(true)}
+          />
           {/* The expanded console's aria-live regions are unmounted while collapsed;
               keep status and errors announced from the pill. */}
           <span
@@ -1009,22 +1182,26 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               toggleExpanded(true);
             }}
             style={{
-              background: 'none',
-              border: 'none',
-              color: '#94a3b8',
+              position: 'absolute',
+              bottom: '2px',
+              right: '2px',
+              background: 'rgba(15, 23, 42, 0.9)',
+              border: '1px solid rgba(56, 189, 248, 0.3)',
+              borderRadius: '50%',
+              color: '#38bdf8',
               cursor: 'pointer',
-              padding: '2px 4px',
-              fontSize: '11px',
-              display: 'flex',
-              alignItems: 'center',
+              padding: '2px',
+              fontSize: '9px',
+              lineHeight: 1,
             }}
+            title="Expand companion (Alt+N)"
           >
-            ▼
+            ▲
           </button>
         </div>
       )}
 
-      {/* Expanded Notch Console (Max 480×360 px at Top Centre) */}
+      {/* Expanded Companion Console (Max 380×320 px at Bottom-Right) */}
       {isExpanded && (
         <div
           data-testid="notch-expanded"
@@ -1032,23 +1209,21 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
           aria-label="Voicebot notch console"
           style={{
             position: 'fixed',
-            top: 0,
-            left: '50%',
-            transform: 'translateX(-50%)',
+            bottom: '16px',
+            right: '16px',
             width: '100%',
-            maxWidth: '480px',
-            maxHeight: '360px',
+            maxWidth: '380px',
+            maxHeight: '320px',
             backgroundColor: '#090d16',
             border: '1px solid #334155',
-            borderTop: 'none',
-            borderRadius: '0 0 16px 16px',
+            borderRadius: '16px',
             boxShadow: '0 12px 28px rgba(0, 0, 0, 0.75)',
             display: 'flex',
             flexDirection: 'column',
             overflowY: 'auto',
             zIndex: 99999,
             color: '#f8fafc',
-            padding: '12px 14px',
+            padding: '10px 12px',
             boxSizing: 'border-box',
           }}
         >
@@ -1058,22 +1233,15 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              marginBottom: '8px',
-              paddingBottom: '6px',
+              marginBottom: '6px',
+              paddingBottom: '4px',
               borderBottom: '1px solid #1e293b',
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span
-                style={{
-                  width: '9px',
-                  height: '9px',
-                  borderRadius: '50%',
-                  backgroundColor: getStatusColor(uiState, backendSessionState),
-                }}
-              />
+              <Mascot state={mascotState} reducedMotion={reducedMotion} size={24} />
               <h2 style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>
-                Voicebot Notch
+                Jarvis Companion
               </h2>
             </div>
 
@@ -1110,11 +1278,94 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                   padding: '2px 8px',
                   fontSize: '11px',
                 }}
+                title="Collapse companion (Alt+N)"
               >
-                ▲
+                ▼
               </button>
             </div>
           </header>
+
+          {/* Speech Bubble (User Query, Plan, Turn Response, Step Chips) */}
+          <SpeechBubble
+            userQuery={userQuery}
+            turnResponse={turnResponse}
+            stepActions={stepActions}
+            pendingApproval={pendingApproval}
+            onApprove={handleApprove}
+            onReject={handleReject}
+            isApproving={isTransitioning}
+            reducedMotion={reducedMotion}
+          />
+
+          {/* Interactive Turn Input & Hey Jarvis Listen Trigger */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (inputText.trim()) {
+                handleTurnSubmit(inputText);
+                setInputText('');
+              }
+            }}
+            style={{
+              display: 'flex',
+              gap: '6px',
+              marginTop: '6px',
+              marginBottom: '4px',
+            }}
+          >
+            <input
+              type="text"
+              data-testid="turn-input"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              placeholder="Type request or say 'hey jarvis'..."
+              aria-label="Type request or say hey jarvis"
+              style={{
+                flex: 1,
+                padding: '4px 8px',
+                fontSize: '11px',
+                borderRadius: '6px',
+                background: '#0f172a',
+                border: '1px solid #334155',
+                color: '#f8fafc',
+              }}
+            />
+            <button
+              type="submit"
+              data-testid="turn-submit"
+              aria-label="Send request"
+              style={{
+                padding: '4px 10px',
+                fontSize: '11px',
+                borderRadius: '6px',
+                background: '#0284c7',
+                color: '#ffffff',
+                border: 'none',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              Send
+            </button>
+            <button
+              type="button"
+              data-testid="listen-button"
+              aria-label="Listen (Hey Jarvis)"
+              onClick={handleListenTrigger}
+              title="Listen / Wake Word (Alt+L)"
+              style={{
+                padding: '4px 8px',
+                fontSize: '11px',
+                borderRadius: '6px',
+                background: mascotState === 'listening' ? '#2563eb' : '#1e293b',
+                color: '#38bdf8',
+                border: '1px solid #38bdf8',
+                cursor: 'pointer',
+              }}
+            >
+              🎙️
+            </button>
+          </form>
 
           {/* Banner */}
           <MockModeBanner />

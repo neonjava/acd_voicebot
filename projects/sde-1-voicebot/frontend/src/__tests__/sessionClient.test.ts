@@ -733,5 +733,149 @@ describe('SessionClient implementations', () => {
       expect(auditEvt).toBeDefined();
       expect(auditEvt?.event_id).toBe('evt-audit-decision-appr-det-1-rejected');
     });
+
+    it('FixtureSessionClient handles Week 4 Demo Mode scripted turns, browser task approval and rejection', async () => {
+      const client = new FixtureSessionClient();
+
+      // Normal flow: request -> answer
+      const ramTurn = await client.createTurn({ text: "what's using the most ram?" });
+      expect(ramTurn.kind).toBe('answer');
+      if (ramTurn.kind === 'answer') {
+        expect(ramTurn.text).toContain('3.1 GB');
+        expect(ramTurn.sources?.[0].locator).toBe('system_stats.memory');
+        expect(ramTurn.spoken_text).toBe('Chrome, about 3.1 GB.');
+      }
+
+      // Clarify flow
+      const clarifyTurn = await client.createTurn({ text: 'close it' });
+      expect(clarifyTurn.kind).toBe('clarify');
+      if (clarifyTurn.kind === 'clarify') {
+        expect(clarifyTurn.question).toContain('Chrome');
+      }
+
+      // Error flow
+      const errorTurn = await client.createTurn({ text: 'simulate error' });
+      expect(errorTurn.kind).toBe('error');
+
+      // Browser task proposal flow
+      const proposalTurn = await client.createTurn({ text: 'open my attendance page' });
+      expect(proposalTurn.kind).toBe('proposal');
+      if (proposalTurn.kind === 'proposal') {
+        expect(proposalTurn.requires_approval).toBe(true);
+        expect(proposalTurn.approval_id).toBeDefined();
+        const approvalId = proposalTurn.approval_id!;
+
+        // Approve the browser task
+        const decided = await client.decideApproval('session-demo', approvalId, 'approve');
+        expect(decided.status).toBe('approved');
+        expect(client.getExecutionCount()).toBe(1);
+
+        // Verify browser.action events emitted in order
+        const stream = await client.getEvents('session-demo');
+        const actions = stream.events.filter((e) => e.event_type === 'browser.action');
+        expect(actions).toHaveLength(3);
+        expect((actions[0].payload as any).label).toBe('Read page');
+        expect((actions[1].payload as any).label).toBe('Click Attendance');
+        expect((actions[2].payload as any).label).toBe('Read results');
+      }
+
+      // Rejection flow guarantees zero execution
+      const rejectClient = new FixtureSessionClient();
+      const p2 = await rejectClient.createTurn({ text: 'open attendance portal' });
+      if (p2.kind === 'proposal') {
+        const rejected = await rejectClient.decideApproval('session-demo', p2.approval_id!, 'reject');
+        expect(rejected.status).toBe('rejected');
+        expect(rejectClient.getExecutionCount()).toBe(0);
+
+        const st = await rejectClient.getEvents('session-demo');
+        const browserActions = st.events.filter((e) => e.event_type === 'browser.action');
+        expect(browserActions).toHaveLength(0);
+      }
+
+      // Capture status toggle
+      expect((await client.getCaptureStatus()).status).toBe('disabled');
+      client.setCaptureEnabled(true);
+      expect((await client.getCaptureStatus()).status).toBe('captured');
+      expect((await client.getCaptureStatus()).capture_enabled).toBe(true);
+
+      // Listen and speech synthesis
+      const listenRes = await client.triggerListen();
+      expect(listenRes.status).toBe('listening');
+      expect(listenRes.wake_word_detected).toBe(true);
+
+      const speechRes = await client.synthesizeSpeech('Hello from Jarvis');
+      expect(speechRes.spoken_text).toBe('Hello from Jarvis');
+    });
+
+    it('HttpSessionClient calls /api/turns, /api/capture, /api/listen, and /api/speech with Bearer token', async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        if (url.includes('/api/turns')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              kind: 'answer',
+              text: 'Chrome, about 3.1 GB.',
+              spoken_text: 'Chrome, about 3.1 GB.',
+            }),
+          };
+        }
+        if (url.includes('/api/capture')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              status: 'captured',
+              frame_id: 'frame-test-1',
+              capture_enabled: true,
+            }),
+          };
+        }
+        if (url.includes('/api/listen')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              status: 'listening',
+              wake_word_detected: true,
+            }),
+          };
+        }
+        if (url.includes('/api/speech')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              spoken_text: 'Spoken reply',
+            }),
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+      globalThis.fetch = fetchMock;
+
+      const client = new HttpSessionClient({ token: 'test-bearer-token' });
+
+      const turn = await client.createTurn({ text: 'Test query' });
+      expect(turn.kind).toBe('answer');
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/turns',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({
+            Authorization: 'Bearer test-bearer-token',
+          }),
+        })
+      );
+
+      const capture = await client.getCaptureStatus();
+      expect(capture.status).toBe('captured');
+
+      const listen = await client.triggerListen();
+      expect(listen.status).toBe('listening');
+
+      const speech = await client.synthesizeSpeech('Spoken reply');
+      expect(speech.spoken_text).toBe('Spoken reply');
+    });
   });
 });

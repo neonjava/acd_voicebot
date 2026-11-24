@@ -15,6 +15,10 @@ import {
   validateWorkflowProposal,
   validateSessionEventStreamResponse,
   validateEventEnvelope,
+  validateCaptureStatus,
+  validateCaptureOutcome,
+  validateTurnResponse,
+  validateBrowserActionEvent,
   MalformedResponseError,
 } from '../utils/validation';
 import { baselineSessionResponse } from '../fixtures/baselineSession';
@@ -606,6 +610,168 @@ describe('Runtime Validation', () => {
           'sess-direct'
         )
       ).toThrow(/Unsupported event_type/);
+    });
+
+    it('validates Week 4 browser.action, audio.capture, and assistant.turn event envelopes', () => {
+      const browserActionEvt = validateEventEnvelope(
+        {
+          event_id: 'evt-browser-1',
+          event_type: 'browser.action',
+          schema_version: '1.0',
+          session_id: 'sess-w4',
+          correlation_id: 'corr-w4',
+          timestamp: '2026-11-24T12:00:00Z',
+          producer: 'browser',
+          payload: {
+            action_id: 'act-1',
+            session_id: 'sess-w4',
+            action_type: 'click',
+            label: 'Click Attendance',
+            status: 'completed',
+          },
+        },
+        'sess-w4'
+      );
+      expect(browserActionEvt.event_type).toBe('browser.action');
+      expect((browserActionEvt.payload as any).label).toBe('Click Attendance');
+
+      const captureEvt = validateEventEnvelope(
+        {
+          event_id: 'evt-capture-1',
+          event_type: 'audio.capture',
+          schema_version: '1.0',
+          session_id: 'sess-w4',
+          correlation_id: 'corr-w4',
+          timestamp: '2026-11-24T12:00:00Z',
+          producer: 'capture',
+          payload: {
+            status: 'captured',
+            frame_id: 'frame-1',
+          },
+        },
+        'sess-w4'
+      );
+      expect(captureEvt.event_type).toBe('audio.capture');
+      expect((captureEvt.payload as any).status).toBe('captured');
+
+      const turnEvt = validateEventEnvelope(
+        {
+          event_id: 'evt-turn-1',
+          event_type: 'assistant.turn',
+          schema_version: '1.0',
+          session_id: 'sess-w4',
+          correlation_id: 'corr-w4',
+          timestamp: '2026-11-24T12:00:00Z',
+          producer: 'assistant',
+          payload: {
+            kind: 'answer',
+            text: 'Your attendance is 92%.',
+            spoken_text: 'Your attendance is 92%.',
+          },
+        },
+        'sess-w4'
+      );
+      expect(turnEvt.event_type).toBe('assistant.turn');
+      expect((turnEvt.payload as any).text).toBe('Your attendance is 92%.');
+    });
+
+    it('validates TurnResponse kinds: answer, clarify, proposal, error', () => {
+      const answer = validateTurnResponse({
+        kind: 'answer',
+        text: 'Chrome is using 3.1 GB of RAM.',
+        sources: [{ id: 'src-1', label: 'psutil', kind: 'system' }],
+        spoken_text: 'Chrome, about 3.1 GB.',
+      });
+      expect(answer.kind).toBe('answer');
+      if (answer.kind === 'answer') {
+        expect(answer.text).toContain('3.1 GB');
+        expect(answer.sources?.[0].label).toBe('psutil');
+      }
+
+      const clarify = validateTurnResponse({
+        kind: 'clarify',
+        question: 'Did you mean Chrome or Firefox?',
+        spoken_text: 'Did you mean Chrome or Firefox?',
+      });
+      expect(clarify.kind).toBe('clarify');
+      if (clarify.kind === 'clarify') {
+        expect(clarify.question).toContain('Chrome');
+      }
+
+      const proposal = validateTurnResponse({
+        kind: 'proposal',
+        plan_id: 'plan-attendance',
+        summary: 'Open attendance page and read statistics',
+        steps: [
+          { step_id: 'step-nav', tool_name: 'open_url', arguments: { url: 'https://example.com' }, requires_approval: false },
+          { step_id: 'step-click', tool_name: 'click_element', arguments: { selector: '#attendance' }, requires_approval: true },
+        ],
+        requires_approval: true,
+        approval_id: 'appr-attendance-1',
+      });
+      expect(proposal.kind).toBe('proposal');
+      if (proposal.kind === 'proposal') {
+        expect(proposal.plan_id).toBe('plan-attendance');
+        expect(proposal.steps).toHaveLength(2);
+        expect(proposal.requires_approval).toBe(true);
+      }
+
+      const err = validateTurnResponse({
+        kind: 'error',
+        message: 'Could not connect to browser',
+        code: 'BROWSER_UNAVAILABLE',
+        retryable: true,
+      });
+      expect(err.kind).toBe('error');
+      if (err.kind === 'error') {
+        expect(err.code).toBe('BROWSER_UNAVAILABLE');
+      }
+
+      expect(() => validateTurnResponse({ kind: 'unknown' })).toThrow(MalformedResponseError);
+    });
+
+    it('validates CaptureStatus and CaptureOutcome', () => {
+      expect(validateCaptureStatus('captured')).toBe('captured');
+      expect(validateCaptureStatus('disabled')).toBe('disabled');
+      expect(() => validateCaptureStatus('invalid_status')).toThrow(MalformedResponseError);
+
+      const outcome = validateCaptureOutcome({
+        status: 'captured',
+        frame_id: 'frame-100',
+        capture_enabled: true,
+      });
+      expect(outcome.status).toBe('captured');
+      expect(outcome.frame_id).toBe('frame-100');
+      expect(outcome.capture_enabled).toBe(true);
+    });
+
+    it('validates BrowserActionEvent', () => {
+      const action = validateBrowserActionEvent(
+        {
+          action_id: 'act-click-1',
+          session_id: 'sess-123',
+          step_id: 'step-1',
+          action_type: 'click',
+          label: 'Click Submit',
+          status: 'running',
+          target: '#submit-btn',
+        },
+        'sess-123'
+      );
+      expect(action.action_id).toBe('act-click-1');
+      expect(action.status).toBe('running');
+      expect(action.label).toBe('Click Submit');
+
+      expect(() =>
+        validateBrowserActionEvent(
+          {
+            action_id: 'act-1',
+            session_id: 'sess-mismatch',
+            label: 'Test',
+          },
+          'sess-expected'
+        )
+      ).toThrow(MalformedResponseError);
     });
   });
 });

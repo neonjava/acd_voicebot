@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ApprovalRequest } from '../types/contracts';
 
 export interface ApprovalDialogProps {
@@ -13,6 +13,36 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
   onReject,
 }) => {
   const [submitting, setSubmitting] = useState(false);
+  const rejectBtnRef = useRef<HTMLButtonElement>(null);
+  const approveBtnRef = useRef<HTMLButtonElement>(null);
+
+  // Focus trap and Escape key handler
+  useEffect(() => {
+    if (approval && approval.status === 'pending') {
+      approveBtnRef.current?.focus();
+    }
+  }, [approval]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Tab') {
+      if (e.shiftKey) {
+        if (document.activeElement === rejectBtnRef.current) {
+          e.preventDefault();
+          approveBtnRef.current?.focus();
+        }
+      } else {
+        if (document.activeElement === approveBtnRef.current) {
+          e.preventDefault();
+          rejectBtnRef.current?.focus();
+        }
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if (!submitting && approval) {
+        onReject(approval.approval_id);
+      }
+    }
+  };
 
   if (!approval || approval.status !== 'pending') {
     return null;
@@ -38,6 +68,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
       aria-modal="true"
       aria-labelledby="approval-title"
       aria-describedby="approval-desc"
+      onKeyDown={handleKeyDown}
       style={{
         backgroundColor: '#1e293b',
         border: '1px solid #f59e0b',
@@ -78,6 +109,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
 
       <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
         <button
+          ref={rejectBtnRef}
           type="button"
           data-testid="approval-reject-button"
           onClick={() => handleDecision('reject')}
@@ -98,6 +130,7 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({
           Reject
         </button>
         <button
+          ref={approveBtnRef}
           type="button"
           data-testid="approval-approve-button"
           onClick={() => handleDecision('approve')}
