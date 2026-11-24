@@ -138,6 +138,19 @@ def _match_approvals(
     return approval_by_step
 
 
+def _is_spent(
+    plan: WorkflowPlan,
+    approval: ApprovalRequest,
+    spent: Mapping[str, frozenset[str]],
+) -> bool:
+    return (
+        isinstance(approval, ApprovalRequest)
+        and approval.plan_id == plan.plan_id
+        and approval.session_id == plan.session_id
+        and approval.approval_id in spent.get(approval.step_id, frozenset())
+    )
+
+
 def _approval_expired(approval: ApprovalRequest | None, clock: Clock | None) -> bool:
     if approval is None or approval.expires_at is None or clock is None:
         return False
@@ -179,9 +192,12 @@ def execute(
 
     - ``store`` keeps checkpoints: a later call for the same plan skips steps
       that already succeeded (audited as ``step_restored``) and never calls
-      their tools again. An approval-gated step whose outcome is unknown (it
-      timed out, or was cancelled while its tool ran) is not repeated under the
-      same approval: the run waits for a fresh one (a new ``approval_id``).
+      their tools again. An approval-gated step spends its approval when it
+      succeeds or when its outcome is unknown (it timed out, or was cancelled
+      while its tool ran). A spent approval is ignored from then on, even after
+      the plan succeeded: the run waits for a fresh one (a new
+      ``approval_id``, see ``approvals.reapproval_requests_for``). Only one run
+      of a plan at a time: an overlapping one is ``WORKFLOW_RUN_IN_PROGRESS``.
     - ``idempotency_key`` (needs ``store``): a ``succeeded`` or ``cancelled``
       result is stored; repeating the key for the same plan returns it without
       running anything. A ``failed`` run is not stored, so the same key
@@ -203,22 +219,30 @@ def execute(
         if stored is not None:
             return stored
     try:
-        return _execute_and_store(
-            plan,
-            approvals=approvals,
-            granted_scopes=granted_scopes,
-            clock=clock,
-            step_timeout_ms=step_timeout_ms,
-            max_retries=max_retries,
-            cancellation=cancellation,
-            invoker=invoker,
-            correlation_id=correlation_id,
-            store=store,
-            idempotency_key=idempotency_key,
-            on_audit=on_audit,
-            approval_source=approval_source,
-            runtime=runtime,
-        )
+        if store is not None:
+            if not isinstance(plan, WorkflowPlan):
+                raise TypeError("plan must be a WorkflowPlan")
+            store.claim_run(plan.plan_id)
+        try:
+            return _execute_and_store(
+                plan,
+                approvals=approvals,
+                granted_scopes=granted_scopes,
+                clock=clock,
+                step_timeout_ms=step_timeout_ms,
+                max_retries=max_retries,
+                cancellation=cancellation,
+                invoker=invoker,
+                correlation_id=correlation_id,
+                store=store,
+                idempotency_key=idempotency_key,
+                on_audit=on_audit,
+                approval_source=approval_source,
+                runtime=runtime,
+            )
+        finally:
+            if store is not None:
+                store.release_run(plan.plan_id)
     finally:
         if idempotency_key is not None:
             assert store is not None
@@ -295,8 +319,10 @@ def _execute_once(
       timed out and its output is discarded, even if the tool is still blocked.
       A timed-out tool cannot be killed; see ``_call_supervised``.
     - A consequential tool is never called a second time in one run, and with
-      a ``store`` never again under an approval whose attempt had an unknown
-      outcome (``approval_missing`` with ``reason=previous_outcome_unknown``).
+      a ``store`` never again under an approval it already spent. A spent
+      approval is ignored; its step reports ``approval_missing`` with
+      ``reason=previous_outcome_unknown`` (the last attempt may have run) or
+      ``reason=approval_already_used`` (it ran).
 
     Without a ``WorkflowStore`` there is no history: calling it again may run
     the same steps again.
@@ -325,8 +351,18 @@ def _execute_once(
         tools.check_scope(step.tool_name, granted_scopes)
     completed = store.completed_steps(plan) if store is not None else {}
     unknown = store.outcome_unknown_steps(plan) if store is not None else {}
+    spent = store.spent_approvals(plan.plan_id) if store is not None else {}
 
-    approval_by_step = _match_approvals(plan, approvals)
+    # A spent approval can never run its step again, so it is set aside before
+    # matching: an old and a fresh approval for one step are not duplicates.
+    spent_by_step = {
+        approval.step_id: approval
+        for approval in approvals
+        if _is_spent(plan, approval, spent)
+    }
+    approval_by_step = _match_approvals(
+        plan, [a for a in approvals if not _is_spent(plan, a, spent)]
+    )
     has_expiry = any(a.expires_at is not None for a in approval_by_step.values())
     if clock is None and has_expiry:
         raise ValueError("approval expiry requires an injected clock")
@@ -371,23 +407,22 @@ def _execute_once(
     if cancellation is not None and cancellation.cancelled:
         return _cancel(plan, plan.state, audit, reason="cancelled_before_start")
 
-    def _stale(step: WorkflowStep, approval: ApprovalRequest) -> bool:
-        # The approval was already used by an attempt that may have run.
-        return step.step_id in unknown and unknown[step.step_id] == approval.approval_id
-
     missing = [
         step
         for step in required
         if approval_by_step.get(step.step_id) is None
         or approval_by_step[step.step_id].status != "approved"
-        or _stale(step, approval_by_step[step.step_id])
     ]
     if missing:
         for step in missing:
-            approval = approval_by_step.get(step.step_id)
+            approval = approval_by_step.get(step.step_id) or spent_by_step.get(
+                step.step_id
+            )
             details = (
                 {"reason": "previous_outcome_unknown"}
                 if step.step_id in unknown
+                else {"reason": "approval_already_used"}
+                if step.step_id in spent
                 else {}
             )
             audit.record(
@@ -446,7 +481,12 @@ def _execute_once(
         if status == "ok":
             outputs[step.step_id] = output
             if store is not None:
-                store.save_step(plan, step.step_id, output)
+                spent_id = (
+                    approval.approval_id
+                    if approval is not None and step.step_id in gated
+                    else None
+                )
+                store.save_step(plan, step.step_id, output, spent_id)
             continue
         if store is not None and status in ("timeout", "interrupted"):
             if step.step_id in gated:
