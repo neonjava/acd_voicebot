@@ -8,7 +8,12 @@ from pydantic import Field, field_validator, model_validator
 from app.contracts.audio import SpeechEvent
 from app.contracts.common import ContractModel, EventEnvelope, SessionState
 from app.contracts.transcription import TranscriptEvent
-from app.contracts.workflow import AuditEvent
+from app.contracts.workflow import (
+    ApprovalRequest,
+    AuditEvent,
+    WorkflowProposal,
+    WorkflowResult,
+)
 
 
 class AudioChunkMetadata(ContractModel):
@@ -171,3 +176,60 @@ class HealthResponse(ContractModel):
     status: OverallHealthStatus
     mode: Literal["mock"] = "mock"
     modules: dict[str, ModuleHealthStatus]
+
+
+# --- Week 4: conversational turns (W5 implements, W6 consumes) ---
+
+
+class TurnRequest(ContractModel):
+    """One thing the user said or typed to the assistant."""
+
+    text: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    active_app: str | None = Field(default=None, max_length=200)
+    active_window_title: str | None = Field(default=None, max_length=500)
+
+
+TurnKind = Literal["answer", "clarify", "proposal", "error"]
+
+
+class TurnResponse(ContractModel):
+    """The assistant's reply to one turn.
+
+    - ``answer``: ``answer`` is set, citing ``source_ids`` (empty means the
+      evidence was insufficient and the answer says so).
+    - ``clarify``: ``clarify`` holds one short question.
+    - ``proposal``: ``proposal`` is set. ``approvals`` lists the pending
+      approvals it needs; ``workflow`` is set when only safe steps ran directly.
+    - ``error``: ``error_code`` holds a safe error code.
+    ``spoken_text`` is the short text the assistant speaks (TTS), if any.
+    """
+
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    turn_id: str = Field(min_length=1, pattern=r"\S")
+    kind: TurnKind
+    answer: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    clarify: str | None = Field(default=None, max_length=300)
+    proposal: WorkflowProposal | None = None
+    approvals: list[ApprovalRequest] = Field(default_factory=list)
+    workflow: WorkflowResult | None = None
+    error_code: str | None = None
+    spoken_text: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def fields_match_kind(self) -> Self:
+        required = {
+            "answer": self.answer,
+            "clarify": self.clarify,
+            "proposal": self.proposal,
+            "error": self.error_code,
+        }
+        if required[self.kind] is None:
+            raise ValueError(f"a {self.kind} turn needs its {self.kind} field")
+        if self.kind != "proposal" and (self.approvals or self.workflow):
+            raise ValueError("approvals and workflow belong to proposal turns")
+        if any(
+            sid != self.session_id for sid in [a.session_id for a in self.approvals]
+        ):
+            raise ValueError("approvals must belong to this session")
+        return self

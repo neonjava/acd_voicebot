@@ -70,7 +70,7 @@ export interface MockSessionResponse {
 export interface SourceReference {
   source_id: string;
   locator: string;
-  kind: 'synthetic_screen' | 'transcript';
+  kind: 'synthetic_screen' | 'transcript' | 'note';
 }
 
 export interface ContextItem {

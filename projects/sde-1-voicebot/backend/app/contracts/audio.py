@@ -74,3 +74,22 @@ class SpeechEvent(ContractModel):
         if not is_wake and (self.wake_word is not None or self.score is not None):
             raise ValueError("wake_word and score are only allowed on wake events")
         return self
+
+
+CaptureState = Literal["idle", "listening", "capturing", "paused", "stopped"]
+
+
+class CaptureStatus(ContractModel):
+    """What the microphone is doing, for the UI's capture indicator (W1 → W5 → W6).
+
+    ``idle``: not started. ``listening``: waiting for the wake word.
+    ``capturing``: recording an utterance after the wake word (or with the wake
+    word off). ``paused`` / ``stopped``: capture is off. Audio is never written
+    to disk in any state.
+    """
+
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    state: CaptureState
+    source: Literal["mock", "mic"]
+    wake_required: bool
+    wake_word: str | None = Field(default=None, min_length=1, pattern=r"\S")
