@@ -4,6 +4,7 @@ import {
   FixtureSessionClient,
   BackendError,
   NetworkError,
+  parseRetryAfterMs,
 } from '../services/sessionClient';
 import { baselineSessionResponse, week2StreamingSessionResponse } from '../fixtures/baselineSession';
 import { MalformedResponseError } from '../utils/validation';
@@ -421,19 +422,169 @@ describe('SessionClient implementations', () => {
       }
     });
 
-    it('resolves production relative URLs to http://127.0.0.1:8000 in file:// protocol or via voicebot.getBackendUrl', () => {
+    // Behaviour change (review of #79): the Electron renderer must call the backend
+    // same-origin (Vite proxy in dev, app:// protocol in production). An absolute
+    // http://127.0.0.1:8000 URL is cross-origin and fails the CORS preflight.
+    it('keeps API URLs same-origin even inside the Electron desktop shell', async () => {
       const client = new HttpSessionClient();
       expect(client.resolveUrl('http://custom-host:9000/api/mock')).toBe('http://custom-host:9000/api/mock');
 
-      // Test with window.voicebot.getBackendUrl
       const originalVoicebot = (window as unknown as { voicebot?: unknown }).voicebot;
-      (window as unknown as { voicebot?: { getBackendUrl?: () => string } }).voicebot = {
+      (window as unknown as { voicebot?: unknown }).voicebot = {
+        isElectron: true,
+        getToken: () => 'vbt-test-token-123456',
         getBackendUrl: () => 'http://127.0.0.1:8000',
       };
-      expect(client.resolveUrl('/api/sessions/mock')).toBe('http://127.0.0.1:8000/api/sessions/mock');
-      expect(client.resolveUrl('api/sessions/1/events')).toBe('http://127.0.0.1:8000/api/sessions/1/events');
+      try {
+        expect(client.resolveUrl('/api/sessions/mock')).toBe('/api/sessions/mock');
 
-      (window as unknown as { voicebot?: unknown }).voicebot = originalVoicebot;
+        const fetchMock = vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            session_id: 'sess-1',
+            from_sequence: 0,
+            total_events: 0,
+            has_more: false,
+            events: [],
+          }),
+        });
+        globalThis.fetch = fetchMock;
+        await client.getEvents('sess-1', 3);
+        expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/sess-1/events?from_sequence=3');
+        expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe('Bearer vbt-test-token-123456');
+      } finally {
+        (window as unknown as { voicebot?: unknown }).voicebot = originalVoicebot;
+      }
+    });
+
+    it('reports a real SESSION_NOT_FOUND 404 envelope instead of DEPENDENCY_UNAVAILABLE', async () => {
+      const notFound = {
+        code: 'SESSION_NOT_FOUND',
+        message_safe_for_user: 'Session was not found: sess-gone',
+        retryable: false,
+        correlation_id: 'corr-404',
+        details_redacted: { session_id: 'sess-gone' },
+      };
+      globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => notFound });
+      const client = new HttpSessionClient();
+      for (const call of [
+        () => client.pauseSession('sess-gone'),
+        () => client.resumeSession('sess-gone'),
+        () => client.getSessionState('sess-gone'),
+        () => client.getPendingApprovals('sess-gone'),
+      ]) {
+        const err = await call().catch((e) => e);
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('SESSION_NOT_FOUND');
+        expect((err as BackendError).message).toBe('Session was not found: sess-gone');
+        expect((err as BackendError).status).toBe(404);
+      }
+
+      // An unknown route (FastAPI reports HTTP_404) still means the endpoint is missing.
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ ...notFound, code: 'HTTP_404', message_safe_for_user: 'Not Found' }),
+      });
+      const missing = await client.pauseSession('sess-1').catch((e) => e);
+      expect((missing as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+    });
+
+    it('parses Retry-After as seconds or HTTP-date', () => {
+      expect(parseRetryAfterMs('30')).toBe(30000);
+      expect(parseRetryAfterMs(null)).toBeUndefined();
+      expect(parseRetryAfterMs('soon')).toBeUndefined();
+      const now = Date.parse('2026-01-01T00:00:00Z');
+      expect(parseRetryAfterMs('Thu, 01 Jan 2026 00:00:05 GMT', now)).toBe(5000);
+      expect(parseRetryAfterMs('Thu, 01 Jan 2026 00:00:00 GMT', now + 1000)).toBe(0);
+    });
+
+    it('waits for the 429 Retry-After delay before polling events again', async () => {
+      vi.useFakeTimers();
+      try {
+        const rateLimited = {
+          code: 'RATE_LIMITED',
+          message_safe_for_user: 'Rate limit exceeded. Please retry later.',
+          retryable: true,
+          correlation_id: 'corr-429',
+          details_redacted: { retry_after: '7' },
+        };
+        const fetchMock = vi.fn().mockImplementation(async () => {
+          if (fetchMock.mock.calls.length === 1) {
+            return {
+              ok: false,
+              status: 429,
+              headers: { get: (name: string) => (name.toLowerCase() === 'retry-after' ? '7' : null) },
+              json: async () => rateLimited,
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ session_id: 's', from_sequence: 0, total_events: 0, has_more: false, events: [] }),
+          };
+        });
+        globalThis.fetch = fetchMock;
+
+        const reconnects: { attempt: number; delayMs: number }[] = [];
+        const sub = new HttpSessionClient().subscribeToEvents('s', {
+          initialDelayMs: 500,
+          maxDelayMs: 3000,
+          pollIntervalMs: 1000,
+          onEvents: () => {},
+          onReconnect: (attempt, delayMs) => reconnects.push({ attempt, delayMs }),
+        });
+
+        await vi.advanceTimersByTimeAsync(10);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(reconnects).toEqual([{ attempt: 1, delayMs: 7000 }]);
+
+        // Without Retry-After the poller would retry after 500 ms (and keep hitting the limiter).
+        await vi.advanceTimersByTimeAsync(6900);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(200);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        sub.unsubscribe();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops polling on a non-retryable backend error such as 401 AUTH_REQUIRED', async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchMock = vi.fn().mockResolvedValue({
+          ok: false,
+          status: 401,
+          json: async () => ({
+            code: 'AUTH_REQUIRED',
+            message_safe_for_user: 'Authentication required.',
+            retryable: false,
+            correlation_id: 'corr-401',
+            details_redacted: {},
+          }),
+        });
+        globalThis.fetch = fetchMock;
+        const stopped: BackendError[] = [];
+        const reconnects: number[] = [];
+        const sub = new HttpSessionClient().subscribeToEvents('s', {
+          onEvents: () => {},
+          onReconnect: (attempt) => reconnects.push(attempt),
+          onStopped: (err) => stopped.push(err as BackendError),
+        });
+
+        await vi.advanceTimersByTimeAsync(60000);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(reconnects).toEqual([]);
+        expect(stopped).toHaveLength(1);
+        expect(stopped[0].code).toBe('AUTH_REQUIRED');
+        expect(stopped[0].status).toBe(401);
+        sub.unsubscribe();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('subscribes to live event stream with automatic pagination and capped exponential backoff on failure', async () => {

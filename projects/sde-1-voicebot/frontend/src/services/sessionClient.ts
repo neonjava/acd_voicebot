@@ -28,6 +28,8 @@ export interface StreamEventsOptions {
   onEvents: (events: EventEnvelope<unknown>[]) => void;
   onError?: (error: Error) => void;
   onReconnect?: (attempt: number, delayMs: number) => void;
+  /** Called once when polling stops for good because the backend answered with a non-retryable error. */
+  onStopped?: (error: Error) => void;
   initialDelayMs?: number;
   maxDelayMs?: number;
   pollIntervalMs?: number;
@@ -55,15 +57,46 @@ export class BackendError extends Error {
   public readonly retryable: boolean;
   public readonly correlationId: string;
   public readonly details: Record<string, string>;
+  /** HTTP status of the response that carried the envelope, when known. */
+  public readonly status?: number;
+  /** Delay the backend asked for in its Retry-After header (HTTP 429), in milliseconds. */
+  public readonly retryAfterMs?: number;
 
-  constructor(envelope: ErrorEnvelope) {
+  constructor(envelope: ErrorEnvelope, meta: { status?: number; retryAfterMs?: number } = {}) {
     super(envelope.message_safe_for_user);
     this.name = 'BackendError';
     this.code = envelope.code;
     this.retryable = envelope.retryable;
     this.correlationId = envelope.correlation_id;
     this.details = envelope.details_redacted;
+    this.status = meta.status;
+    this.retryAfterMs = meta.retryAfterMs;
   }
+}
+
+/** Upper bound on a single Retry-After wait so a bad header cannot stall the UI forever. */
+export const MAX_RETRY_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * Parse an HTTP Retry-After header (delta-seconds or HTTP-date) into milliseconds.
+ * Returns undefined when the header is missing or malformed.
+ */
+export function parseRetryAfterMs(value: string | null | undefined, nowMs: number = Date.now()): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const text = value.trim();
+  if (text === '') return undefined;
+  if (/^\d+$/.test(text)) {
+    return Number(text) * 1000;
+  }
+  const at = Date.parse(text);
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, at - nowMs);
+}
+
+interface MissingEndpointInfo {
+  message: string;
+  dependency: string;
+  sessionId: string;
 }
 
 export class NetworkError extends Error {
@@ -96,21 +129,13 @@ export class HttpSessionClient implements SessionClient {
     }
   }
 
+  /**
+   * Requests always go to the page's own origin (/api/...): the Vite dev proxy in
+   * development and the Electron app:// protocol in the packaged app forward them
+   * to the backend. A cross-origin URL would need CORS, which the backend does not
+   * offer, so the Bearer-authenticated preflight would fail.
+   */
   public resolveUrl(path: string): string {
-    if (path.startsWith('http://') || path.startsWith('https://')) {
-      return path;
-    }
-    let baseUrl = '';
-    if (typeof window !== 'undefined') {
-      if (window.voicebot?.getBackendUrl) {
-        baseUrl = window.voicebot.getBackendUrl();
-      } else if (window.location && window.location.protocol === 'file:') {
-        baseUrl = 'http://127.0.0.1:8000';
-      }
-    }
-    if (baseUrl) {
-      return `${baseUrl.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
-    }
     return path;
   }
 
@@ -139,6 +164,69 @@ export class HttpSessionClient implements SessionClient {
       headers['Authorization'] = `Bearer ${token}`;
     }
     return headers;
+  }
+
+  /**
+   * Read a JSON response. Non-2xx answers become a BackendError built from the
+   * ErrorEnvelope (with the HTTP status and any Retry-After delay). When
+   * `missingEndpoint` is given, a 501, or a 404 that is not a domain error such as
+   * SESSION_NOT_FOUND (FastAPI reports an unknown route as HTTP_404), means the
+   * route is not available yet and is reported as DEPENDENCY_UNAVAILABLE.
+   */
+  private async readJson(response: Response, missingEndpoint?: MissingEndpointInfo): Promise<unknown> {
+    let payload: unknown;
+    let parsed = true;
+    try {
+      payload = await response.json();
+    } catch {
+      parsed = false;
+    }
+
+    if (response.ok) {
+      if (!parsed) {
+        throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
+      }
+      return payload;
+    }
+
+    let envelope: ErrorEnvelope | null = null;
+    if (parsed) {
+      try {
+        envelope = validateErrorEnvelope(payload);
+      } catch {
+        envelope = null;
+      }
+    }
+
+    if (
+      missingEndpoint &&
+      (response.status === 501 ||
+        (response.status === 404 && (envelope === null || envelope.code === 'HTTP_404')))
+    ) {
+      throw new BackendError(
+        {
+          code: 'DEPENDENCY_UNAVAILABLE',
+          message_safe_for_user: missingEndpoint.message,
+          retryable: true,
+          correlation_id: `corr-${missingEndpoint.sessionId}`,
+          details_redacted: { dependency: missingEndpoint.dependency, status: String(response.status) },
+        },
+        { status: response.status }
+      );
+    }
+
+    if (envelope) {
+      throw new BackendError(envelope, {
+        status: response.status,
+        retryAfterMs:
+          response.status === 429 ? parseRetryAfterMs(response.headers?.get?.('Retry-After') ?? null) : undefined,
+      });
+    }
+
+    if (!parsed) {
+      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
+    }
+    throw new NetworkError(`Request failed with HTTP ${response.status}`, response.status);
   }
 
   async startMockSession(signal?: AbortSignal): Promise<MockSessionResponse> {
@@ -228,28 +316,12 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to reach backend at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
-    if (response.status === 404 || response.status === 501) {
-      throw new BackendError({
-        code: 'DEPENDENCY_UNAVAILABLE',
-        message_safe_for_user:
-          `Backend ${action} lifecycle endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.`,
-        retryable: true,
-        correlation_id: `corr-${sessionId}`,
-        details_redacted: { dependency: `app.main (${action} endpoint)`, status: String(response.status) },
-      });
-    }
-
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
-    }
-
-    if (!response.ok) {
-      const errorEnv = validateErrorEnvelope(payload);
-      throw new BackendError(errorEnv);
-    }
+    const payload = await this.readJson(response, {
+      message:
+        `Backend ${action} lifecycle endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.`,
+      dependency: `app.main (${action} endpoint)`,
+      sessionId,
+    });
 
     const stateObj = payload as { state: unknown };
     return validateSessionLifecycleState(stateObj.state);
@@ -275,28 +347,12 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to reach backend at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
-    if (response.status === 404 || response.status === 501) {
-      throw new BackendError({
-        code: 'DEPENDENCY_UNAVAILABLE',
-        message_safe_for_user:
-          'Backend session query endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-        retryable: true,
-        correlation_id: `corr-${sessionId}`,
-        details_redacted: { dependency: 'app.main (session query endpoint)', status: String(response.status) },
-      });
-    }
-
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
-    }
-
-    if (!response.ok) {
-      const errorEnv = validateErrorEnvelope(payload);
-      throw new BackendError(errorEnv);
-    }
+    const payload = await this.readJson(response, {
+      message:
+        'Backend session query endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
+      dependency: 'app.main (session query endpoint)',
+      sessionId,
+    });
 
     const stateObj = payload as { state: unknown };
     return validateSessionLifecycleState(stateObj.state);
@@ -322,18 +378,7 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to fetch events from ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
-    }
-
-    if (!response.ok) {
-      const errorEnv = validateErrorEnvelope(payload);
-      throw new BackendError(errorEnv);
-    }
-
+    const payload = await this.readJson(response);
     return validateSessionEventStreamResponse(payload);
   }
 
@@ -357,28 +402,12 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to get approvals from ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
-    if (response.status === 404 || response.status === 501) {
-      throw new BackendError({
-        code: 'DEPENDENCY_UNAVAILABLE',
-        message_safe_for_user:
-          'Backend approvals endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-        retryable: true,
-        correlation_id: `corr-${sessionId}`,
-        details_redacted: { dependency: 'app.main (approvals endpoint)', status: String(response.status) },
-      });
-    }
-
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
-    }
-
-    if (!response.ok) {
-      const errorEnv = validateErrorEnvelope(payload);
-      throw new BackendError(errorEnv);
-    }
+    const payload = await this.readJson(response, {
+      message:
+        'Backend approvals endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
+      dependency: 'app.main (approvals endpoint)',
+      sessionId,
+    });
 
     if (!Array.isArray(payload)) {
       throw new NetworkError('Approvals response must be an array');
@@ -413,28 +442,12 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to post approval decision to ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
-    if (response.status === 404 || response.status === 501) {
-      throw new BackendError({
-        code: 'DEPENDENCY_UNAVAILABLE',
-        message_safe_for_user:
-          'Backend approvals endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-        retryable: true,
-        correlation_id: `corr-${sessionId}`,
-        details_redacted: { dependency: 'app.main (approvals endpoint)', status: String(response.status) },
-      });
-    }
-
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
-    }
-
-    if (!response.ok) {
-      const errorEnv = validateErrorEnvelope(payload);
-      throw new BackendError(errorEnv);
-    }
+    const payload = await this.readJson(response, {
+      message:
+        'Backend approvals endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
+      dependency: 'app.main (approvals endpoint)',
+      sessionId,
+    });
 
     return validateApprovalRequest(payload, sessionId);
   }
@@ -475,8 +488,22 @@ export class HttpSessionClient implements SessionClient {
         if (!active || signal?.aborted) return;
         if (err instanceof DOMException && err.name === 'AbortError') return;
 
+        // A non-retryable backend answer (401 AUTH_REQUIRED, 404 SESSION_NOT_FOUND,
+        // 410 SESSION_EXPIRED, ...) will not change by polling again: stop for good.
+        if (err instanceof BackendError && !err.retryable) {
+          active = false;
+          timer = null;
+          options.onError?.(err);
+          options.onStopped?.(err);
+          return;
+        }
+
         attempt++;
-        const delayMs = Math.min(initialDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+        let delayMs = Math.min(initialDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+        // Honour the backend's rate limiter (429 Retry-After) instead of retrying early.
+        if (err instanceof BackendError && err.retryAfterMs !== undefined) {
+          delayMs = Math.max(delayMs, Math.min(err.retryAfterMs, MAX_RETRY_AFTER_MS));
+        }
         if (options.onReconnect) {
           options.onReconnect(attempt, delayMs);
         }

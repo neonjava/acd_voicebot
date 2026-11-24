@@ -1579,5 +1579,179 @@ describe('Voicebot App Component', () => {
         expect(screen.getByText('Live audio stream was corrupted during transcription.')).toBeInTheDocument();
       });
     });
+
+    describe('review of #79: replay sequence, poller lifecycle and collapsed notch', () => {
+      const seg = (n: number, sid: string) => ({
+        event_id: `evt-real-${n}`,
+        event_type: 'transcript.segment',
+        schema_version: '1.0',
+        session_id: sid,
+        correlation_id: 'corr-x',
+        timestamp: '2026-01-01T00:00:00Z',
+        producer: 'transcription',
+        payload: {
+          segment_id: `seg-${n}`,
+          session_id: sid,
+          sequence_id: n,
+          start_ms: n * 1000,
+          end_ms: n * 1000 + 500,
+          text: `caption number ${n}`,
+          confidence: 0.9,
+          language: 'en',
+          is_final: true,
+        },
+      });
+
+      it('does not skip a real event on Reconnect after an approval decision', async () => {
+        const sid = 'sess-seq';
+        // Backend log: index 0 was delivered with the start response; index 1 arrives later.
+        const log = [seg(0, sid), seg(1, sid)];
+        const getEvents = vi.fn().mockImplementation(async (_s: string, from = 0) => ({
+          session_id: sid,
+          events: log.slice(from),
+          from_sequence: from,
+          total_events: log.length,
+          has_more: false,
+        }));
+        const mockClient: SessionClient = {
+          startMockSession: vi.fn().mockResolvedValue({ session_id: sid, state: 'active', mode: 'mock', events: [log[0]] }),
+          getPendingApprovals: vi.fn().mockResolvedValue([
+            {
+              approval_id: 'appr-seq',
+              plan_id: 'plan-1',
+              step_id: 'step-1',
+              session_id: sid,
+              status: 'pending',
+              risk_level: 'high',
+              summary: 'Run a consequential step',
+            },
+          ]),
+          decideApproval: vi.fn().mockResolvedValue({
+            approval_id: 'appr-seq',
+            plan_id: 'plan-1',
+            step_id: 'step-1',
+            session_id: sid,
+            status: 'approved',
+          }),
+          getEvents,
+        };
+
+        render(<App customClient={mockClient} />);
+        fireEvent.click(screen.getByTestId('start-button'));
+        await waitFor(() => expect(screen.getByTestId('approval-dialog')).toBeInTheDocument());
+        fireEvent.click(screen.getByTestId('approval-approve-button'));
+        await waitFor(() => expect(screen.queryByTestId('approval-dialog')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByTestId('reconnect-button'));
+        await waitFor(() => expect(getEvents).toHaveBeenCalled());
+        // One event was received, so replay must resume from sequence 1 (not 2).
+        expect(getEvents.mock.calls[0][1]).toBe(1);
+        await waitFor(() => expect(screen.getByText('caption number 1')).toBeInTheDocument());
+      });
+
+      it('stops the live poller when the stream reports transcript.error and does not leak it into the next session', async () => {
+        const subs: { opts: { onEvents: (e: unknown[]) => void }; unsubscribe: ReturnType<typeof vi.fn> }[] = [];
+        let n = 0;
+        const mockClient: SessionClient = {
+          startMockSession: vi.fn().mockImplementation(async () => ({
+            session_id: `sess-leak-${++n}`,
+            state: 'active',
+            mode: 'mock',
+            events: [],
+          })),
+          subscribeToEvents: vi.fn().mockImplementation((_s, opts) => {
+            const sub = { opts, unsubscribe: vi.fn() };
+            subs.push(sub);
+            return { unsubscribe: sub.unsubscribe };
+          }),
+        };
+
+        render(<App customClient={mockClient} />);
+        fireEvent.click(screen.getByTestId('start-button'));
+        await waitFor(() => expect(subs).toHaveLength(1));
+
+        act(() => {
+          subs[0].opts.onEvents([
+            {
+              event_id: 'evt-err',
+              event_type: 'transcript.error',
+              schema_version: '1.0',
+              session_id: 'sess-leak-1',
+              correlation_id: 'corr-err',
+              timestamp: '2026-01-01T00:00:02Z',
+              producer: 'transcription',
+              payload: {
+                code: 'STT_FAILED',
+                message_safe_for_user: 'Transcription failed.',
+                retryable: false,
+                correlation_id: 'corr-err',
+                details_redacted: {},
+              },
+            },
+          ]);
+        });
+        await waitFor(() => expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i));
+        expect(subs[0].unsubscribe).toHaveBeenCalled();
+
+        fireEvent.click(screen.getByTestId('start-button'));
+        await waitFor(() => expect(subs).toHaveLength(2));
+        expect(subs[1].unsubscribe).not.toHaveBeenCalled();
+      });
+
+      it('shows the error and stops when the live poller gives up on a non-retryable error', async () => {
+        let stopped: ((e: Error) => void) | undefined;
+        const mockClient: SessionClient = {
+          startMockSession: vi.fn().mockResolvedValue({ session_id: 'sess-401', state: 'active', mode: 'mock', events: [] }),
+          subscribeToEvents: vi.fn().mockImplementation((_s, opts) => {
+            stopped = opts.onStopped;
+            return { unsubscribe: vi.fn() };
+          }),
+        };
+        render(<App customClient={mockClient} />);
+        fireEvent.click(screen.getByTestId('start-button'));
+        await waitFor(() => expect(stopped).toBeDefined());
+
+        act(() => {
+          stopped!(
+            new BackendError({
+              code: 'AUTH_REQUIRED',
+              message_safe_for_user: 'Authentication required.',
+              retryable: false,
+              correlation_id: 'corr-401',
+              details_redacted: {},
+            })
+          );
+        });
+        await waitFor(() => expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i));
+        expect(screen.getAllByText(/Authentication required\./).length).toBeGreaterThan(0);
+        expect(screen.getByTestId('start-button')).not.toBeDisabled();
+      });
+
+      it('expands a collapsed notch when an approval arrives and announces status from the pill', async () => {
+        const mockClient: SessionClient = {
+          startMockSession: vi.fn().mockResolvedValue({ session_id: 'sess-pill', state: 'active', mode: 'mock', events: [] }),
+          getPendingApprovals: vi.fn().mockResolvedValue([
+            {
+              approval_id: 'appr-pill',
+              plan_id: 'plan-1',
+              step_id: 'step-1',
+              session_id: 'sess-pill',
+              status: 'pending',
+              risk_level: 'high',
+              summary: 'Send the drafted message',
+            },
+          ]),
+        };
+        render(<App customClient={mockClient} initialExpanded={false} />);
+        const live = screen.getByTestId('notch-pill-live-status');
+        expect(live).toHaveAttribute('aria-live', 'polite');
+        expect(live).toHaveTextContent('Ready to start session.');
+
+        // Alt+S starts from the collapsed pill
+        fireEvent.keyDown(window, { key: 's', altKey: true });
+        await waitFor(() => expect(screen.getByTestId('approval-dialog')).toBeInTheDocument());
+        expect(screen.getByTestId('notch-expanded')).toBeInTheDocument();
+      });
+    });
   });
 });
