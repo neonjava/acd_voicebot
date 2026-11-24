@@ -9,6 +9,7 @@ one after integration.
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Literal, Protocol
 
 from app.agent import tools
@@ -101,18 +102,26 @@ def reapproval_requests_for(
 
 
 class InMemoryApprovalSource:
-    """Mock approval state: register requests, decide them once, read them back."""
+    """Mock approval state: register requests, decide them once, read them back.
+
+    Thread-safe: of two overlapping decisions on one request, only one is
+    accepted; the other gets ``APPROVAL_ALREADY_DECIDED``.
+    """
 
     def __init__(self) -> None:
         self._by_id: dict[str, ApprovalRequest] = {}
+        self._lock = Lock()
 
     def register(self, requests: Sequence[ApprovalRequest]) -> None:
-        for request in requests:
-            if request.approval_id in self._by_id:
+        with self._lock:
+            if len({r.approval_id for r in requests}) != len(requests) or any(
+                r.approval_id in self._by_id for r in requests
+            ):
                 raise ApprovalDecisionError(
                     "APPROVAL_DUPLICATE", "approval request already exists"
                 )
-            self._by_id[request.approval_id] = request
+            for request in requests:
+                self._by_id[request.approval_id] = request
 
     def decide(
         self,
@@ -122,6 +131,15 @@ class InMemoryApprovalSource:
         now: datetime | None = None,
     ) -> ApprovalRequest:
         """Approve or reject once; a second decision or an expired one is refused."""
+        with self._lock:
+            return self._decide(approval_id, decision, now)
+
+    def _decide(
+        self,
+        approval_id: str,
+        decision: Literal["approve", "reject"],
+        now: datetime | None,
+    ) -> ApprovalRequest:
         request = self._by_id.get(approval_id)
         if request is None:
             raise ApprovalDecisionError(
@@ -147,4 +165,5 @@ class InMemoryApprovalSource:
         return updated
 
     def approvals_for_plan(self, plan_id: str) -> list[ApprovalRequest]:
-        return [a for a in self._by_id.values() if a.plan_id == plan_id]
+        with self._lock:
+            return [a for a in self._by_id.values() if a.plan_id == plan_id]
