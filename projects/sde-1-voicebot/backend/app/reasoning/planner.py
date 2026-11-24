@@ -13,8 +13,10 @@ Prompt-injection defence: only the user's own request can ask for an action.
 context. ``LLMWorkflowPlanner`` rejects any proposal that uses an unknown tool,
 cites a source that was not supplied, does not cite the user's request, or
 uses a tool the request text itself does not ask for (``requested_tools``, the
-same intent rules as ``RuleBasedPlanner``). The model cannot pass that last
-check by citing the request, because it reads only the user's own words.
+same intent rules as ``RuleBasedPlanner``), or takes a step argument from
+anywhere but the request (``_arguments_from_request``). The model cannot pass
+those checks by citing the request, because they read only the user's own
+words.
 """
 
 import json
@@ -31,7 +33,7 @@ from pydantic import ValidationError
 
 from app.contracts.common import ErrorEnvelope
 from app.contracts.workflow import ToolSpec, WorkflowProposal, WorkflowStep
-from app.reasoning.bundle import ContextBundle, Turn, last_mentioned_app
+from app.reasoning.bundle import ContextBundle, Turn, resolve_referent
 from app.reasoning.llm import LLMProvider, ProviderTransientError
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "planner_v1.txt"
@@ -40,10 +42,12 @@ MAX_CLARIFY_CHARS = 300
 PlanKind = Literal["none", "clarify", "proposal"]
 
 _PRONOUNS = {"it", "that", "this", "them"}
+# Things that are not apps: "close this tab" must not close the whole browser.
+_NOT_APPS = {
+    "tab", "tabs", "file", "files", "page", "pages",
+    "document", "documents", "folder", "folders",
+}  # fmt: skip
 _RAM = re.compile(r"\b(ram|memory)\b|using the most", re.IGNORECASE)
-_OPEN_YOUTUBE = re.compile(
-    r"\bopen\b.*\byoutube\b|\byoutube\b.*\bopen\b", re.IGNORECASE
-)
 _SEARCH = re.compile(
     r"\bsearch(?:\s+up|\s+for)?\s+(?P<query>.+?)(?:\s+(?:on|in)\s+youtube)?\s*$",
     re.IGNORECASE,
@@ -55,13 +59,46 @@ _LEAD = (
     r"^\s*(?:(?:hey\s+)?jarvis\b[\s,.:!]*)?"
     r"(?:(?:please|(?:can|could|would|will)\s+you)\s+)*"
 )
-_CLOSE = re.compile(_LEAD + r"close\s+(?:the\s+)?(?P<target>[\w.+-]+)", re.IGNORECASE)
+_CLOSE = re.compile(
+    _LEAD
+    + r"close\s+(?:(?:the|my|your)\s+)?(?P<target>[\w.+-]+)(?:\s+(?P<noun>[\w-]+))?",
+    re.IGNORECASE,
+)
+_OPEN_YOUTUBE = re.compile(_LEAD + r"open\b.*\byoutube\b", re.IGNORECASE)
 _NOTE = re.compile(
     _LEAD
     + r"(?:save|make|take|write)\s+(?:a\s+)?note\b"
     + r"(?:\s+(?:that|saying))?[\s:,]*(?P<text>.*)$",
     re.IGNORECASE,
 )
+
+
+def _close_request(text: str) -> tuple[str, bool] | None:
+    """``(target, is_app)`` for an imperative close request, else ``None``."""
+    match = _CLOSE.search(text)
+    if match is None:
+        return None
+    target = match.group("target")
+    noun = (match.group("noun") or "").lower()
+    is_app = target.lower() not in _NOT_APPS and not (
+        target.lower() in _PRONOUNS and noun in _NOT_APPS
+    )
+    return target, is_app
+
+
+def youtube_url(text: str) -> str:
+    """The YouTube page an "open YouTube" request asks for, built from its words."""
+    if search := _SEARCH.search(text):
+        query = search.group("query").strip(" .?!")
+        if query:
+            return f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+    return "https://www.youtube.com/"
+
+
+def _note_body(text: str) -> str:
+    note = _NOTE.search(text)
+    body = note.group("text").strip(" .") if note is not None else ""
+    return body or text.strip()
 
 
 def requested_tools(text: str) -> frozenset[str]:
@@ -71,7 +108,8 @@ def requested_tools(text: str) -> frozenset[str]:
     ``LLMWorkflowPlanner`` accepts a proposed tool only if it is listed here.
     """
     tools: set[str] = set()
-    if _CLOSE.search(text):
+    close = _close_request(text)
+    if close is not None and close[1]:
         tools.add("close_app")
     if _NOTE.search(text):
         tools.add("mock_save_note")
@@ -95,6 +133,52 @@ def default_catalogue() -> dict[str, ToolSpec]:
     from app.agent.tools import TOOL_SPECS
 
     return dict(TOOL_SPECS)
+
+
+def _normalise(text: str) -> str:
+    return " ".join(text.casefold().split()).strip(" .")
+
+
+def _names_app(text: str, app: str) -> bool:
+    pattern = rf"(?<![\w.+-]){re.escape(app)}(?![\w.+-])"
+    return re.search(pattern, text.casefold()) is not None
+
+
+def _arguments_from_request(
+    tool: str, arguments: Mapping[str, str], request: Turn, bundle: ContextBundle
+) -> bool:
+    """True when every argument comes from the user's request, not from context.
+
+    A model that follows injected text can keep the tool the user asked for and
+    swap its argument (a link, the note text, the app), so arguments are checked
+    against the request too. "close it" may resolve to an app named in the
+    conversation or the active window, never to screen text.
+    """
+    text = request.text
+    if tool == "system_stats":
+        return not arguments
+    if tool == "open_url":
+        return dict(arguments) == {"url": youtube_url(text)}
+    if tool == "mock_save_note":
+        if set(arguments) != {"text"}:
+            return False
+        body = _normalise(arguments["text"])
+        return bool(body) and body in _normalise(text)
+    if tool == "close_app":
+        close = _close_request(text)
+        if close is None or set(arguments) != {"app"}:
+            return False
+        app = arguments["app"].strip().casefold()
+        if not app:
+            return False
+        target = close[0]
+        if target.lower() not in _PRONOUNS:
+            return app == target.casefold()
+        named = [turn.text for turn in bundle.turns if turn.turn_id != request.turn_id]
+        if bundle.active_window is not None:
+            named.append(bundle.active_window.app)
+        return any(_names_app(t, app) for t in named)
+    return False
 
 
 def _require_request(request: Turn) -> None:
@@ -151,21 +235,19 @@ class RuleBasedPlanner:
         def missing_tool() -> PlanDecision:
             return PlanDecision("clarify", message="I can't do that yet.")
 
-        if close := _CLOSE.search(text):
+        if close := _close_request(text):
+            target, is_app = close
+            if not is_app:
+                return PlanDecision("clarify", message="I can only close apps.")
             if "close_app" not in catalogue:
                 return missing_tool()
-            target = close.group("target")
             extra: tuple[str, ...] = ()
             if target.lower() in _PRONOUNS:
-                resolved = last_mentioned_app(bundle)
-                if resolved is None:
+                referent = resolve_referent(bundle)
+                if referent is None:
                     return PlanDecision("clarify", message="Which app should I close?")
-                target = resolved
-                extra = tuple(
-                    t.turn_id
-                    for t in reversed(bundle.turns)
-                    if t.role == "assistant" and resolved in t.text
-                )[:1]
+                target, source_id = referent
+                extra = (source_id,)
             step = WorkflowStep(
                 step_id="close",
                 tool_name="close_app",
@@ -176,10 +258,10 @@ class RuleBasedPlanner:
                 summary=f"Close {target}", steps=[step], extra_sources=extra, **common
             )
 
-        if note := _NOTE.search(text):
+        if _NOTE.search(text):
             if "mock_save_note" not in catalogue:
                 return missing_tool()
-            body = note.group("text").strip(" .") or text
+            body = _note_body(text)
             step = WorkflowStep(
                 step_id="note",
                 tool_name="mock_save_note",
@@ -193,15 +275,10 @@ class RuleBasedPlanner:
         if _OPEN_YOUTUBE.search(text):
             if "open_url" not in catalogue:
                 return missing_tool()
-            url = "https://www.youtube.com/"
-            if search := _SEARCH.search(text):
-                query = search.group("query").strip(" .?!")
-                if query:
-                    url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
             step = WorkflowStep(
                 step_id="open",
                 tool_name="open_url",
-                arguments={"url": url},
+                arguments={"url": youtube_url(text)},
                 requires_approval=bool(catalogue["open_url"].consequential),
             )
             return _proposal(summary="Open YouTube", steps=[step], **common)
@@ -355,6 +432,8 @@ class LLMWorkflowPlanner:
                 isinstance(k, str) and isinstance(v, str) for k, v in arguments.items()
             ):
                 return malformed
+            if not _arguments_from_request(tool, arguments, request, bundle):
+                return self._unsafe("argument_not_from_user_request")
             try:
                 steps.append(
                     WorkflowStep(
