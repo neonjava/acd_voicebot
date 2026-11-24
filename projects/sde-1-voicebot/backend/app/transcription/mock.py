@@ -18,6 +18,9 @@ class FakeTranscriber:
         failure_mode: str | None = None,
         failures_before_success: int = 0,
         custom_texts: Sequence[str] | None = None,
+        default_confidence: float = 1.0,
+        default_is_final: bool = True,
+        detect_missing_chunks: bool = True,
     ) -> None:
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a positive number")
@@ -28,6 +31,9 @@ class FakeTranscriber:
         self.failure_mode = failure_mode
         self.failures_before_success = failures_before_success
         self.custom_texts = list(custom_texts) if custom_texts is not None else None
+        self.default_confidence = float(default_confidence)
+        self.default_is_final = bool(default_is_final)
+        self.detect_missing_chunks = bool(detect_missing_chunks)
 
         self._cancelled_sessions: set[str] = set()
         self._segment_indices: dict[str, int] = {}
@@ -42,6 +48,17 @@ class FakeTranscriber:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
+
+    def clear_cancellation(self, session_id: str) -> None:
+        """Clear a session's cancellation without touching other session state."""
+        self._cancelled_sessions.discard(session_id)
+
+    def reset(self, session_id: str | None = None) -> None:
+        """Clear cancellations; segment and event IDs keep counting to stay unique."""
+        if session_id:
+            self._cancelled_sessions.discard(session_id)
+        else:
+            self._cancelled_sessions.clear()
 
     def transcribe(
         self,
@@ -109,7 +126,7 @@ class FakeTranscriber:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"event-transcript-err-{session_id}",
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,
@@ -134,7 +151,32 @@ class FakeTranscriber:
                 )
                 return [
                     TranscriptEvent(
-                        event_id=f"event-transcript-err-{session_id}",
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
+                        event_type="transcript.error",
+                        schema_version="1.0",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        timestamp=timestamp,
+                        producer="transcription",
+                        payload=error_payload,
+                    )
+                ]
+
+            if self.detect_missing_chunks and chunk.sequence_id > expected_seq + 1:
+                # Missing chunks gap produces safe error event
+                error_payload = ErrorEnvelope(
+                    code="TRANSCRIPTION_MISSING_CHUNKS",
+                    message_safe_for_user="Detected missing audio chunks in stream.",
+                    retryable=False,
+                    correlation_id=correlation_id,
+                    details_redacted={
+                        "expected_sequence": str(expected_seq + 1),
+                        "received_sequence": str(chunk.sequence_id),
+                    },
+                )
+                return [
+                    TranscriptEvent(
+                        event_id=f"event-transcript-err-{session_id}-{self._call_count}",
                         event_type="transcript.error",
                         schema_version="1.0",
                         session_id=session_id,
@@ -166,9 +208,9 @@ class FakeTranscriber:
             start_ms=start_ms,
             end_ms=end_ms,
             text=text,
-            confidence=1.0,
+            confidence=self.default_confidence,
             language="en",
-            is_final=True,
+            is_final=self.default_is_final,
         )
 
         return [
@@ -196,7 +238,23 @@ class FakeTranscriber:
         if mode == "timeout":
             raise TimeoutError("Simulated transcriber timeout")
 
-        if mode == "temporary_error":
+        if mode == "quota_error":
+            payload = ErrorEnvelope(
+                code="TRANSCRIPTION_QUOTA_EXCEEDED",
+                message_safe_for_user="Transcription quota exceeded.",
+                retryable=False,
+                correlation_id=correlation_id,
+                details_redacted={"mode": "simulated_quota"},
+            )
+        elif mode == "network_error":
+            payload = ErrorEnvelope(
+                code="TRANSCRIPTION_NETWORK_ERROR",
+                message_safe_for_user="Transcription network connection failed.",
+                retryable=True,
+                correlation_id=correlation_id,
+                details_redacted={"mode": "simulated_network"},
+            )
+        elif mode == "temporary_error":
             payload = ErrorEnvelope(
                 code="TRANSCRIPTION_TEMPORARY_ERROR",
                 message_safe_for_user="Temporary transcription provider failure.",
