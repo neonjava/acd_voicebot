@@ -1752,6 +1752,31 @@ describe('Voicebot App Component', () => {
         await waitFor(() => expect(screen.getByTestId('approval-dialog')).toBeInTheDocument());
         expect(screen.getByTestId('notch-expanded')).toBeInTheDocument();
       });
+
+      it('lets the user collapse the notch again while the same approval is still pending', async () => {
+        const mockClient: SessionClient = {
+          startMockSession: vi.fn().mockResolvedValue({ session_id: 'sess-col', state: 'active', mode: 'mock', events: [] }),
+          getPendingApprovals: vi.fn().mockResolvedValue([
+            {
+              approval_id: 'appr-col',
+              plan_id: 'plan-1',
+              step_id: 'step-1',
+              session_id: 'sess-col',
+              status: 'pending',
+            },
+          ]),
+        };
+        render(<App customClient={mockClient} initialExpanded={false} />);
+        fireEvent.keyDown(window, { key: 's', altKey: true });
+        await waitFor(() => expect(screen.getByTestId('approval-dialog')).toBeInTheDocument());
+
+        fireEvent.click(screen.getByTestId('notch-collapse-button'));
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 20));
+        });
+        expect(screen.queryByTestId('notch-expanded')).not.toBeInTheDocument();
+        expect(screen.getByTestId('notch-pill')).toBeInTheDocument();
+      });
     });
   });
 });
