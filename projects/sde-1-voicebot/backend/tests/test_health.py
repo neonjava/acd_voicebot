@@ -13,10 +13,17 @@ def client():
 
 
 def test_health_endpoint(client):
-    """GET /api/health returns 200 with ok status and mock mode."""
+    """GET /api/health returns 200 with ok status and aggregated module statuses."""
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "mode": "mock"}
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["mode"] == "mock"
+    assert "modules" in data
+    assert data["modules"]["audio"] in ("ok", "mock")
+    assert data["modules"]["transcription"] in ("ok", "mock")
+    assert data["modules"]["reasoning"] in ("ok", "mock")
+    assert data["modules"]["workflow"] in ("ok", "mock")
     assert "X-Request-ID" in response.headers
     assert "X-Correlation-ID" in response.headers
 
@@ -25,7 +32,10 @@ def test_ready_endpoint(client):
     """GET /api/ready returns 200 with ready status and mock mode."""
     response = client.get("/api/ready")
     assert response.status_code == 200
-    assert response.json() == {"status": "ready", "mode": "mock"}
+    data = response.json()
+    assert data["status"] == "ready"
+    assert data["mode"] == "mock"
+    assert data["auth"] in ("off", "token")
     assert "X-Request-ID" in response.headers
     assert "X-Correlation-ID" in response.headers
 

@@ -83,47 +83,56 @@ def test_post_mock_session_reports_missing_dependency_blocker(client):
 
 
 def test_post_mock_session_success_when_dependencies_present(client):
-    """POST /api/sessions/mock returns 201 MockSessionResponse when available."""
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", fake_w1_w2_modules()),
-    ):
-        response = client.post(
-            "/api/sessions/mock",
-            json={},
-            headers={"X-Correlation-ID": "test-corr-abc"},
-        )
-        assert response.status_code == 201
-        assert response.headers["X-Correlation-ID"] == "test-corr-abc"
-        assert "X-Request-ID" in response.headers
+    """POST /api/sessions/mock keeps approval pending for client decision."""
+    response = client.post(
+        "/api/sessions/mock",
+        json={},
+        headers={"X-Correlation-ID": "test-corr-abc"},
+    )
+    assert response.status_code == 201
+    assert response.headers["X-Correlation-ID"] == "test-corr-abc"
+    assert "X-Request-ID" in response.headers
 
-        data = response.json()
-        validated = MockSessionResponse.model_validate(data)
-        assert validated.state == "completed"
-        assert validated.mode == "mock"
-        assert len(validated.events) == 2
-        assert validated.events[0].event_type == "audio.chunk"
-        assert validated.events[1].event_type == "transcript.segment"
+    data = response.json()
+    validated = MockSessionResponse.model_validate(data)
+    assert validated.state == "active"
+    assert validated.mode == "mock"
+    event_types = [e.event_type for e in validated.events]
+    assert "audio.chunk" in event_types
+    assert "audio.speech" in event_types
+    assert "transcript.segment" in event_types
+
+    # Ensure approval remains pending for client decision (Ruthwin dialog)
+    appr_resp = client.get(f"/api/sessions/{validated.session_id}/approvals")
+    assert appr_resp.status_code == 200
+    approvals = appr_resp.json()
+    assert len(approvals) == 1
+    assert approvals[0]["status"] == "pending"
+    appr_id = approvals[0]["approval_id"]
+
+    # Client decides approval through approvals endpoint
+    decide_resp = client.post(
+        f"/api/sessions/{validated.session_id}/approvals/{appr_id}",
+        json={"decision": "approve"},
+    )
+    assert decide_resp.status_code == 200
+    assert decide_resp.json()["status"] == "approved"
 
 
 def test_post_mock_session_generates_unique_session_ids(client):
     """Subsequent POST requests must generate distinct session IDs in memory."""
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", fake_w1_w2_modules()),
-    ):
-        resp1 = client.post("/api/sessions/mock", json={})
-        resp2 = client.post("/api/sessions/mock", json={})
+    resp1 = client.post("/api/sessions/mock", json={})
+    resp2 = client.post("/api/sessions/mock", json={})
 
-        assert resp1.status_code == 201
-        assert resp2.status_code == 201
+    assert resp1.status_code == 201
+    assert resp2.status_code == 201
 
-        sid1 = resp1.json()["session_id"]
-        sid2 = resp2.json()["session_id"]
+    sid1 = resp1.json()["session_id"]
+    sid2 = resp2.json()["session_id"]
 
-        assert sid1 != sid2, "Session IDs must be unique across runtime requests"
-        assert session_service.get_session(sid1) is not None
-        assert session_service.get_session(sid2) is not None
+    assert sid1 != sid2, "Session IDs must be unique across runtime requests"
+    assert session_service.get_session(sid1) is not None
+    assert session_service.get_session(sid2) is not None
 
 
 def test_post_mock_session_rejects_extra_fields(client):
@@ -191,14 +200,15 @@ def test_fixture_matches_service_output():
 
 def test_post_mock_session_rejects_mismatched_event_session_ids(client):
     """Transcriber returning mismatched session ID fails response validation."""
-    fake_pcm = bytes(32000)
-    fake_chunks = [MagicMock() for _ in range(50)]
 
     def mismatched_transcribe(
-        audio_chunks,
+        _self,
+        _chunks,
+        *,
         session_id: str,
         correlation_id: str,
-        timestamp: datetime | None = None,
+        timestamp: datetime,
+        preprocess: bool = True,
     ):
         ts = timestamp or datetime.now(timezone.utc)
         fake_segment = TranscriptSegment(
@@ -224,22 +234,9 @@ def test_post_mock_session_rejects_mismatched_event_session_ids(client):
         )
         return [fake_event]
 
-    mock_transcriber = MagicMock()
-    mock_transcriber.transcribe.side_effect = mismatched_transcribe
-
-    modules = {
-        "app.audio": MagicMock(),
-        "app.audio.source": MagicMock(make_fake_pcm=MagicMock(return_value=fake_pcm)),
-        "app.audio.chunker": MagicMock(chunk_pcm=MagicMock(return_value=fake_chunks)),
-        "app.transcription": MagicMock(),
-        "app.transcription.mock": MagicMock(
-            FakeTranscriber=MagicMock(return_value=mock_transcriber)
-        ),
-    }
-
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", modules),
+    with patch(
+        "app.transcription.orchestrator.TranscriptionOrchestrator.process_chunks",
+        mismatched_transcribe,
     ):
         response = client.post("/api/sessions/mock", json={})
         assert response.status_code == 500
