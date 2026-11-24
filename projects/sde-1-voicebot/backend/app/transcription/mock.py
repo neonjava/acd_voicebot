@@ -49,6 +49,10 @@ class FakeTranscriber:
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
 
+    def clear_cancellation(self, session_id: str) -> None:
+        """Clear a session's cancellation without touching other session state."""
+        self._cancelled_sessions.discard(session_id)
+
     def reset(self, session_id: str | None = None) -> None:
         """Clear cancellations; segment and event IDs keep counting to stay unique."""
         if session_id:

@@ -82,9 +82,11 @@ class TranscriptionOrchestrator:
         if session_id not in self._cancelled_sessions:
             return False
         self._cancelled_sessions.discard(session_id)
-        adapter_reset = getattr(self.adapter, "reset", None)
-        if callable(adapter_reset):
-            adapter_reset(session_id)
+        clear = getattr(self.adapter, "clear_cancellation", None)
+        if not callable(clear):
+            clear = getattr(self.adapter, "reset", None)
+        if callable(clear):
+            clear(session_id)
         return True
 
     def process_chunks(

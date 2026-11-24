@@ -91,8 +91,12 @@ class FasterWhisperAdapter:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
-        self._fallback_announced.discard(session_id)
         self._fallback_transcriber.cancel(session_id)
+
+    def clear_cancellation(self, session_id: str) -> None:
+        """Clear a session's cancellation without touching other session state."""
+        self._cancelled_sessions.discard(session_id)
+        self._fallback_transcriber.clear_cancellation(session_id)
 
     def reset(self, session_id: str | None = None) -> None:
         """Clear cancellations; segment and event IDs keep counting to stay unique."""
