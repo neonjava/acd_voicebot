@@ -74,15 +74,24 @@ function startBackendSidecar(options) {
   let readyState = false;
   let failed = false;
 
+  // Output is handled per complete line: a pipe chunk can split the token (or the
+  // ready line) anywhere, so redaction and ready detection need whole lines.
+  const flushers = [];
   const lineHandler = () => {
     let buffered = '';
+    flushers.push(() => {
+      if (buffered) {
+        onLog?.(sanitizeLogOutput(buffered, token));
+        buffered = '';
+      }
+    });
     return (chunk) => {
-      const text = chunk.toString();
-      onLog?.(sanitizeLogOutput(text, token));
-      buffered += text;
-      const lines = buffered.split(/\r?\n/);
+      buffered += chunk.toString();
+      const lines = buffered.split('\n');
       buffered = lines.pop() ?? '';
-      for (const line of lines) {
+      for (const rawLine of lines) {
+        onLog?.(sanitizeLogOutput(`${rawLine}\n`, token));
+        const line = rawLine.replace(/\r$/, '');
         if (readyState || failed) continue;
         const result = parseReadyLine(line, port);
         if (result.ready) {
@@ -104,6 +113,7 @@ function startBackendSidecar(options) {
   });
 
   child.on('exit', (code, signal) => {
+    flushers.forEach((flush) => flush());
     if (!readyState && !failed) {
       failed = true;
       onError?.(

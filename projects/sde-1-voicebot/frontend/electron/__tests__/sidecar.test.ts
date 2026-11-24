@@ -345,4 +345,22 @@ describe('Backend ready line and port (review of #79)', () => {
     expect(process.env.VOICEBOT_LAUNCH_TOKEN).toBeUndefined();
     mainCjs.cleanupBackend();
   });
+
+  it('redacts a launch token that is split across two output chunks', () => {
+    const token = generateLaunchToken();
+    const { child, stdout } = fakeChild(4246);
+    const logged: string[] = [];
+    startBackendSidecar({
+      token,
+      spawnFn: (() => child) as any,
+      onLog: (line: string) => logged.push(line),
+    });
+    const half = Math.floor(token.length / 2);
+    stdout.emit('data', Buffer.from(`debug token=${token.slice(0, half)}`));
+    stdout.emit('data', Buffer.from(`${token.slice(half)} end\n`));
+    const all = logged.join('');
+    expect(all).not.toContain(token.slice(0, half));
+    expect(all).not.toContain(token.slice(half));
+    expect(all).toBe('debug token=[REDACTED_LAUNCH_TOKEN] end\n');
+  });
 });

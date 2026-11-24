@@ -136,11 +136,13 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   // A pending approval lives in the expanded notch: open it so the request is seen
   // (and its dialog is reachable by keyboard and screen readers) even when the
   // notch was collapsed when the approval arrived.
+  // Expand once per new approval, so the user can still collapse the notch.
+  const pendingApprovalId = pendingApproval?.approval_id ?? null;
   useEffect(() => {
-    if (pendingApproval && !isExpanded) {
+    if (pendingApprovalId) {
       toggleExpanded(true);
     }
-  }, [pendingApproval, isExpanded, toggleExpanded]);
+  }, [pendingApprovalId, toggleExpanded]);
 
   // Listen to backend readiness in Electron
   useEffect(() => {
