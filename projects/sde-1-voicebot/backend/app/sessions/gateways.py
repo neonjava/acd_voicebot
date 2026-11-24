@@ -317,7 +317,9 @@ class WorkflowGateway:
             from app.agent.executor import execute
 
             clk = clock or (lambda: datetime.now(timezone.utc))
-            result = execute(plan, approvals=approvals, clock=clk)
+            result = execute(
+                plan, approvals=approvals, clock=clk, correlation_id=correlation_id
+            )
             return result, result.audit_events
 
         except Exception as exc:  # noqa: BLE001

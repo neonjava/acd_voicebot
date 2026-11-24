@@ -428,13 +428,38 @@ class SessionService:
                 f"Approval step_id '{approval.step_id}' is not in "
                 f"plan steps {plan_step_ids}"
             )
+        if approval.approval_id in self._approvals:
+            raise ValueError(f"Approval '{approval.approval_id}' is already registered")
+        for existing in self._approvals.values():
+            if (
+                existing.plan_id == approval.plan_id
+                and existing.step_id == approval.step_id
+            ):
+                raise ValueError(
+                    f"Step '{approval.step_id}' of plan '{approval.plan_id}' "
+                    f"already has approval '{existing.approval_id}'"
+                )
+        stored_plan = self._workflow_plans.get(plan.plan_id)
+        if stored_plan is not None and stored_plan != plan:
+            raise ValueError(
+                f"A different plan is already registered as '{plan.plan_id}'"
+            )
         self._approvals[approval.approval_id] = approval
         self._workflow_plans[plan.plan_id] = plan
 
     def get_pending_approvals(self, session_id: str) -> list[ApprovalRequest]:
         """List all pending approval requests for a session."""
-        if session_id not in self._sessions:
+        sess = self.get_session(session_id, check_expiry=True)
+        if sess is None:
             raise SessionNotFoundError(session_id)
+        # A terminal session can never decide an approval (decide returns 409),
+        # so it has nothing pending.
+        if sess.state in (
+            SessionState.completed,
+            SessionState.failed,
+            SessionState.expired,
+        ):
+            return []
         now = datetime.now(timezone.utc)
         pending: list[ApprovalRequest] = []
         for appr in self._approvals.values():
