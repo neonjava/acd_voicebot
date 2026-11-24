@@ -749,6 +749,56 @@ def test_expired_approval_cannot_be_decided_and_never_executes() -> None:
     assert recorder.calls == []
 
 
+class _SlowCopyRequest(ApprovalRequest):
+    """Holds the first decision inside ``decide`` so a second one can overlap."""
+
+    def model_copy(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        _DECIDING.set()
+        _OVERLAP.wait(0.5)
+        return super().model_copy(*args, **kwargs)
+
+
+_DECIDING = threading.Event()
+_OVERLAP = threading.Event()
+
+
+def test_overlapping_approve_and_reject_accept_only_one_decision() -> None:
+    _DECIDING.clear()
+    _OVERLAP.clear()
+    source = InMemoryApprovalSource()
+    source.register(
+        [
+            _SlowCopyRequest(
+                approval_id="a", plan_id="plan-1", step_id="save", session_id=SESSION
+            )
+        ]
+    )
+    accepted: list[str] = []
+    refused: list[str] = []
+
+    def decide(decision: str) -> None:
+        try:
+            source.decide("a", decision, now=T0)  # type: ignore[arg-type]
+            accepted.append(decision)
+        except ApprovalDecisionError as err:
+            refused.append(err.code)
+
+    approve = threading.Thread(target=decide, args=("approve",))
+    approve.start()
+    assert _DECIDING.wait(2)
+    reject = threading.Thread(target=decide, args=("reject",))
+    reject.start()
+    reject.join(0.2)
+    _OVERLAP.set()
+    approve.join(2)
+    reject.join(2)
+
+    # The UI that rejected must never be told "rejected" while the step runs.
+    assert accepted == ["approve"]
+    assert refused == ["APPROVAL_ALREADY_DECIDED"]
+    assert [a.status for a in source.approvals_for_plan("plan-1")] == ["approved"]
+
+
 def test_approval_source_and_direct_approvals_are_exclusive() -> None:
     plan = make_plan(step("save", "mock_save_note"))
     with pytest.raises(ValueError, match="not both"):
