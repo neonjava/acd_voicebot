@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Protocol
 
 from app.agent import tools
+from app.agent.checkpoint import WorkflowStore
 from app.agent.plan_validation import execution_order
 from app.contracts.workflow import ApprovalRequest, WorkflowPlan
 
@@ -35,26 +36,68 @@ def steps_needing_approval(plan: WorkflowPlan) -> list[str]:
     ]
 
 
-def approval_requests_for(
-    plan: WorkflowPlan, *, now: datetime, ttl_seconds: int = 300
-) -> list[ApprovalRequest]:
-    """Pending requests (with expiry) for every step that needs approval."""
+def _expiry(now: datetime, ttl_seconds: int) -> datetime:
     if now.tzinfo is None or now.utcoffset() != timedelta(0):
         raise ValueError("now must be timezone-aware UTC")
     if type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be a positive integer")
-    expires_at = now + timedelta(seconds=ttl_seconds)
+    return now + timedelta(seconds=ttl_seconds)
+
+
+def _pending(
+    plan: WorkflowPlan, step_id: str, approval_id: str, expires_at: datetime
+) -> ApprovalRequest:
+    return ApprovalRequest(
+        approval_id=approval_id,
+        plan_id=plan.plan_id,
+        step_id=step_id,
+        session_id=plan.session_id,
+        status="pending",
+        expires_at=expires_at,
+    )
+
+
+def approval_requests_for(
+    plan: WorkflowPlan, *, now: datetime, ttl_seconds: int = 300
+) -> list[ApprovalRequest]:
+    """Pending requests (with expiry) for every step that needs approval."""
+    expires_at = _expiry(now, ttl_seconds)
     return [
-        ApprovalRequest(
-            approval_id=f"{plan.plan_id}-approval-{step_id}",
-            plan_id=plan.plan_id,
-            step_id=step_id,
-            session_id=plan.session_id,
-            status="pending",
-            expires_at=expires_at,
-        )
+        _pending(plan, step_id, f"{plan.plan_id}-approval-{step_id}", expires_at)
         for step_id in steps_needing_approval(plan)
     ]
+
+
+def reapproval_requests_for(
+    plan: WorkflowPlan,
+    store: WorkflowStore,
+    *,
+    now: datetime,
+    ttl_seconds: int = 300,
+) -> list[ApprovalRequest]:
+    """Fresh pending requests for steps whose approval is already spent.
+
+    An approval is spent once its step ran or may have run (outcome unknown);
+    the executor then ignores it. To run such a step again the person must
+    decide again, on a request with a new ID: ``{plan_id}-approval-{step_id}-N``
+    with the lowest ``N >= 2`` that the step has not spent. The same call twice
+    returns the same IDs, so registering them twice is ``APPROVAL_DUPLICATE``.
+    Steps restored from the checkpoint need nothing.
+    """
+    expires_at = _expiry(now, ttl_seconds)
+    spent = store.spent_approvals(plan.plan_id)
+    completed = store.completed_steps(plan)
+    requests: list[ApprovalRequest] = []
+    for step_id in steps_needing_approval(plan):
+        used = spent.get(step_id, frozenset())
+        if not used or step_id in completed:
+            continue
+        attempt = len(used) + 1
+        while f"{plan.plan_id}-approval-{step_id}-{attempt}" in used:
+            attempt += 1
+        approval_id = f"{plan.plan_id}-approval-{step_id}-{attempt}"
+        requests.append(_pending(plan, step_id, approval_id, expires_at))
+    return requests
 
 
 class InMemoryApprovalSource:

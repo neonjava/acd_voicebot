@@ -15,6 +15,7 @@ from app.agent.approvals import (
     ApprovalDecisionError,
     InMemoryApprovalSource,
     approval_requests_for,
+    reapproval_requests_for,
     steps_needing_approval,
 )
 from app.agent.checkpoint import WorkflowStore
@@ -380,6 +381,184 @@ def test_concurrent_calls_with_one_idempotency_key_execute_once() -> None:
     assert calls == ["mock_save_note"]
 
 
+# --- Spent approvals, overlapping runs and re-approval (review 2 of #81) -----
+
+
+def test_every_used_approval_stays_used_after_several_unknown_outcomes() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    clock, slow_tool = _advancing_clock(5)
+    calls: list[str] = []
+
+    def late_save(name: str, arguments: Mapping[str, str]) -> str:
+        calls.append(name)
+        return slow_tool(name, arguments)
+
+    kwargs = {
+        "store": store,
+        "clock": clock,
+        "step_timeout_ms": 1000,
+        "invoker": late_save,
+    }
+    first = approved(plan, "save")
+    second = first.model_copy(update={"approval_id": "approval-save-2"})
+    assert execute(plan, approvals=[first], **kwargs).state == WorkflowState.failed
+    assert execute(plan, approvals=[second], **kwargs).state == WorkflowState.failed
+
+    # The first approval was spent by attempt 1; attempt 2 must not revive it.
+    again = execute(plan, approvals=[first], **kwargs)
+    assert again.state == WorkflowState.awaiting_approval
+    assert calls == ["mock_save_note", "mock_save_note"]
+    assert [
+        (e.kind, e.approval_id, e.details_redacted) for e in again.audit_events
+    ] == [("approval_missing", "approval-save", {"reason": "previous_outcome_unknown"})]
+
+
+def test_an_approval_runs_its_step_once_even_after_the_plan_succeeded() -> None:
+    plan = make_plan(step("read"), step("save", "mock_save_note"))
+    source = backend_with_requests(plan)
+    source.decide("plan-1-approval-save", "approve", now=T0)
+    store = WorkflowStore()
+    recorder = Recorder()
+    kwargs = {"approval_source": source, "store": store, "clock": NOW}
+
+    done = execute(plan, invoker=recorder, **kwargs)
+    again = execute(plan, invoker=recorder, **kwargs)
+
+    assert done.state == WorkflowState.succeeded
+    assert again.state == WorkflowState.awaiting_approval
+    assert recorder.calls == [("echo_text", "read"), ("mock_save_note", "save")]
+    assert [
+        (e.kind, e.step_id, e.approval_id, e.details_redacted)
+        for e in again.audit_events
+    ] == [
+        (
+            "approval_missing",
+            "save",
+            "plan-1-approval-save",
+            {"reason": "approval_already_used"},
+        )
+    ]
+
+
+def test_a_tool_failure_does_not_spend_the_approval() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    recorder = Recorder(fail={"save": 1})
+    kwargs = {"approvals": [approved(plan, "save")], "store": store}
+
+    assert execute(plan, invoker=recorder, **kwargs).state == WorkflowState.failed
+    assert execute(plan, invoker=recorder, **kwargs).state == WorkflowState.succeeded
+    assert store.spent_approvals(plan.plan_id) == {"save": frozenset({"approval-save"})}
+
+
+def test_overlapping_runs_of_one_plan_execute_once() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    store = WorkflowStore()
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    results: list[WorkflowState] = []
+
+    def blocking_save(name: str, arguments: Mapping[str, str]) -> str:
+        calls.append(name)
+        entered.set()
+        release.wait(2)
+        return tools.invoke_tool(name, arguments)
+
+    kwargs = {
+        "approvals": [approved(plan, "save")],
+        "store": store,
+        "invoker": blocking_save,
+    }
+    worker = threading.Thread(
+        target=lambda: results.append(
+            execute(plan, idempotency_key="tab-1", **kwargs).state
+        )
+    )
+    worker.start()
+    try:
+        assert entered.wait(2)
+        # No key, or another key: still the same plan, so it must not run again.
+        for key in (None, "tab-2"):
+            with pytest.raises(WorkflowPolicyError) as err:
+                execute(plan, idempotency_key=key, **kwargs)
+            assert err.value.code == "WORKFLOW_RUN_IN_PROGRESS"
+    finally:
+        release.set()
+        worker.join(2)
+
+    assert results == [WorkflowState.succeeded]
+    assert calls == ["mock_save_note"]
+    # The reservation is released: the next call runs (and finds nothing to do
+    # without a fresh approval).
+    assert execute(plan, **kwargs).state == WorkflowState.awaiting_approval
+    assert calls == ["mock_save_note"]
+
+
+def test_fresh_approval_through_the_backend_runs_the_step_again_once() -> None:
+    plan = make_plan(step("save", "mock_save_note"))
+    source = backend_with_requests(plan)
+    source.decide("plan-1-approval-save", "approve", now=T0)
+    store = WorkflowStore()
+    clock, slow_tool = _advancing_clock(5)
+    calls: list[str] = []
+
+    def save(name: str, arguments: Mapping[str, str]) -> str:
+        calls.append(name)
+        return (slow_tool if len(calls) == 1 else tools.invoke_tool)(name, arguments)
+
+    kwargs = {"approval_source": source, "store": store, "invoker": save}
+    timed = execute(plan, clock=clock, step_timeout_ms=1000, **kwargs)
+    assert timed.state == WorkflowState.failed
+    assert execute(plan, clock=clock, **kwargs).state == (
+        WorkflowState.awaiting_approval
+    )
+
+    fresh = reapproval_requests_for(plan, store, now=clock(), ttl_seconds=60)
+    assert [(r.approval_id, r.step_id, r.status) for r in fresh] == [
+        ("plan-1-approval-save-2", "save", "pending")
+    ]
+    source.register(fresh)
+    with pytest.raises(ApprovalDecisionError) as err:
+        source.register(reapproval_requests_for(plan, store, now=clock()))
+    assert err.value.code == "APPROVAL_DUPLICATE"
+    source.decide("plan-1-approval-save-2", "approve", now=clock())
+
+    done = execute(plan, clock=clock, **kwargs)
+    assert done.state == WorkflowState.succeeded
+    assert calls == ["mock_save_note", "mock_save_note"]
+    granted = [e.approval_id for e in done.audit_events if e.kind == "approval_granted"]
+    assert granted == ["plan-1-approval-save-2"]
+    # The fresh approval is spent too; the next request would be "-3".
+    assert execute(plan, clock=clock, **kwargs).state == (
+        WorkflowState.awaiting_approval
+    )
+    assert [r.approval_id for r in reapproval_requests_for(plan, store, now=T0)] == [
+        "plan-1-approval-save-3"
+    ]
+    assert calls == ["mock_save_note", "mock_save_note"]
+
+
+def test_reapproval_is_not_requested_for_unspent_or_restored_steps() -> None:
+    plan = make_plan(
+        step("save", "mock_save_note"),
+        step("note", "mock_save_note", depends_on=("save",)),
+        step("report", depends_on=("note",)),
+    )
+    store = WorkflowStore()
+    recorder = Recorder(fail={"report": 1})
+    approvals = [approved(plan, "save"), approved(plan, "note")]
+    assert execute(plan, approvals=approvals, store=store, invoker=recorder).state == (
+        WorkflowState.failed
+    )
+    # Both notes ran and are in the checkpoint: nothing to re-approve.
+    assert reapproval_requests_for(plan, store, now=T0) == []
+    assert (
+        reapproval_requests_for(make_plan(step("x"), plan_id="p9"), store, now=T0) == []
+    )
+
+
 # --- Audit trail and progress events -------------------------------------------
 
 
@@ -672,6 +851,17 @@ def test_open_url_rejects_hosts_a_browser_would_read_differently(url: str) -> No
         runtime.invoke("open_url", {"url": url})
     assert err.value.code == "WORKFLOW_URL_NOT_ALLOWED"
     assert list(runtime.opener.opened) == []
+
+
+@pytest.mark.parametrize(
+    "url", ["https://[youtube.com/", "https://youtube.com\uff0f@evil.example/"]
+)
+def test_open_url_rejects_links_python_cannot_parse(url: str) -> None:
+    runtime = tools.ToolRuntime()
+    with pytest.raises(WorkflowPolicyError) as err:
+        runtime.invoke("open_url", {"url": url})
+    assert err.value.code == "WORKFLOW_URL_NOT_ALLOWED"
+    assert list(runtime.opener.opened) == []  # type: ignore[attr-defined]
 
 
 def test_open_url_still_opens_allow_listed_url_with_port_and_path() -> None:

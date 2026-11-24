@@ -89,7 +89,12 @@ def _validate_url(arguments: Mapping[str, str], allowed_hosts: frozenset[str]) -
         raise WorkflowPolicyError(
             "WORKFLOW_URL_NOT_ALLOWED", "links with a backslash are not allowed"
         )
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:  # e.g. "https://[x" or NFKC-unsafe characters
+        raise WorkflowPolicyError(
+            "WORKFLOW_URL_NOT_ALLOWED", "this link cannot be parsed safely"
+        ) from exc
     if parts.scheme != "https":
         raise WorkflowPolicyError(
             "WORKFLOW_URL_NOT_ALLOWED", "only https links can be opened"
