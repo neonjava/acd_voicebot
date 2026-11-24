@@ -207,7 +207,13 @@ def test_policy_error_converts_to_safe_envelope() -> None:
 def test_registry_policy_is_fixed() -> None:
     assert tools.TOOL_POLICIES["echo_text"].idempotent is True
     assert tools.TOOL_POLICIES["mock_save_note"].idempotent is False
-    assert set(tools.TOOL_POLICIES) == {"echo_text", "mock_save_note"}
+    # Week 3 (#68) adds exactly two real tools; nothing else may be registered.
+    assert set(tools.TOOL_POLICIES) == {
+        "echo_text",
+        "mock_save_note",
+        "system_stats",
+        "open_url",
+    }
 
 
 # --- Approval, rejection and expiry ------------------------------------------
