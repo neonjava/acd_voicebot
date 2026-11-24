@@ -118,6 +118,7 @@ AuditKind = Literal[
     "step_timed_out",
     "step_retried",
     "workflow_cancelled",
+    "step_restored",
 ]
 
 
