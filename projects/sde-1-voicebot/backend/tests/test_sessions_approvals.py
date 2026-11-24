@@ -350,3 +350,205 @@ def test_deciding_approval_on_failed_session_returns_409(client):
     assert res.status_code == 409
     err = ErrorEnvelope.model_validate(res.json())
     assert err.code == "SESSION_TERMINAL_STATE"
+
+
+def test_approve_with_future_expiry_succeeds_and_executes_step(client):
+    """Approving an approval with future expires_at passes clock and executes step."""
+    session_service.create_session("sess-appr-expiry")
+    step = WorkflowStep(
+        step_id="step-exp",
+        tool_name="echo_text",
+        arguments={"text": "Expiring approval text"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-exp",
+        session_id="sess-appr-expiry",
+        steps=[step],
+    )
+    future_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    appr = ApprovalRequest(
+        approval_id="appr-future-exp",
+        plan_id="plan-exp",
+        step_id="step-exp",
+        session_id="sess-appr-expiry",
+        status="pending",
+        expires_at=future_expiry,
+    )
+    session_service.register_approval(appr, plan)
+
+    res = client.post(
+        "/api/sessions/sess-appr-expiry/approvals/appr-future-exp",
+        json={"decision": "approve"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["approval_id"] == "appr-future-exp"
+    assert data["status"] == "approved"
+
+    events = session_service.get_events("sess-appr-expiry")
+    audits = [e.payload for e in events if e.event_type == "workflow.audit"]
+    assert any(a.kind == "step_succeeded" for a in audits)
+
+
+def test_approval_remains_pending_when_execution_fails(client):
+    """If workflow execution fails, approval status is not saved as approved."""
+    from unittest.mock import patch
+
+    from app.sessions.gateways import GatewayError
+
+    session_service.create_session("sess-appr-fail")
+    step = WorkflowStep(
+        step_id="step-fail-cmd",
+        tool_name="echo_text",
+        arguments={"text": "Fail text"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-fail-cmd",
+        session_id="sess-appr-fail",
+        steps=[step],
+    )
+    appr = ApprovalRequest(
+        approval_id="appr-fail-cmd",
+        plan_id="plan-fail-cmd",
+        step_id="step-fail-cmd",
+        session_id="sess-appr-fail",
+        status="pending",
+    )
+    session_service.register_approval(appr, plan)
+
+    envelope = ErrorEnvelope(
+        code="WORKFLOW_EXECUTION_FAILED",
+        message_safe_for_user="Workflow execution failed.",
+        retryable=False,
+        correlation_id="corr-appr-fail",
+    )
+
+    with patch(
+        "app.sessions.gateways.WorkflowGateway.execute_plan",
+        side_effect=GatewayError(envelope),
+    ):
+        res = client.post(
+            "/api/sessions/sess-appr-fail/approvals/appr-fail-cmd",
+            json={"decision": "approve"},
+        )
+        assert res.status_code == 502
+
+    # Verify approval remains pending (not permanently locked in 409 already decided)
+    pending = session_service.get_pending_approvals("sess-appr-fail")
+    assert len(pending) == 1
+    assert pending[0].approval_id == "appr-fail-cmd"
+    assert pending[0].status == "pending"
+
+
+def test_multi_step_plan_execution_with_multiple_approvals(client):
+    """Multi-step plan executes steps as each required approval completes."""
+    session_service.create_session("sess-multi-plan")
+    step1 = WorkflowStep(
+        step_id="step-1",
+        tool_name="echo_text",
+        arguments={"text": "First action"},
+        requires_approval=True,
+    )
+    step2 = WorkflowStep(
+        step_id="step-2",
+        tool_name="echo_text",
+        arguments={"text": "Second action"},
+        requires_approval=True,
+        depends_on=["step-1"],
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-multi",
+        session_id="sess-multi-plan",
+        steps=[step1, step2],
+    )
+    appr1 = ApprovalRequest(
+        approval_id="appr-multi-1",
+        plan_id="plan-multi",
+        step_id="step-1",
+        session_id="sess-multi-plan",
+        status="pending",
+    )
+    appr2 = ApprovalRequest(
+        approval_id="appr-multi-2",
+        plan_id="plan-multi",
+        step_id="step-2",
+        session_id="sess-multi-plan",
+        status="pending",
+    )
+    session_service.register_approval(appr1, plan)
+    session_service.register_approval(appr2, plan)
+
+    # Approve step 1
+    res1 = client.post(
+        "/api/sessions/sess-multi-plan/approvals/appr-multi-1",
+        json={"decision": "approve"},
+    )
+    assert res1.status_code == 200
+    assert res1.json()["status"] == "approved"
+
+    # Step 2 is still pending
+    pending = session_service.get_pending_approvals("sess-multi-plan")
+    assert len(pending) == 1
+    assert pending[0].approval_id == "appr-multi-2"
+
+    # Approve step 2
+    res2 = client.post(
+        "/api/sessions/sess-multi-plan/approvals/appr-multi-2",
+        json={"decision": "approve"},
+    )
+    assert res2.status_code == 200
+    assert res2.json()["status"] == "approved"
+
+    # Both steps executed
+    events = session_service.get_events("sess-multi-plan")
+    audits = [e.payload for e in events if e.event_type == "workflow.audit"]
+    succeeded_steps = [a.step_id for a in audits if a.kind == "step_succeeded"]
+    assert "step-1" in succeeded_steps
+    assert "step-2" in succeeded_steps
+
+
+def test_register_approval_validates_plan_consistency():
+    """register_approval enforces matching plan_id, session_id, and step_id."""
+    step = WorkflowStep(
+        step_id="step-ok",
+        tool_name="echo_text",
+        arguments={"text": "consistent"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(
+        plan_id="plan-ok",
+        session_id="sess-ok",
+        steps=[step],
+    )
+
+    # Mismatched plan_id
+    bad_plan_id = ApprovalRequest(
+        approval_id="appr-bad-1",
+        plan_id="plan-mismatch",
+        step_id="step-ok",
+        session_id="sess-ok",
+    )
+    with pytest.raises(ValueError, match="does not match plan"):
+        session_service.register_approval(bad_plan_id, plan)
+
+    # Mismatched session_id
+    bad_sess_id = ApprovalRequest(
+        approval_id="appr-bad-2",
+        plan_id="plan-ok",
+        step_id="step-ok",
+        session_id="sess-mismatch",
+    )
+    with pytest.raises(ValueError, match="does not match plan"):
+        session_service.register_approval(bad_sess_id, plan)
+
+    # Mismatched step_id
+    bad_step_id = ApprovalRequest(
+        approval_id="appr-bad-3",
+        plan_id="plan-ok",
+        step_id="step-nonexistent",
+        session_id="sess-ok",
+    )
+    with pytest.raises(ValueError, match="not in plan steps"):
+        session_service.register_approval(bad_step_id, plan)

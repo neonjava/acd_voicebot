@@ -200,14 +200,15 @@ def test_fixture_matches_service_output():
 
 def test_post_mock_session_rejects_mismatched_event_session_ids(client):
     """Transcriber returning mismatched session ID fails response validation."""
-    fake_pcm = bytes(32000)
-    fake_chunks = [MagicMock() for _ in range(50)]
 
     def mismatched_transcribe(
-        audio_chunks,
+        _self,
+        _chunks,
+        *,
         session_id: str,
         correlation_id: str,
-        timestamp: datetime | None = None,
+        timestamp: datetime,
+        preprocess: bool = True,
     ):
         ts = timestamp or datetime.now(timezone.utc)
         fake_segment = TranscriptSegment(
@@ -233,22 +234,9 @@ def test_post_mock_session_rejects_mismatched_event_session_ids(client):
         )
         return [fake_event]
 
-    mock_transcriber = MagicMock()
-    mock_transcriber.transcribe.side_effect = mismatched_transcribe
-
-    modules = {
-        "app.audio": MagicMock(),
-        "app.audio.source": MagicMock(make_fake_pcm=MagicMock(return_value=fake_pcm)),
-        "app.audio.chunker": MagicMock(chunk_pcm=MagicMock(return_value=fake_chunks)),
-        "app.transcription": MagicMock(),
-        "app.transcription.mock": MagicMock(
-            FakeTranscriber=MagicMock(return_value=mock_transcriber)
-        ),
-    }
-
-    with (
-        patch("importlib.util.find_spec", return_value=MagicMock()),
-        patch.dict("sys.modules", modules),
+    with patch(
+        "app.transcription.orchestrator.TranscriptionOrchestrator.process_chunks",
+        mismatched_transcribe,
     ):
         response = client.post("/api/sessions/mock", json={})
         assert response.status_code == 500
