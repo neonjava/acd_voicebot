@@ -4,6 +4,7 @@ import logging
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from app.contracts.audio import AudioChunk, SpeechEvent
 from app.contracts.common import ErrorEnvelope
@@ -80,7 +81,12 @@ class AudioGateway:
                 )
             ]
 
-            # Ordered SpeechEvents: wake -> speech_start -> speech_end
+            from app.audio.vad import MockVAD
+
+            vad = MockVAD()
+            spans = vad.detect(chunks)
+
+            # Ordered SpeechEvents: synthetic wake, followed by MockVAD spans
             speech_events = [
                 SpeechEvent(
                     kind="wake",
@@ -90,22 +96,30 @@ class AudioGateway:
                     at_ms=0,
                     wake_word="hey_jarvis",
                     score=0.96,
-                ),
-                SpeechEvent(
-                    kind="speech_start",
-                    session_id=session_id,
-                    correlation_id=correlation_id,
-                    sequence_id=1,
-                    at_ms=20,
-                ),
-                SpeechEvent(
-                    kind="speech_end",
-                    session_id=session_id,
-                    correlation_id=correlation_id,
-                    sequence_id=2,
-                    at_ms=duration_ms,
-                ),
+                )
             ]
+            seq = 1
+            for span in spans:
+                speech_events.append(
+                    SpeechEvent(
+                        kind="speech_start",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        sequence_id=seq,
+                        at_ms=span.start_ms,
+                    )
+                )
+                seq += 1
+                speech_events.append(
+                    SpeechEvent(
+                        kind="speech_end",
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                        sequence_id=seq,
+                        at_ms=span.end_ms,
+                    )
+                )
+                seq += 1
 
             return chunks, metadata, speech_events
 
@@ -126,10 +140,10 @@ class TranscriptionGateway:
     def health(self) -> ModuleHealthStatus:
         """Check transcription subsystem health."""
         try:
-            from app.transcription.mock import FakeTranscriber
+            from app.transcription.orchestrator import TranscriptionOrchestrator
 
-            transcriber = FakeTranscriber()
-            return "mock" if transcriber.health() == "ready" else "down"
+            orchestrator = TranscriptionOrchestrator()
+            return "mock" if orchestrator.health() == "ready" else "down"
         except Exception as exc:  # noqa: BLE001
             logger.warning("Transcription health check failed: %s", type(exc).__name__)
             return "down"
@@ -142,16 +156,16 @@ class TranscriptionGateway:
         correlation_id: str,
         timestamp: datetime | None = None,
     ) -> list[TranscriptEvent]:
-        """Call W2 transcriber and normalize output."""
+        """Call W2 orchestrator and normalize output."""
         ts = timestamp or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
         try:
-            from app.transcription.mock import FakeTranscriber
+            from app.transcription.orchestrator import TranscriptionOrchestrator
 
-            transcriber = FakeTranscriber()
-            return transcriber.transcribe(
+            orchestrator = TranscriptionOrchestrator()
+            return orchestrator.process_chunks(
                 chunks,
                 session_id=session_id,
                 correlation_id=correlation_id,
@@ -239,10 +253,11 @@ class WorkflowGateway:
         correlation_id: str,
         text_to_echo: str,
         source_ids: list[str] | None = None,
+        expires_at: datetime | None = None,
     ) -> tuple[WorkflowProposal, WorkflowPlan, ApprovalRequest]:
-        """Construct a proposal, plan, and initial approval request."""
+        """Construct a proposal, plan, and initial approval request from evidence."""
         try:
-            plan_id = f"plan-{uuid.uuid4().hex[:8]}"
+            proposal_id = f"prop-{uuid.uuid4().hex[:8]}"
             step_id = f"step-{uuid.uuid4().hex[:6]}"
             approval_id = f"appr-{uuid.uuid4().hex[:8]}"
 
@@ -253,28 +268,29 @@ class WorkflowGateway:
                 requires_approval=True,
             )
 
-            srcs = source_ids or [f"src-{uuid.uuid4().hex[:6]}"]
             proposal = WorkflowProposal(
-                proposal_id=f"prop-{uuid.uuid4().hex[:8]}",
+                proposal_id=proposal_id,
                 session_id=session_id,
                 correlation_id=correlation_id,
                 summary=f"Echo reasoning response: {text_to_echo[:60]}",
                 steps=[step],
-                source_ids=srcs,
+                source_ids=list(dict.fromkeys(source_ids or [])),
             )
 
+            # Link plan to proposal ID and use proposal steps
             plan = WorkflowPlan(
-                plan_id=plan_id,
+                plan_id=proposal.proposal_id,
                 session_id=session_id,
-                steps=[step],
+                steps=proposal.steps,
             )
 
             approval = ApprovalRequest(
                 approval_id=approval_id,
-                plan_id=plan_id,
+                plan_id=plan.plan_id,
                 step_id=step_id,
                 session_id=session_id,
                 status="pending",
+                expires_at=expires_at,
             )
 
             return proposal, plan, approval
@@ -294,12 +310,14 @@ class WorkflowGateway:
         approvals: Sequence[ApprovalRequest],
         *,
         correlation_id: str,
+        clock: Any | None = None,
     ) -> tuple[WorkflowResult, list[AuditEvent]]:
         """Execute workflow plan using W4 executor and generate AuditEvents."""
         try:
             from app.agent.executor import execute
 
-            result = execute(plan, approvals=approvals)
+            clk = clock or (lambda: datetime.now(timezone.utc))
+            result = execute(plan, approvals=approvals, clock=clk)
             return result, result.audit_events
 
         except Exception as exc:  # noqa: BLE001

@@ -407,10 +407,26 @@ class SessionService:
     def register_approval(
         self, approval: ApprovalRequest, plan: WorkflowPlan | None = None
     ) -> None:
-        """Register an approval request and its required associated workflow plan."""
+        """Register approval request and validate consistency with workflow plan."""
         if plan is None:
             raise ValueError(
                 "Workflow plan is required when registering an approval request"
+            )
+        if approval.plan_id != plan.plan_id:
+            raise ValueError(
+                f"Approval plan_id '{approval.plan_id}' does not match "
+                f"plan '{plan.plan_id}'"
+            )
+        if approval.session_id != plan.session_id:
+            raise ValueError(
+                f"Approval session_id '{approval.session_id}' does not match "
+                f"plan '{plan.session_id}'"
+            )
+        plan_step_ids = {s.step_id for s in plan.steps}
+        if approval.step_id not in plan_step_ids:
+            raise ValueError(
+                f"Approval step_id '{approval.step_id}' is not in "
+                f"plan steps {plan_step_ids}"
             )
         self._approvals[approval.approval_id] = approval
         self._workflow_plans[plan.plan_id] = plan
@@ -475,15 +491,23 @@ class SessionService:
         if plan is None:
             raise MissingWorkflowPlanError(approval.plan_id)
 
-        # 5. Update approval
+        # 5. Update approval (storing new status only after execute_plan succeeds)
         new_status = "approved" if decision == "approve" else "rejected"
         updated = approval.model_copy(update={"status": new_status})
-        self._approvals[approval_id] = updated
 
         cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+        plan_approvals = [
+            updated if a.approval_id == approval_id else a
+            for a in self._approvals.values()
+            if a.plan_id == plan.plan_id
+        ]
+        if not any(a.approval_id == approval_id for a in plan_approvals):
+            plan_approvals.append(updated)
+
         workflow_result, audit_events = workflow_gateway.execute_plan(
-            plan, [updated], correlation_id=cid
+            plan, plan_approvals, correlation_id=cid, clock=lambda: ts
         )
+        self._approvals[approval_id] = updated
         for audit in audit_events:
             audit_envelope = WorkflowAuditEvent(
                 event_id=f"event-audit-{uuid.uuid4().hex[:8]}",
@@ -536,9 +560,9 @@ class SessionService:
         *,
         session_id: str | None = None,
         correlation_id: str | None = None,
-        question: str = "What was said?",
+        question: str | None = None,
         timestamp: datetime | None = None,
-        auto_approve: bool = True,
+        auto_approve: bool = False,
     ) -> tuple[SessionRecord, list[SessionEvent]]:
         """Route session through audio, transcription, reasoning, and workflow."""
         sid = session_id or f"session-{uuid.uuid4().hex[:12]}"
@@ -617,33 +641,49 @@ class SessionService:
                 if isinstance(tr_evt.payload, TranscriptSegment):
                     segments.append(tr_evt.payload)
 
-            # 3. Reasoning Gateway
+            # 3. Reasoning Gateway (question built from user words in transcript)
+            final_text = " ".join(seg.text for seg in segments if seg.is_final).strip()
+            fallback_q = question or "What was said?"
+            effective_question = final_text if final_text else fallback_q
+
             reasoning_result = reasoning_gateway.reason_from_transcript(
                 session_id=sid,
                 correlation_id=cid,
                 segments=segments,
-                question=question,
+                question=effective_question,
             )
 
-            # 4. Workflow Gateway
-            prop, plan, approval = workflow_gateway.build_proposal_and_plan(
-                session_id=sid,
-                correlation_id=cid,
-                text_to_echo=reasoning_result.answer,
-                source_ids=reasoning_result.source_ids,
-            )
-            self.register_approval(approval, plan)
+            # 4. Workflow Gateway (only when grounded evidence exists)
+            from datetime import timedelta
 
-            if auto_approve:
-                self.decide_approval(
-                    sid,
-                    approval.approval_id,
-                    "approve",
-                    now=ts,
+            appr_expiry = ts + timedelta(hours=1)
+
+            has_evidence = not reasoning_result.insufficient_evidence and bool(
+                reasoning_result.source_ids
+            )
+            if has_evidence:
+                prop, plan, approval = workflow_gateway.build_proposal_and_plan(
+                    session_id=sid,
                     correlation_id=cid,
+                    text_to_echo=reasoning_result.answer,
+                    source_ids=reasoning_result.source_ids,
+                    expires_at=appr_expiry,
                 )
-                completed_record = self.transition(sid, SessionState.completed, now=ts)
-                return completed_record, self._session_events.get(sid, [])
+                if approval is not None and plan is not None:
+                    self.register_approval(approval, plan)
+
+                    if auto_approve:
+                        self.decide_approval(
+                            sid,
+                            approval.approval_id,
+                            "approve",
+                            now=ts,
+                            correlation_id=cid,
+                        )
+                        completed_record = self.transition(
+                            sid, SessionState.completed, now=ts
+                        )
+                        return completed_record, self._session_events.get(sid, [])
 
             current_record = self.get_session(sid, check_expiry=False)
             return current_record, self._session_events.get(sid, [])

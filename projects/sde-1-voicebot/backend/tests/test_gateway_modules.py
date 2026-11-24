@@ -86,7 +86,7 @@ def test_transcription_gateway_error_normalization():
     """Exceptions in transcription are normalized into ErrorEnvelope."""
     gw = TranscriptionGateway()
     with patch(
-        "app.transcription.mock.FakeTranscriber.transcribe",
+        "app.transcription.orchestrator.TranscriptionOrchestrator.process_chunks",
         side_effect=ValueError("Model crashed"),
     ):
         with pytest.raises(GatewayError) as exc_info:
@@ -273,3 +273,115 @@ def test_reasoning_gateway_does_not_swallow_validation_errors():
             segments=["not-a-segment"],  # Invalid segment type
         )
     assert exc_info.value.envelope.code == "REASONING_FAILED"
+
+
+def test_audio_gateway_generates_speech_events_from_vad_spans():
+    """AudioGateway produces speech_start and speech_end from MockVAD spans."""
+    gw = AudioGateway()
+    chunks, metadata, speech_events = gw.produce_audio_and_speech(
+        session_id="session-vad-test",
+        correlation_id="corr-vad-test",
+        duration_ms=1000,
+    )
+    assert len(chunks) > 0
+    assert len(metadata) == 1
+    assert len(speech_events) >= 3
+
+    # First event is synthetic wake
+    assert speech_events[0].kind == "wake"
+    assert speech_events[0].sequence_id == 0
+
+    # Remaining events are speech_start / speech_end pairs with monotonic sequences
+    for i, evt in enumerate(speech_events[1:], start=1):
+        assert evt.sequence_id == i
+        assert evt.kind in ("speech_start", "speech_end")
+
+
+def test_transcription_gateway_delegates_to_orchestrator():
+    """TranscriptionGateway delegates to TranscriptionOrchestrator."""
+    audio_gw = AudioGateway()
+    chunks, _, _ = audio_gw.produce_audio_and_speech(
+        session_id="session-orch-test",
+        correlation_id="corr-orch-test",
+    )
+    trans_gw = TranscriptionGateway()
+    events = trans_gw.transcribe(
+        chunks,
+        session_id="session-orch-test",
+        correlation_id="corr-orch-test",
+    )
+    assert len(events) > 0
+    assert events[0].event_type == "transcript.segment"
+    assert events[0].session_id == "session-orch-test"
+
+
+def test_pipeline_skips_proposal_when_reasoning_lacks_evidence():
+    """Pipeline creates no proposal or approval if reasoning has no grounded sources."""
+    from unittest.mock import patch
+
+    from app.contracts.reasoning import ReasoningResult
+
+    mock_res = ReasoningResult(
+        request_id="req-no-ev",
+        session_id="session-no-ev",
+        answer="I do not have enough evidence to answer.",
+        source_ids=[],
+        insufficient_evidence=True,
+        prompt_version="v1",
+    )
+
+    with patch(
+        "app.sessions.gateways.ReasoningGateway.reason_from_transcript",
+        return_value=mock_res,
+    ):
+        record, events = session_service.run_pipeline_session(
+            session_id="session-no-ev",
+            correlation_id="corr-no-ev",
+            auto_approve=False,
+        )
+        assert record.session_id == "session-no-ev"
+        pending = session_service.get_pending_approvals("session-no-ev")
+        assert len(pending) == 0
+
+
+def test_pipeline_builds_question_from_final_transcript_segments():
+    """Pipeline builds effective question from final transcript segments."""
+    from unittest.mock import patch
+
+    with patch(
+        "app.sessions.gateways.ReasoningGateway.reason_from_transcript"
+    ) as mock_reason:
+        from app.contracts.reasoning import ReasoningResult
+
+        mock_reason.return_value = ReasoningResult(
+            request_id="req-q-test",
+            session_id="session-q-test",
+            answer="Answer to user words",
+            source_ids=["session-q-test-segment-0"],
+            insufficient_evidence=False,
+            prompt_version="v1",
+        )
+        session_service.run_pipeline_session(
+            session_id="session-q-test",
+            correlation_id="corr-q-test",
+            auto_approve=False,
+        )
+        assert mock_reason.call_count == 1
+        _, kwargs = mock_reason.call_args
+        # Mock transcriber produces "Hello from the mock voicebot."
+        assert "Hello from the mock voicebot." in kwargs["question"]
+
+
+def test_workflow_gateway_links_plan_to_proposal():
+    """WorkflowGateway links plan_id to proposal and uses proposal steps."""
+    gw = WorkflowGateway()
+    prop, plan, appr = gw.build_proposal_and_plan(
+        session_id="session-wf-link",
+        correlation_id="corr-wf-link",
+        text_to_echo="Linked plan echo",
+        source_ids=["src-1"],
+    )
+    assert prop.proposal_id == plan.plan_id
+    assert plan.steps == prop.steps
+    assert appr.plan_id == plan.plan_id
+    assert appr.step_id == plan.steps[0].step_id
