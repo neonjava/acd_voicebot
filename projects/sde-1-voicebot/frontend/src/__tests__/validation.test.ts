@@ -271,6 +271,11 @@ describe('Runtime Validation', () => {
       expect(res.kind).toBe('synthetic_screen');
     });
 
+    it('accepts note sources from the Week 4 RAG contract', () => {
+      const res = validateSourceReference({ ...validSource, kind: 'note' });
+      expect(res.kind).toBe('note');
+    });
+
     it('rejects invalid SourceReference', () => {
       expect(() => validateSourceReference({ source_id: '', locator: 'loc' })).toThrow(MalformedResponseError);
       expect(() => validateSourceReference(null)).toThrow(MalformedResponseError);

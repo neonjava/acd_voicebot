@@ -317,9 +317,9 @@ export function validateSourceReference(val: unknown): SourceReference {
     throw new MalformedResponseError('SourceReference missing non-empty "locator"');
   }
 
-  if (val.kind !== 'synthetic_screen' && val.kind !== 'transcript') {
+  if (val.kind !== 'synthetic_screen' && val.kind !== 'transcript' && val.kind !== 'note') {
     throw new MalformedResponseError(
-      `SourceReference "kind" must be "synthetic_screen" or "transcript", got "${val.kind}"`
+      `SourceReference "kind" must be "synthetic_screen", "transcript" or "note", got "${val.kind}"`
     );
   }
 

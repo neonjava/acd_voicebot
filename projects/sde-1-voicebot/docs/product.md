@@ -109,6 +109,19 @@ Each issue = the internship task (mandatory, checked by reviewers) + the product
 
 Scenarios S1–S5 end to end on Fedora and Windows. RAG over opted-in folders, YouTube via Playwright, Piper voice replies, glow overlay, packaging (AppImage/RPM and Windows installer), failure handling, demo video.
 
+### Week 4 status and plan (hardening and Day 30 demo)
+
+Week 3 merged all six modules (858 tests). The Week 4 issues finish the real conversation loop and harden it for the Day 30 release gate (clean-clone setup, full demo with a normal path and a failure path, critical defects fixed, tests and CI green, README and known limitations):
+
+| Member | Official Week 4 task | Product step |
+|---|---|---|
+| Hemanth (W1) | Profiling, stress tests, privacy checks, troubleshooting guide | Live mic capture loop with `CaptureStatus` for the notch indicator |
+| Megha (W2) | Latency benchmark, long-session consistency, redacted logging, provider guide | Piper text-to-speech for short spoken replies |
+| Saanvi (W3) | Golden test set, privacy and consent tests, latency, data-handling docs | Notes search (RAG, S5), redaction before the prompt |
+| Shalini (W4) | Failure-injection tests, replay fixtures, policy matrix, runbook | `play_youtube` and `close_app` tools (S2, S4) |
+| Rakshita (W5) | Concurrency and malformed-request tests, log hygiene, OpenAPI examples, runbook, clean-clone check | `/turns` conversation endpoint wiring W1→W2→W3→W4, listen and capture endpoints, speech audio |
+| Ruthwin (W6) | End-to-end tests, accessibility, demo mode, troubleshooting guide | Notch polish (eyes, step chips, diff card, glow), talk and type input, spoken replies |
+
 ## 8. Rules for AI-agent-written code (Antigravity and others)
 
 - Read this document, the issue, `docs/contracts.md` and `AGENTS.md` first. Implement only the issue.
