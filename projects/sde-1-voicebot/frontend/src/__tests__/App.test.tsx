@@ -1455,5 +1455,129 @@ describe('Voicebot App Component', () => {
       expect(screen.getByTestId('approval-dialog')).toBeInTheDocument();
       expect(screen.queryByText(/Step execution prevented/i)).not.toBeInTheDocument();
     });
+
+    it('surfaces transcript.error and marks session failed when replayed during reconnect', async () => {
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          session_id: 'sess-err-replay',
+          state: 'active',
+          mode: 'mock',
+          events: [
+            {
+              event_id: 'evt-init-seg',
+              event_type: 'transcript.segment',
+              schema_version: '1.0',
+              session_id: 'sess-err-replay',
+              correlation_id: 'corr-1',
+              timestamp: '2026-01-01T00:00:00Z',
+              producer: 'transcription',
+              payload: {
+                segment_id: 'seg-1',
+                session_id: 'sess-err-replay',
+                sequence_id: 0,
+                start_ms: 0,
+                end_ms: 500,
+                text: 'Initial segment before error',
+                confidence: 0.9,
+                language: 'en',
+                is_final: true,
+              },
+            },
+          ],
+        }),
+        getEvents: vi.fn().mockResolvedValue({
+          session_id: 'sess-err-replay',
+          from_sequence: 1,
+          total_events: 2,
+          has_more: false,
+          events: [
+            {
+              event_id: 'evt-err-replayed',
+              event_type: 'transcript.error',
+              schema_version: '1.0',
+              session_id: 'sess-err-replay',
+              correlation_id: 'corr-err',
+              timestamp: '2026-01-01T00:00:01Z',
+              producer: 'transcription',
+              payload: {
+                code: 'MODEL_TIMEOUT',
+                message_safe_for_user: 'Replayed speech recognizer service timed out.',
+                retryable: true,
+                correlation_id: 'corr-err',
+                details_redacted: {},
+              },
+            },
+          ],
+        }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Initial segment before error')).toBeInTheDocument();
+      });
+
+      // Trigger reconnect to replay missed events
+      fireEvent.click(screen.getByTestId('reconnect-button'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i);
+        expect(screen.getByText('Transcript Error')).toBeInTheDocument();
+        expect(screen.getByText('Replayed speech recognizer service timed out.')).toBeInTheDocument();
+      });
+    });
+
+    it('surfaces transcript.error and marks session failed when received over live stream', async () => {
+      let streamCallback: ((events: unknown[]) => void) | null = null;
+
+      const mockClient: SessionClient = {
+        startMockSession: vi.fn().mockResolvedValue({
+          session_id: 'sess-stream-err',
+          state: 'active',
+          mode: 'mock',
+          events: [],
+        }),
+        subscribeToEvents: vi.fn().mockImplementation((_sessId, opts) => {
+          streamCallback = opts.onEvents;
+          return { unsubscribe: vi.fn() };
+        }),
+      };
+
+      render(<App customClient={mockClient} />);
+      fireEvent.click(screen.getByTestId('start-button'));
+
+      await waitFor(() => {
+        expect(mockClient.subscribeToEvents).toHaveBeenCalledTimes(1);
+      });
+
+      // Stream delivers transcript.error event
+      act(() => {
+        streamCallback?.([
+          {
+            event_id: 'evt-live-err',
+            event_type: 'transcript.error',
+            schema_version: '1.0',
+            session_id: 'sess-stream-err',
+            correlation_id: 'corr-live-err',
+            timestamp: '2026-01-01T00:00:02Z',
+            producer: 'transcription',
+            payload: {
+              code: 'AUDIO_STREAM_CORRUPTED',
+              message_safe_for_user: 'Live audio stream was corrupted during transcription.',
+              retryable: false,
+              correlation_id: 'corr-live-err',
+              details_redacted: {},
+            },
+          },
+        ]);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('ui-state-indicator')).toHaveTextContent(/failed/i);
+        expect(screen.getByText('Transcript Error')).toBeInTheDocument();
+        expect(screen.getByText('Live audio stream was corrupted during transcription.')).toBeInTheDocument();
+      });
+    });
   });
 });

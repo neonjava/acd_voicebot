@@ -344,6 +344,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                   if (sessionToken !== currentSessionTokenRef.current) return;
                   let hasNewSegs = false;
                   let hasNewAuds = false;
+                  let streamTranscriptError: ErrorEnvelope | null = null;
                   const newAuds: AuditEvent[] = [];
                   const newAudio: EventEnvelope<AudioChunkMetadata>[] = [];
 
@@ -359,7 +360,23 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                     } else if (evt.event_type === 'workflow.audit') {
                       newAuds.push(evt.payload as AuditEvent);
                       hasNewAuds = true;
+                    } else if (evt.event_type === 'transcript.error') {
+                      streamTranscriptError = evt.payload as ErrorEnvelope;
                     }
+                  }
+
+                  if (streamTranscriptError) {
+                    setError({
+                      type: 'backend',
+                      title: 'Transcript Error',
+                      message: streamTranscriptError.message_safe_for_user,
+                      code: streamTranscriptError.code,
+                      correlationId: streamTranscriptError.correlation_id,
+                      retryable: streamTranscriptError.retryable,
+                    });
+                    setUiState('failed');
+                    setStatusMessage(`Session transcription failed: ${streamTranscriptError.message_safe_for_user}`);
+                    return;
                   }
 
                   if (hasNewSegs) {
@@ -580,6 +597,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     try {
       let fromSequence = seenEventIdsRef.current.size;
       let hasMore = true;
+      let transcriptErrorEnvelope: ErrorEnvelope | null = null;
       const newAudits: AuditEvent[] = [];
       const newAudioChunks: EventEnvelope<AudioChunkMetadata>[] = [];
       let hasNewSegments = false;
@@ -611,11 +629,27 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
             newAudioChunks.push(evt as EventEnvelope<AudioChunkMetadata>);
           } else if (evt.event_type === 'workflow.audit') {
             newAudits.push(evt.payload as AuditEvent);
+          } else if (evt.event_type === 'transcript.error') {
+            transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
           }
         }
 
         fromSequence = streamRes.from_sequence + streamRes.events.length;
         hasMore = Boolean(streamRes.has_more);
+      }
+
+      if (transcriptErrorEnvelope) {
+        setError({
+          type: 'backend',
+          title: 'Transcript Error',
+          message: transcriptErrorEnvelope.message_safe_for_user,
+          code: transcriptErrorEnvelope.code,
+          correlationId: transcriptErrorEnvelope.correlation_id,
+          retryable: transcriptErrorEnvelope.retryable,
+        });
+        setUiState('failed');
+        setStatusMessage(`Session transcription failed: ${transcriptErrorEnvelope.message_safe_for_user}`);
+        return;
       }
 
       if (hasNewSegments) {
