@@ -149,8 +149,22 @@ Week 4 connects every module into the real conversation loop for the Day 30 demo
 |---|---|---|---|
 | `system_stats` | none | safe | S3 |
 | `open_url` | `url` (https, allow-listed) | safe | S2 |
-| `play_youtube` | `query`, `index` (1-based, as a string) | safe; opens YouTube search and plays that result (Playwright, `browser` extra) | S2 |
+| `browser_task` | `goal`, `start_url` (https) | **consequential**: one approval per task (see "Browser agent" below) | S1, S2 and any web task |
 | `close_app` | `app` | **consequential** (always asks first) | S4 |
+
+### Browser agent: extension bridge (`app/contracts/browser.py`)
+
+Jarvis works inside the user's own browser like a browser co-pilot: it reads the page, then clicks, types, navigates and scrolls, one action at a time.
+
+- **Extension (W1)** `projects/sde-1-voicebot/extension/`: Chrome/Chromium Manifest V3. It connects to `ws://127.0.0.1:<VOICEBOT_PORT>/api/bridge`; the first message must be `{"type":"hello","token":"<VOICEBOT_LAUNCH_TOKEN>","version":"..."}`, otherwise the server closes the socket. It executes `BrowserAction`s on the active tab and replies with `BrowserActionResult` (including a fresh `PageSnapshot`). Inside the page it draws the **thread cursor** that moves to each element it acts on, and a thin glow border while a task runs.
+- **Bridge (W5)**: `/api/bridge` WebSocket. Messages are JSON `{"type": "hello"|"action"|"result"|"bye", ...}`. Server → extension: `{"type":"action","action":BrowserAction}`. Extension → server: `{"type":"result","result":BrowserActionResult}`. Exactly one extension connection is active per backend; one action is in flight at a time, with a 15 s timeout (`BROWSER_ACTION_TIMEOUT`).
+- **Agent loop (W3)**: snapshot → choose the next `BrowserAction` (local LLM, or the deterministic mock) → result → repeat until done, at most 25 actions per task. `PageSnapshot.text` and element names are **untrusted data**: they never change the goal or add actions the user did not ask for.
+- **Policy (W4)**, one approval per task: the user approves the plan once (`browser_task` goal and start site). After that the agent may read, navigate, click, scroll and type within the task's site (the start URL's domain, plus domains the user named). It must stop and ask again before:
+  - typing into a `sensitive` field (password, card, one-time code);
+  - submitting anything that pays, buys, deletes, sends or posts;
+  - leaving the allowed domains.
+- **Events**: `event_type="browser.action"`, `producer="browser"`, with payload `{action: BrowserAction, ok, error_code}` (no snapshot text), so the companion UI can show step chips.
+- Without the extension connected, `browser_task` returns the safe error `BROWSER_NOT_CONNECTED`. Mock mode uses a fake extension in tests.
 
 ### W3: notes (RAG)
 
@@ -159,7 +173,7 @@ Week 4 connects every module into the real conversation loop for the Day 30 demo
 
 ### New optional extras
 
-- `browser`: Playwright (W4 `play_youtube`). Browsers are installed with `uv run playwright install chromium`, never in tests.
+- `browser`: Playwright, used only for automated end-to-end tests of the extension (optional). Browsers are installed with `uv run playwright install chromium`, never in normal tests.
 - `tts`: Piper (W2 text-to-speech). Voice models are downloaded on first use, never committed.
 
 ## File locations and handoffs
