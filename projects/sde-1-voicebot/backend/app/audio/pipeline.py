@@ -357,23 +357,24 @@ class SpeechPipeline:
         else:
             self._active_span_end = span_end
 
-        if chunk_end_ms - span_start >= self.config.max_utterance_ms:
+        if chunk_end_ms - span_end >= self.config.speech_end_silence_ms:
+            self._close_active_span(
+                timestamp=timestamp,
+                out_events=out_events,
+                out_chunks=out_chunks,
+                out_transcripts=out_transcripts,
+            )
+        elif span_end - span_start >= self.config.max_utterance_ms:
             # Very long speech is split; listening stays open so the rest of
             # the sentence becomes the next utterance instead of being lost.
-            self._active_span_end = chunk_end_ms
+            # Only the speech counts: trailing silence during the hangover
+            # never reaches the cap, so a finished command ends normally.
             self._close_active_span(
                 timestamp=timestamp,
                 out_events=out_events,
                 out_chunks=out_chunks,
                 out_transcripts=out_transcripts,
                 keep_listening=True,
-            )
-        elif chunk_end_ms - span_end >= self.config.speech_end_silence_ms:
-            self._close_active_span(
-                timestamp=timestamp,
-                out_events=out_events,
-                out_chunks=out_chunks,
-                out_transcripts=out_transcripts,
             )
 
         return PipelineStepResult(
