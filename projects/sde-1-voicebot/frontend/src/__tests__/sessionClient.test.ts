@@ -131,7 +131,13 @@ describe('SessionClient implementations', () => {
       }
     });
 
-    it('reports DEPENDENCY_UNAVAILABLE when calling pause or resume without inventing fake routes', async () => {
+    it('reports DEPENDENCY_UNAVAILABLE when calling pause, resume or getSessionState on 404 or 501', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        json: async () => ({}),
+      });
       const client = new HttpSessionClient('/api/sessions/mock');
 
       await expect(client.pauseSession('sess-123')).rejects.toThrow(BackendError);
@@ -141,7 +147,7 @@ describe('SessionClient implementations', () => {
         expect(e).toBeInstanceOf(BackendError);
         const err = e as BackendError;
         expect(err.code).toBe('DEPENDENCY_UNAVAILABLE');
-        expect(err.details.dependency).toContain('pause/resume');
+        expect(err.details.dependency).toContain('pause');
       }
 
       await expect(client.resumeSession('sess-123')).rejects.toThrow(BackendError);
@@ -151,9 +157,18 @@ describe('SessionClient implementations', () => {
         expect(e).toBeInstanceOf(BackendError);
         const err = e as BackendError;
         expect(err.code).toBe('DEPENDENCY_UNAVAILABLE');
+        expect(err.details.dependency).toContain('resume');
       }
 
       await expect(client.getSessionState('sess-123')).rejects.toThrow(BackendError);
+      try {
+        await client.getSessionState('sess-123');
+      } catch (e) {
+        expect(e).toBeInstanceOf(BackendError);
+        const err = e as BackendError;
+        expect(err.code).toBe('DEPENDENCY_UNAVAILABLE');
+        expect(err.details.dependency).toContain('session query');
+      }
     });
 
     it('parses backend ErrorEnvelope when response is not ok', async () => {
@@ -295,6 +310,89 @@ describe('SessionClient implementations', () => {
 
       const decision = await client.decideApproval('sess-1', 'appr-1', 'reject');
       expect(decision.status).toBe('rejected');
+    });
+
+    it('calls pause and resume endpoints over HTTP with Bearer token and validates returned state', async () => {
+      const mockFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        expect(init?.headers).toMatchObject({
+          Authorization: 'Bearer test-token-123',
+        });
+
+        if (url.endsWith('/pause')) {
+          expect(init?.method).toBe('POST');
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ session_id: 'sess-http-1', state: 'paused' }),
+          };
+        }
+        if (url.endsWith('/resume')) {
+          expect(init?.method).toBe('POST');
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ session_id: 'sess-http-1', state: 'active' }),
+          };
+        }
+        if (url.endsWith('/api/sessions/sess-http-1')) {
+          expect(init?.method).toBe('GET');
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ session_id: 'sess-http-1', state: 'active' }),
+          };
+        }
+        return { ok: false, status: 404 };
+      });
+      globalThis.fetch = mockFetch;
+
+      const client = new HttpSessionClient({
+        token: 'test-token-123',
+      });
+
+      const paused = await client.pauseSession('sess-http-1');
+      expect(paused).toBe('paused');
+
+      const resumed = await client.resumeSession('sess-http-1');
+      expect(resumed).toBe('active');
+
+      const currentState = await client.getSessionState('sess-http-1');
+      expect(currentState).toBe('active');
+    });
+
+    it('throws DEPENDENCY_UNAVAILABLE only when pause, resume, or getSessionState return 404 or 501', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        json: async () => ({}),
+      });
+
+      const client = new HttpSessionClient();
+
+      await expect(client.pauseSession('sess-missing')).rejects.toThrow(BackendError);
+      try {
+        await client.pauseSession('sess-missing');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+      }
+
+      await expect(client.resumeSession('sess-missing')).rejects.toThrow(BackendError);
+      try {
+        await client.resumeSession('sess-missing');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+      }
+
+      await expect(client.getSessionState('sess-missing')).rejects.toThrow(BackendError);
+      try {
+        await client.getSessionState('sess-missing');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BackendError);
+        expect((err as BackendError).code).toBe('DEPENDENCY_UNAVAILABLE');
+      }
     });
 
     it('throws BackendError with DEPENDENCY_UNAVAILABLE when approvals endpoint returns 404 or 501', async () => {

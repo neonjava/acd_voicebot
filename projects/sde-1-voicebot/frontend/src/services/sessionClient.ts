@@ -191,29 +191,12 @@ export class HttpSessionClient implements SessionClient {
     return validateMockSessionResponse(payload);
   }
 
-  async pauseSession(sessionId: string, _signal?: AbortSignal): Promise<SessionLifecycleState> {
-    // W5 has not published HTTP pause/resume endpoints in app/main yet.
-    // In accordance with repository instructions:
-    // Do not invent API routes; report dependency blocker to Hemanth.
-    throw new BackendError({
-      code: 'DEPENDENCY_UNAVAILABLE',
-      message_safe_for_user:
-        'Backend pause/resume lifecycle endpoints are not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-      retryable: true,
-      correlation_id: `corr-${sessionId}`,
-      details_redacted: { dependency: 'app.main (pause/resume endpoints)' },
-    });
+  async pauseSession(sessionId: string, signal?: AbortSignal): Promise<SessionLifecycleState> {
+    return this.postLifecycleAction(sessionId, 'pause', signal);
   }
 
-  async resumeSession(sessionId: string, _signal?: AbortSignal): Promise<SessionLifecycleState> {
-    throw new BackendError({
-      code: 'DEPENDENCY_UNAVAILABLE',
-      message_safe_for_user:
-        'Backend pause/resume lifecycle endpoints are not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-      retryable: true,
-      correlation_id: `corr-${sessionId}`,
-      details_redacted: { dependency: 'app.main (pause/resume endpoints)' },
-    });
+  async resumeSession(sessionId: string, signal?: AbortSignal): Promise<SessionLifecycleState> {
+    return this.postLifecycleAction(sessionId, 'resume', signal);
   }
 
   async stopSession(sessionId: string, signal?: AbortSignal): Promise<SessionLifecycleState> {
@@ -245,6 +228,17 @@ export class HttpSessionClient implements SessionClient {
       throw new NetworkError(`Failed to reach backend at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
     }
 
+    if (response.status === 404 || response.status === 501) {
+      throw new BackendError({
+        code: 'DEPENDENCY_UNAVAILABLE',
+        message_safe_for_user:
+          `Backend ${action} lifecycle endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.`,
+        retryable: true,
+        correlation_id: `corr-${sessionId}`,
+        details_redacted: { dependency: `app.main (${action} endpoint)`, status: String(response.status) },
+      });
+    }
+
     let payload: unknown;
     try {
       payload = await response.json();
@@ -261,15 +255,51 @@ export class HttpSessionClient implements SessionClient {
     return validateSessionLifecycleState(stateObj.state);
   }
 
-  async getSessionState(_sessionId: string, _signal?: AbortSignal): Promise<SessionLifecycleState> {
-    throw new BackendError({
-      code: 'DEPENDENCY_UNAVAILABLE',
-      message_safe_for_user:
-        'Backend session query endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
-      retryable: true,
-      correlation_id: `corr-${_sessionId}`,
-      details_redacted: { dependency: 'app.main (session query endpoint)' },
-    });
+  async getSessionState(sessionId: string, signal?: AbortSignal): Promise<SessionLifecycleState> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
+    }
+
+    const url = this.resolveUrl(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new NetworkError(`Failed to reach backend at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+
+    if (response.status === 404 || response.status === 501) {
+      throw new BackendError({
+        code: 'DEPENDENCY_UNAVAILABLE',
+        message_safe_for_user:
+          'Backend session query endpoint is not yet implemented upstream by W5 in app.main. Awaiting backend integration.',
+        retryable: true,
+        correlation_id: `corr-${sessionId}`,
+        details_redacted: { dependency: 'app.main (session query endpoint)', status: String(response.status) },
+      });
+    }
+
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new NetworkError(`Backend returned invalid JSON (HTTP ${response.status})`, response.status);
+    }
+
+    if (!response.ok) {
+      const errorEnv = validateErrorEnvelope(payload);
+      throw new BackendError(errorEnv);
+    }
+
+    const stateObj = payload as { state: unknown };
+    return validateSessionLifecycleState(stateObj.state);
   }
 
   async getEvents(sessionId: string, fromSequence = 0, signal?: AbortSignal): Promise<SessionEventStreamResponse> {
