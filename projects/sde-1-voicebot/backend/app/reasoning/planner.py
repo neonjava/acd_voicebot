@@ -42,6 +42,8 @@ MAX_CLARIFY_CHARS = 300
 PlanKind = Literal["none", "clarify", "proposal"]
 
 _PRONOUNS = {"it", "that", "this", "them"}
+# "close the app" refers to an app from context, like "close it".
+_REFERENTS = _PRONOUNS | {"app", "application", "program", "window"}
 # Things that are not apps: "close this tab" must not close the whole browser.
 _NOT_APPS = {
     "tab", "tabs", "file", "files", "page", "pages",
@@ -80,9 +82,8 @@ def _close_request(text: str) -> tuple[str, bool] | None:
         return None
     target = match.group("target")
     noun = (match.group("noun") or "").lower()
-    is_app = target.lower() not in _NOT_APPS and not (
-        target.lower() in _PRONOUNS and noun in _NOT_APPS
-    )
+    # "close the YouTube tab" or "close this file" is not a request to close an app.
+    is_app = target.lower() not in _NOT_APPS and noun not in _NOT_APPS
     return target, is_app
 
 
@@ -172,7 +173,7 @@ def _arguments_from_request(
         if not app:
             return False
         target = close[0]
-        if target.lower() not in _PRONOUNS:
+        if target.lower() not in _REFERENTS:
             return app == target.casefold()
         named = [turn.text for turn in bundle.turns if turn.turn_id != request.turn_id]
         if bundle.active_window is not None:
@@ -242,7 +243,7 @@ class RuleBasedPlanner:
             if "close_app" not in catalogue:
                 return missing_tool()
             extra: tuple[str, ...] = ()
-            if target.lower() in _PRONOUNS:
+            if target.lower() in _REFERENTS:
                 referent = resolve_referent(bundle)
                 if referent is None:
                     return PlanDecision("clarify", message="Which app should I close?")
