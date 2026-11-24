@@ -30,7 +30,10 @@ def test_list_pending_approvals(client):
     step = WorkflowStep(
         step_id="step-1", tool_name="echo_text", arguments={"text": "hello"}
     )
-    plan = WorkflowPlan(plan_id="plan-1", session_id="sess-appr-1", steps=[step])
+    step2 = WorkflowStep(
+        step_id="step-2", tool_name="echo_text", arguments={"text": "again"}
+    )
+    plan = WorkflowPlan(plan_id="plan-1", session_id="sess-appr-1", steps=[step, step2])
 
     appr1 = ApprovalRequest(
         approval_id="appr-pending-1",
@@ -42,7 +45,7 @@ def test_list_pending_approvals(client):
     appr_approved = ApprovalRequest(
         approval_id="appr-done",
         plan_id="plan-1",
-        step_id="step-1",
+        step_id="step-2",
         session_id="sess-appr-1",
         status="approved",
     )
@@ -552,3 +555,163 @@ def test_register_approval_validates_plan_consistency():
     )
     with pytest.raises(ValueError, match="not in plan steps"):
         session_service.register_approval(bad_step_id, plan)
+
+
+def _active_session_with_plan(session_id: str, plan_id: str) -> WorkflowPlan:
+    from app.contracts.common import SessionState
+
+    session_service.create_session(session_id)
+    session_service.transition(session_id, SessionState.active)
+    step = WorkflowStep(
+        step_id="step-a",
+        tool_name="echo_text",
+        arguments={"text": "hi"},
+        requires_approval=True,
+    )
+    return WorkflowPlan(plan_id=plan_id, session_id=session_id, steps=[step])
+
+
+def test_workflow_failure_carries_request_correlation_id(client, monkeypatch):
+    """A failing W4 step reports the caller's correlation ID, not W4's default."""
+    import app.agent.executor as executor_module
+
+    plan = _active_session_with_plan("sess-corr", "plan-corr")
+    session_service.register_approval(
+        ApprovalRequest(
+            approval_id="appr-corr",
+            plan_id="plan-corr",
+            step_id="step-a",
+            session_id="sess-corr",
+        ),
+        plan,
+    )
+
+    def failing_tool(name, arguments):
+        raise RuntimeError("tool exploded")
+
+    monkeypatch.setattr(executor_module.tools, "invoke_tool", failing_tool)
+    _, result = session_service.decide_approval(
+        "sess-corr", "appr-corr", "approve", correlation_id="corr-caller-1"
+    )
+    assert result is not None
+    assert result.state.value == "failed"
+    assert result.error is not None
+    assert result.error.correlation_id == "corr-caller-1"
+
+
+@pytest.mark.parametrize("action", ["stop", "expire"])
+def test_terminal_session_lists_no_pending_approvals(client, action):
+    """Approvals of a stopped or expired session are not offered for decision."""
+    plan = _active_session_with_plan("sess-term-list", "plan-term-list")
+    session_service.register_approval(
+        ApprovalRequest(
+            approval_id="appr-term-list",
+            plan_id="plan-term-list",
+            step_id="step-a",
+            session_id="sess-term-list",
+        ),
+        plan,
+    )
+    assert len(client.get("/api/sessions/sess-term-list/approvals").json()) == 1
+
+    res = client.post(f"/api/sessions/sess-term-list/{action}", json={})
+    assert res.status_code == 200
+
+    listed = client.get("/api/sessions/sess-term-list/approvals")
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
+def test_session_past_ttl_lists_no_pending_approvals(client):
+    """A session past its TTL is expired on listing and offers no approvals."""
+    from app.contracts.common import SessionState
+
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    session_service.create_session("sess-ttl-list", now=past, ttl_seconds=60)
+    session_service.transition("sess-ttl-list", SessionState.active, now=past)
+    step = WorkflowStep(
+        step_id="step-a",
+        tool_name="echo_text",
+        arguments={"text": "hi"},
+        requires_approval=True,
+    )
+    plan = WorkflowPlan(plan_id="plan-ttl", session_id="sess-ttl-list", steps=[step])
+    session_service.register_approval(
+        ApprovalRequest(
+            approval_id="appr-ttl",
+            plan_id="plan-ttl",
+            step_id="step-a",
+            session_id="sess-ttl-list",
+        ),
+        plan,
+    )
+    listed = client.get("/api/sessions/sess-ttl-list/approvals")
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
+def test_register_rejects_second_approval_for_same_step(client):
+    """One approval per step: a duplicate would make every W4 decision fail."""
+    plan = _active_session_with_plan("sess-dup", "plan-dup")
+    first = ApprovalRequest(
+        approval_id="appr-dup-1",
+        plan_id="plan-dup",
+        step_id="step-a",
+        session_id="sess-dup",
+    )
+    session_service.register_approval(first, plan)
+    with pytest.raises(ValueError, match="already has approval"):
+        session_service.register_approval(
+            first.model_copy(update={"approval_id": "appr-dup-2"}), plan
+        )
+
+    res = client.post(
+        "/api/sessions/sess-dup/approvals/appr-dup-1", json={"decision": "approve"}
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "approved"
+
+
+def test_register_cannot_reset_a_decided_approval_or_swap_its_plan(client):
+    """Re-registering an approval ID or plan ID never re-opens a decided step."""
+    plan = _active_session_with_plan("sess-rereg", "plan-rereg")
+    appr = ApprovalRequest(
+        approval_id="appr-rereg",
+        plan_id="plan-rereg",
+        step_id="step-a",
+        session_id="sess-rereg",
+    )
+    session_service.register_approval(appr, plan)
+    res = client.post(
+        "/api/sessions/sess-rereg/approvals/appr-rereg", json={"decision": "approve"}
+    )
+    assert res.status_code == 200
+
+    with pytest.raises(ValueError, match="already registered"):
+        session_service.register_approval(appr, plan)
+    assert session_service.get_approval("appr-rereg").status == "approved"
+
+    other_step = WorkflowStep(
+        step_id="step-b",
+        tool_name="echo_text",
+        arguments={"text": "swapped"},
+        requires_approval=True,
+    )
+    swapped = WorkflowPlan(
+        plan_id="plan-rereg", session_id="sess-rereg", steps=[other_step]
+    )
+    with pytest.raises(ValueError, match="different plan"):
+        session_service.register_approval(
+            ApprovalRequest(
+                approval_id="appr-rereg-b",
+                plan_id="plan-rereg",
+                step_id="step-b",
+                session_id="sess-rereg",
+            ),
+            swapped,
+        )
+
+    again = client.post(
+        "/api/sessions/sess-rereg/approvals/appr-rereg", json={"decision": "approve"}
+    )
+    assert again.status_code == 409
