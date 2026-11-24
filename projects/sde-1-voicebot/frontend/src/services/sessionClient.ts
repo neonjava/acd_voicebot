@@ -1,18 +1,27 @@
 import {
   ApprovalRequest,
   AuditEvent,
+  BrowserActionEvent,
+  CaptureOutcome,
   ErrorEnvelope,
   EventEnvelope,
+  ListenResponse,
   MockSessionResponse,
   SessionEventStreamResponse,
   SessionLifecycleState,
+  SpeechResponse,
+  TurnRequest,
+  TurnResponse,
+  WorkflowStep,
 } from '../types/contracts';
 import {
   validateApprovalRequest,
+  validateCaptureOutcome,
   validateErrorEnvelope,
   validateMockSessionResponse,
   validateSessionEventStreamResponse,
   validateSessionLifecycleState,
+  validateTurnResponse,
 } from '../utils/validation';
 import {
   baselineApprovalRequest,
@@ -45,6 +54,10 @@ export interface SessionClient {
   getEvents?(sessionId: string, fromSequence?: number, signal?: AbortSignal): Promise<SessionEventStreamResponse>;
   getPendingApprovals?(sessionId: string, signal?: AbortSignal): Promise<ApprovalRequest[]>;
   decideApproval?(sessionId: string, approvalId: string, decision: 'approve' | 'reject', signal?: AbortSignal): Promise<ApprovalRequest>;
+  createTurn?(turnRequest: TurnRequest, signal?: AbortSignal): Promise<TurnResponse>;
+  getCaptureStatus?(signal?: AbortSignal): Promise<CaptureOutcome>;
+  triggerListen?(signal?: AbortSignal): Promise<ListenResponse>;
+  synthesizeSpeech?(text: string, signal?: AbortSignal): Promise<SpeechResponse>;
   subscribeToEvents?(
     sessionId: string,
     options: StreamEventsOptions,
@@ -452,6 +465,129 @@ export class HttpSessionClient implements SessionClient {
     return validateApprovalRequest(payload, sessionId);
   }
 
+  async createTurn(turnRequest: TurnRequest, signal?: AbortSignal): Promise<TurnResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
+    }
+    const url = this.resolveUrl('/api/turns');
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(turnRequest),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new NetworkError(`Failed to post turn to ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+
+    const payload = await this.readJson(response, {
+      message: 'Backend turns endpoint is not yet implemented upstream in app.main.',
+      dependency: 'app.main (turns endpoint)',
+      sessionId: turnRequest.session_id || 'unknown',
+    });
+
+    return validateTurnResponse(payload);
+  }
+
+  async getCaptureStatus(signal?: AbortSignal): Promise<CaptureOutcome> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
+    }
+    const url = this.resolveUrl('/api/capture');
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new NetworkError(`Failed to get capture status from ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+
+    const payload = await this.readJson(response, {
+      message: 'Backend capture endpoint is not yet implemented upstream in app.main.',
+      dependency: 'app.main (capture endpoint)',
+      sessionId: 'global',
+    });
+
+    return validateCaptureOutcome(payload);
+  }
+
+  async triggerListen(signal?: AbortSignal): Promise<ListenResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
+    }
+    const url = this.resolveUrl('/api/listen');
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({}),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new NetworkError(`Failed to trigger listen at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+
+    const payload = (await this.readJson(response, {
+      message: 'Backend listen endpoint is not yet implemented upstream in app.main.',
+      dependency: 'app.main (listen endpoint)',
+      sessionId: 'global',
+    })) as { status?: string; wake_word_detected?: boolean; session_id?: string };
+
+    return {
+      status: payload.status === 'idle' ? 'idle' : 'listening',
+      wake_word_detected: Boolean(payload.wake_word_detected ?? true),
+      session_id: payload.session_id,
+    };
+  }
+
+  async synthesizeSpeech(text: string, signal?: AbortSignal): Promise<SpeechResponse> {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
+    }
+    const url = this.resolveUrl('/api/speech');
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ text }),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new NetworkError(`Failed to post speech synthesis to ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+
+    const payload = (await this.readJson(response, {
+      message: 'Backend speech endpoint is not yet implemented upstream in app.main.',
+      dependency: 'app.main (speech endpoint)',
+      sessionId: 'global',
+    })) as { audio_url?: string; spoken_text?: string; duration_ms?: number };
+
+    return {
+      audio_url: payload.audio_url,
+      spoken_text: payload.spoken_text || text,
+      duration_ms: payload.duration_ms,
+    };
+  }
+
   subscribeToEvents(
     sessionId: string,
     options: StreamEventsOptions,
@@ -567,7 +703,7 @@ export class FixtureSessionClient implements SessionClient {
       'events' in fixture &&
       Array.isArray((fixture as { events: unknown }).events)
     ) {
-      this.events = (fixture as { events: EventEnvelope<unknown>[] }).events;
+      this.events = structuredClone((fixture as { events: EventEnvelope<unknown>[] }).events);
     }
 
     this.approvals = initialApprovals.map((a) => ({ ...a }));
@@ -706,9 +842,68 @@ export class FixtureSessionClient implements SessionClient {
         },
       };
       this.events.push(auditEvt as EventEnvelope<unknown>);
+
+      const browserEvts: EventEnvelope<BrowserActionEvent>[] = [
+        {
+          event_id: `evt-action-${appr.plan_id}-1`,
+          event_type: 'browser.action',
+          schema_version: '1.0',
+          session_id: sessionId,
+          correlation_id: `corr-${sessionId}`,
+          timestamp: new Date().toISOString(),
+          producer: 'browser',
+          payload: {
+            action_id: `act-${appr.plan_id}-1`,
+            session_id: sessionId,
+            step_id: 'step-nav',
+            action_type: 'navigate',
+            label: 'Read page',
+            status: 'completed',
+            target: 'https://portal.university.edu/attendance',
+          },
+        },
+        {
+          event_id: `evt-action-${appr.plan_id}-2`,
+          event_type: 'browser.action',
+          schema_version: '1.0',
+          session_id: sessionId,
+          correlation_id: `corr-${sessionId}`,
+          timestamp: new Date().toISOString(),
+          producer: 'browser',
+          payload: {
+            action_id: `act-${appr.plan_id}-2`,
+            session_id: sessionId,
+            step_id: 'step-click',
+            action_type: 'click',
+            label: 'Click Attendance',
+            status: 'completed',
+            target: '#submit-query',
+          },
+        },
+        {
+          event_id: `evt-action-${appr.plan_id}-3`,
+          event_type: 'browser.action',
+          schema_version: '1.0',
+          session_id: sessionId,
+          correlation_id: `corr-${sessionId}`,
+          timestamp: new Date().toISOString(),
+          producer: 'browser',
+          payload: {
+            action_id: `act-${appr.plan_id}-3`,
+            session_id: sessionId,
+            step_id: 'step-read',
+            action_type: 'read',
+            label: 'Read results',
+            status: 'completed',
+          },
+        },
+      ];
+      for (const be of browserEvts) {
+        this.events.push(be as EventEnvelope<unknown>);
+      }
     } else {
       // Rejecting NEVER triggers execution!
-      // executionCount is strictly unchanged
+      // executionCount is strictly unchanged; no browser actions are run
       const auditEvt: EventEnvelope<AuditEvent> = {
         event_id: `evt-audit-decision-${appr.approval_id}-rejected`,
         event_type: 'workflow.audit',
@@ -730,6 +925,137 @@ export class FixtureSessionClient implements SessionClient {
     }
 
     return structuredClone(appr);
+  }
+
+  private screenCaptureEnabled = false;
+
+  setCaptureEnabled(enabled: boolean): void {
+    this.screenCaptureEnabled = enabled;
+  }
+
+  isCaptureEnabled(): boolean {
+    return this.screenCaptureEnabled;
+  }
+
+  async getCaptureStatus(): Promise<CaptureOutcome> {
+    return {
+      status: this.screenCaptureEnabled ? 'captured' : 'disabled',
+      capture_enabled: this.screenCaptureEnabled,
+      frame_id: this.screenCaptureEnabled ? 'frame-mock-demo-1' : null,
+    };
+  }
+
+  async triggerListen(): Promise<ListenResponse> {
+    return {
+      status: 'listening',
+      wake_word_detected: true,
+      session_id: 'session-demo',
+    };
+  }
+
+  async synthesizeSpeech(text: string): Promise<SpeechResponse> {
+    return {
+      spoken_text: text,
+      duration_ms: 150,
+    };
+  }
+
+  async createTurn(turnRequest: TurnRequest): Promise<TurnResponse> {
+    const raw = (turnRequest.text || '').toLowerCase().trim();
+    const sessionId = turnRequest.session_id || 'session-demo';
+
+    if (raw.includes('fail') || raw.includes('error')) {
+      return {
+        kind: 'error',
+        message: 'Could not connect to service.',
+        code: 'SERVICE_UNAVAILABLE',
+        retryable: true,
+        session_id: sessionId,
+      };
+    }
+
+    if (raw.includes('ram') || raw.includes('memory')) {
+      return {
+        kind: 'answer',
+        text: 'Chrome, about 3.1 GB.',
+        sources: [
+          {
+            id: 'src-ram-1',
+            label: 'psutil (system stats)',
+            kind: 'system',
+            locator: 'system_stats.memory',
+          },
+        ],
+        spoken_text: 'Chrome, about 3.1 GB.',
+        session_id: sessionId,
+      };
+    }
+
+    if (raw.includes('close it') || raw.includes('clarify') || raw === 'close') {
+      return {
+        kind: 'clarify',
+        question: 'Do you mean close Chrome or close the active tab?',
+        spoken_text: 'Do you mean close Chrome or close the active tab?',
+        session_id: sessionId,
+      };
+    }
+
+    if (
+      raw.includes('attendance') ||
+      raw.includes('browser') ||
+      raw.includes('portal') ||
+      raw.includes('open')
+    ) {
+      const planId = `plan-${Date.now()}`;
+      const approvalId = `appr-${Date.now()}`;
+      const steps: WorkflowStep[] = [
+        {
+          step_id: 'step-nav',
+          tool_name: 'open_url',
+          arguments: { url: 'https://portal.university.edu/attendance' },
+          requires_approval: false,
+        },
+        {
+          step_id: 'step-click',
+          tool_name: 'click_element',
+          arguments: { selector: '#attendance-link' },
+          requires_approval: true,
+        },
+        {
+          step_id: 'step-read',
+          tool_name: 'read_page',
+          arguments: { target: 'results_table' },
+          requires_approval: false,
+        },
+      ];
+
+      const appr: ApprovalRequest = {
+        approval_id: approvalId,
+        plan_id: planId,
+        step_id: 'step-click',
+        session_id: sessionId,
+        status: 'pending',
+      };
+      this.approvals.push(appr);
+
+      return {
+        kind: 'proposal',
+        plan_id: planId,
+        summary: 'Open attendance page, click Attendance link, and read results',
+        steps,
+        requires_approval: true,
+        approval_id: approvalId,
+        spoken_text: 'I planned the attendance check. It needs your approval to proceed.',
+        session_id: sessionId,
+      };
+    }
+
+    return {
+      kind: 'answer',
+      text: `I understand: "${turnRequest.text}". Ready to assist.`,
+      spoken_text: `I understand: "${turnRequest.text}". Ready to assist.`,
+      session_id: sessionId,
+    };
   }
 
   getExecutionCount(): number {

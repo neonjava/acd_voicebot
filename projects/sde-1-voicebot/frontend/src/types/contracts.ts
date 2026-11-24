@@ -202,6 +202,120 @@ export interface SessionEventStreamResponse {
   has_more: boolean;
 }
 
+/**
+ * Week 4 Contracts & Events:
+ * - Companion Mascot States, Turn Lifecycle, Browser Action Chips, Audio Capture.
+ */
+export type CaptureStatus =
+  | 'captured'
+  | 'disabled'
+  | 'throttled'
+  | 'rejected'
+  | 'exhausted';
+
+export interface CaptureOutcome {
+  status: CaptureStatus;
+  frame_id?: string | null;
+  error?: ErrorEnvelope | null;
+  capture_enabled?: boolean;
+}
+
+export type MascotState = 'idle' | 'listening' | 'thinking' | 'working' | 'done';
+
+export type TurnKind = 'answer' | 'clarify' | 'proposal' | 'error';
+
+export interface TurnSource {
+  id: string;
+  label: string;
+  kind: 'transcript' | 'synthetic_screen' | 'note' | string;
+  locator?: string;
+}
+
+export interface TurnRequest {
+  text: string;
+  session_id?: string;
+  correlation_id?: string;
+  mode?: 'mock' | 'live';
+  context_enabled?: boolean;
+}
+
+export interface TurnAnswerResponse {
+  kind: 'answer';
+  text: string;
+  sources?: TurnSource[];
+  spoken_text?: string;
+  session_id?: string;
+}
+
+export interface TurnClarifyResponse {
+  kind: 'clarify';
+  question: string;
+  spoken_text?: string;
+  session_id?: string;
+}
+
+export interface TurnProposalResponse {
+  kind: 'proposal';
+  plan_id: string;
+  summary: string;
+  steps: WorkflowStep[];
+  requires_approval: boolean;
+  approval_id?: string;
+  spoken_text?: string;
+  session_id?: string;
+}
+
+export interface TurnErrorResponse {
+  kind: 'error';
+  message: string;
+  code?: string;
+  retryable?: boolean;
+  session_id?: string;
+}
+
+export type TurnResponse =
+  | TurnAnswerResponse
+  | TurnClarifyResponse
+  | TurnProposalResponse
+  | TurnErrorResponse;
+
+export type BrowserActionStatus = 'pending' | 'running' | 'completed' | 'failed';
+
+export interface BrowserActionEvent {
+  action_id: string;
+  session_id: string;
+  step_id?: string;
+  action_type: 'navigate' | 'click' | 'read' | 'input' | 'done' | string;
+  label: string;
+  status: BrowserActionStatus;
+  target?: string;
+  details?: Record<string, string>;
+}
+
+export interface AssistantTurnEvent {
+  turn_id: string;
+  session_id: string;
+  response: TurnResponse;
+}
+
+export interface AudioCaptureEvent {
+  session_id: string;
+  status: CaptureStatus;
+  at_ms?: number;
+}
+
+export interface ListenResponse {
+  status: 'listening' | 'idle';
+  wake_word_detected?: boolean;
+  session_id?: string;
+}
+
+export interface SpeechResponse {
+  audio_url?: string;
+  spoken_text: string;
+  duration_ms?: number;
+}
+
 export interface VoicebotDesktopBridge {
   isElectron: true;
   getToken: () => string;
@@ -215,5 +329,6 @@ declare global {
     voicebot?: VoicebotDesktopBridge;
   }
 }
+
 
 
