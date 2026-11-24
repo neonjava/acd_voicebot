@@ -5,8 +5,9 @@ A bundle holds the recent conversation turns, the active app and window title
 the co-pilot contextual: "close it" can be resolved from the previous turn.
 
 Bundles are size-bounded. Text is never rewritten or truncated, so source
-references stay exact; when the bundle is too large, the oldest turns and then
-the oldest observations are left out.
+references stay exact; when the bundle is too large, the oldest observations,
+then the oldest turns, then the active window are left out. Only the newest
+turn (what the user just said) is always kept.
 
 Every piece becomes a ``ContextItem`` with its own source, so reasoning can cite
 it. Conversation turns use the existing ``transcript`` kind and the active
@@ -64,6 +65,7 @@ class ContextBundle:
     observations: tuple[Observation, ...] = ()
     dropped_turns: tuple[str, ...] = field(default=())
     dropped_observations: int = 0
+    dropped_active_window: bool = False
 
     def to_context_items(self) -> list[ContextItem]:
         """Each piece as a cite-able, untrusted context item."""
@@ -151,14 +153,16 @@ def build_bundle(
     dropped = [t.turn_id for t in list(turns)[: len(turns) - len(kept_turns)]]
     kept_obs = list(observations)[-max_observations:]
     dropped_obs = len(observations) - len(kept_obs)
+    window = active_window
 
     def bundle() -> ContextBundle:
         return ContextBundle(
             turns=tuple(kept_turns),
-            active_window=active_window,
+            active_window=window,
             observations=tuple(kept_obs),
             dropped_turns=tuple(dropped),
             dropped_observations=dropped_obs,
+            dropped_active_window=active_window is not None and window is None,
         )
 
     current = bundle()
@@ -168,14 +172,19 @@ def build_bundle(
             dropped_obs += 1
         elif len(kept_turns) > 1:
             dropped.append(kept_turns.pop(0).turn_id)
+        elif window is not None:
+            # Window titles are set by other programs (a web page sets its own
+            # title), so the title is untrusted text of any length.
+            window = None
         else:
             break
         current = bundle()
     return current
 
 
-def last_mentioned_app(bundle: ContextBundle) -> str | None:
-    """The app a follow-up such as "close it" most likely refers to.
+def resolve_referent(bundle: ContextBundle) -> tuple[str, str] | None:
+    """The app a follow-up such as "close it" refers to, and the source ID of
+    the bundle item it was taken from.
 
     Deterministic mock heuristic (a real model reads the whole bundle): the top
     program in the most recent assistant answer that listed programs
@@ -192,7 +201,13 @@ def last_mentioned_app(bundle: ContextBundle) -> str | None:
         rest = turn.text[start + len(marker) :].strip()
         name = rest.split(",")[0].split()
         if name:
-            return name[0]
+            return name[0], turn.turn_id
     if bundle.active_window is not None:
-        return bundle.active_window.app
+        return bundle.active_window.app, ACTIVE_WINDOW_ID
     return None
+
+
+def last_mentioned_app(bundle: ContextBundle) -> str | None:
+    """The app a follow-up such as "close it" most likely refers to."""
+    referent = resolve_referent(bundle)
+    return referent[0] if referent is not None else None
