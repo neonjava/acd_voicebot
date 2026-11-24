@@ -1282,3 +1282,210 @@ class TestAudioChunkIntegrity:
         assert len(events_mis) == 1
         assert events_mis[0].event_type == "transcript.error"
         assert events_mis[0].payload.code == "TRANSCRIPTION_MIXED_SESSION"
+
+
+class _CancelDuringTranscribe:
+    """Real FakeTranscriber that receives a cancel while one call is in flight."""
+
+    def __init__(self, cancel_on_call: int) -> None:
+        self.inner = FakeTranscriber()
+        self.cancel_on_call = cancel_on_call
+        self.orchestrator: TranscriptionOrchestrator | None = None
+        self.calls = 0
+
+    def health(self) -> str:
+        return self.inner.health()
+
+    def cancel(self, session_id: str) -> None:
+        self.inner.cancel(session_id)
+
+    def reset(self, session_id: str | None = None) -> None:
+        self.inner.reset(session_id)
+
+    def transcribe(self, chunks: Any, **kwargs: Any) -> list[TranscriptEvent]:
+        self.calls += 1
+        events = self.inner.transcribe(chunks, **kwargs)
+        if self.calls == self.cancel_on_call and self.orchestrator is not None:
+            # The cancel lands while the provider is still finishing this utterance
+            self.orchestrator.cancel(kwargs["session_id"])
+        return events
+
+
+def _speech(session_id: str, kind: str, seq: int, at_ms: int) -> SpeechEvent:
+    return SpeechEvent(
+        kind=kind,
+        session_id=session_id,
+        correlation_id="corr-cancel",
+        sequence_id=seq,
+        at_ms=at_ms,
+    )
+
+
+class TestCancellationScopeAndResetIds:
+    """Cancel drops only the current utterance; reset never reuses IDs."""
+
+    def test_inflight_cancel_drops_only_current_utterance(self) -> None:
+        from app.sessions.service import SessionService
+
+        service = SessionService()
+        session_id = "sess-cancel-scope"
+        service.create_session(session_id)
+        adapter = _CancelDuringTranscribe(cancel_on_call=1)
+        orchestrator = TranscriptionOrchestrator(
+            adapter=adapter, event_sink=service.add_event
+        )
+        adapter.orchestrator = orchestrator
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        first = orchestrator.process_chunks(
+            [_make_chunk(session_id, i, start_ms=i * 20) for i in range(3)],
+            session_id=session_id,
+            correlation_id="c1",
+            timestamp=ts,
+        )
+        assert first == []
+        assert service.get_events(session_id) == []
+        assert orchestrator.get_segments() == []
+
+        second = orchestrator.process_chunks(
+            [_make_chunk(session_id, i, start_ms=i * 20) for i in range(3, 6)],
+            session_id=session_id,
+            correlation_id="c2",
+            timestamp=ts,
+        )
+        assert [e.event_type for e in second] == ["transcript.segment"]
+        assert second[0].payload.start_ms == 60
+        stored = service.get_events(session_id)
+        assert [e.event_id for e in stored] == [second[0].event_id]
+
+    def test_cancel_before_utterance_drops_only_that_utterance(self) -> None:
+        orchestrator = TranscriptionOrchestrator()
+        session_id = "sess-cancel-next"
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        orchestrator.cancel(session_id)
+
+        results = [
+            orchestrator.process_chunks(
+                [_make_chunk(session_id, i, start_ms=i * 20) for i in rng],
+                session_id=session_id,
+                correlation_id=f"c{n}",
+                timestamp=ts,
+            )
+            for n, rng in enumerate((range(0, 3), range(3, 6), range(6, 9)))
+        ]
+        assert results[0] == []
+        assert [len(r) for r in results[1:]] == [1, 1]
+        assert [r[0].payload.start_ms for r in results[1:]] == [60, 120]
+
+    def test_cancel_in_speech_session_drops_only_running_utterance(self) -> None:
+        session_id = "sess-cancel-speech"
+        adapter = _CancelDuringTranscribe(cancel_on_call=1)
+        orchestrator = TranscriptionOrchestrator(adapter=adapter)
+        adapter.orchestrator = orchestrator
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        chunks = chunk_pcm(
+            make_fake_pcm(duration_ms=1000), session_id=session_id, chunk_ms=20
+        )
+        speech_events = [
+            _speech(session_id, "speech_start", 0, 100),
+            _speech(session_id, "speech_end", 1, 300),
+            _speech(session_id, "speech_start", 2, 500),
+            _speech(session_id, "speech_end", 3, 800),
+        ]
+
+        events = orchestrator.process_speech_session(
+            speech_events,
+            chunks,
+            session_id=session_id,
+            correlation_id="corr-cancel",
+            timestamp=ts,
+        )
+
+        assert [e.event_type for e in events] == ["transcript.segment"]
+        assert events[0].payload.start_ms == 500
+        assert [s.start_ms for s in orchestrator.get_segments()] == [500]
+
+    @pytest.mark.parametrize("provider", ["mock", "faster_whisper"])
+    def test_reset_keeps_event_and_segment_ids_unique(self, provider: str) -> None:
+        from app.sessions.service import SessionService
+
+        class OneSegmentModel:
+            def transcribe(self, audio: Any, **kwargs: Any) -> tuple[list[Any], Any]:
+                class Seg:
+                    start = 0.0
+                    end = 0.02
+                    text = "open the browser"
+                    avg_logprob = -0.1
+
+                return [Seg()], None
+
+        adapter: Any = (
+            FakeTranscriber()
+            if provider == "mock"
+            else FasterWhisperAdapter(
+                config=TranscriptionConfig(provider="faster_whisper"),
+                model=OneSegmentModel(),
+            )
+        )
+        service = SessionService()
+        session_id = f"sess-reset-ids-{provider}"
+        service.create_session(session_id)
+        orchestrator = TranscriptionOrchestrator(
+            adapter=adapter, event_sink=service.add_event
+        )
+        ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        for n, rng in enumerate((range(0, 2), range(2, 4), range(4, 6))):
+            orchestrator.process_chunks(
+                [_make_chunk(session_id, i, start_ms=i * 20) for i in rng],
+                session_id=session_id,
+                correlation_id=f"c{n}",
+                timestamp=ts,
+            )
+            orchestrator.reset()
+
+        stored = service.get_events(session_id)
+        assert [e.event_type for e in stored] == ["transcript.segment"] * 3
+        event_ids = [e.event_id for e in stored]
+        segment_ids = [e.payload.segment_id for e in stored]
+        assert len(set(event_ids)) == 3
+        assert len(set(segment_ids)) == 3
+
+
+class TestSystemCertsOptInLoadPath:
+    """STT_USE_SYSTEM_CERTS changes SSL settings only when set to 1."""
+
+    @pytest.mark.parametrize("env_value", [None, "", "0", "true"])
+    def test_model_load_leaves_ssl_alone_unless_opted_in(
+        self, monkeypatch: pytest.MonkeyPatch, env_value: str | None
+    ) -> None:
+        injected: list[bool] = []
+        loaded: list[tuple[Any, ...]] = []
+
+        class FakeTruststore:
+            @staticmethod
+            def inject_into_ssl() -> None:
+                injected.append(True)
+
+        class FakeWhisperModel:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                loaded.append(args)
+
+        class FakeFasterWhisper:
+            WhisperModel = FakeWhisperModel
+
+        monkeypatch.setitem(sys.modules, "truststore", FakeTruststore)
+        monkeypatch.setitem(sys.modules, "faster_whisper", FakeFasterWhisper)
+        if env_value is None:
+            monkeypatch.delenv("STT_USE_SYSTEM_CERTS", raising=False)
+        else:
+            monkeypatch.setenv("STT_USE_SYSTEM_CERTS", env_value)
+
+        adapter = FasterWhisperAdapter(
+            config=TranscriptionConfig(provider="faster_whisper", device="cpu")
+        )
+        model = adapter._ensure_model_loaded()
+
+        assert isinstance(model, FakeWhisperModel)
+        assert loaded == [("base",)]
+        assert injected == []
