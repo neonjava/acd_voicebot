@@ -29,6 +29,12 @@ stt = [
 system = [
     "psutil>=6.0.0",
 ]
+browser = [
+    "playwright>=1.48.0",
+]
+tts = [
+    "piper-tts>=1.3.0",
+]
 
 [build-system]
 requires = ["hatchling"]

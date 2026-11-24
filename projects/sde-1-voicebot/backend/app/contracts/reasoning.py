@@ -13,7 +13,7 @@ class SourceReference(ContractModel):
 
     source_id: str = Field(min_length=1, pattern=r"\S")
     locator: str = Field(min_length=1, pattern=r"\S")
-    kind: Literal["synthetic_screen", "transcript"]
+    kind: Literal["synthetic_screen", "transcript", "note"]
 
 
 class ContextItem(ContractModel):
