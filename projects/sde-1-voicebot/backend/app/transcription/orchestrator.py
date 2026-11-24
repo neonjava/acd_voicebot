@@ -66,11 +66,26 @@ class TranscriptionOrchestrator:
         return self.adapter.health()
 
     def cancel(self, session_id: str) -> None:
-        """Cancel transcription for a session, emitting no further events."""
+        """Cancel the current utterance of a session, emitting no events for it.
+
+        The cancellation applies to the utterance in flight, or to the next one
+        if nothing is running. Once that utterance is dropped, the session
+        transcribes normally again.
+        """
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a nonempty string")
         self._cancelled_sessions.add(session_id)
         self.adapter.cancel(session_id)
+
+    def _consume_cancellation(self, session_id: str) -> bool:
+        """Drop the cancelled utterance and clear the flag for the next one."""
+        if session_id not in self._cancelled_sessions:
+            return False
+        self._cancelled_sessions.discard(session_id)
+        adapter_reset = getattr(self.adapter, "reset", None)
+        if callable(adapter_reset):
+            adapter_reset(session_id)
+        return True
 
     def process_chunks(
         self,
@@ -96,10 +111,10 @@ class TranscriptionOrchestrator:
         if not isinstance(correlation_id, str) or not correlation_id.strip():
             raise ValueError("correlation_id must be a nonempty string")
 
-        if session_id in self._cancelled_sessions:
+        if not chunks:
             return []
 
-        if not chunks:
+        if self._consume_cancellation(session_id):
             return []
 
         # Optional preprocessing
@@ -122,6 +137,10 @@ class TranscriptionOrchestrator:
             timestamp=timestamp,
             batch_id=self._batch_counter,
         )
+
+        # A cancel that arrived while the adapter was running drops this utterance
+        if self._consume_cancellation(session_id):
+            return []
 
         # Ingest successful segment events into accumulator
         processed_events: list[TranscriptEvent] = []
@@ -161,9 +180,6 @@ class TranscriptionOrchestrator:
             raise ValueError("session_id must be a nonempty string")
         if not isinstance(correlation_id, str) or not correlation_id.strip():
             raise ValueError("correlation_id must be a nonempty string")
-
-        if session_id in self._cancelled_sessions:
-            return []
 
         # Validate that all speech events belong strictly to the target session
         for e in speech_events:

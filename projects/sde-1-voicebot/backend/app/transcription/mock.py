@@ -50,12 +50,11 @@ class FakeTranscriber:
         self._cancelled_sessions.add(session_id)
 
     def reset(self, session_id: str | None = None) -> None:
-        """Reset state and clear cancellations."""
+        """Clear cancellations; segment and event IDs keep counting to stay unique."""
         if session_id:
             self._cancelled_sessions.discard(session_id)
         else:
             self._cancelled_sessions.clear()
-            self._segment_indices.clear()
 
     def transcribe(
         self,
