@@ -1313,3 +1313,37 @@ def test_gap_mid_command_keeps_listening_with_wake_required() -> None:
     assert len(orch.get_segments()) == 2
     # A normal speech_end still closes listening.
     assert pipeline.listening is False
+
+
+def test_speech_ending_before_max_utterance_closes_normally_after_hangover() -> None:
+    """Silence after the last word is not speech: max_utterance_ms must not split it."""
+    orch = TranscriptionOrchestrator()
+    pipeline = SpeechPipeline(
+        session_id=SESSION_ID,
+        correlation_id=CORRELATION_ID,
+        config=AudioConfig(
+            wake_required=True, max_utterance_ms=200, speech_end_silence_ms=100
+        ),
+        orchestrator=orch,
+    )
+    # Wake, then speech 20-180 ms (160 ms, under the 200 ms cap), then silence.
+    chunks = [wake_chunk(0, 0)] + [make_chunk(i, 20 * i) for i in range(1, 9)]
+    chunks += [silence_chunk(i, 20 * i) for i in range(9, 15)]
+
+    result = pipeline.process_chunks(chunks, timestamp=FIXED_TS)
+
+    # speech_end is where the speech stopped, not where the cap was crossed in
+    # the trailing silence, and it is a normal end that closes listening.
+    assert [(e.kind, e.at_ms) for e in result.speech_events] == [
+        ("wake", 0),
+        ("speech_start", 20),
+        ("speech_end", 180),
+    ]
+    assert pipeline.listening is False
+    assert [c.sequence_id for c in result.utterance_chunks] == list(range(1, 9))
+    assert len(orch.get_segments()) == 1
+
+    # Without a new wake word, later speech is gated off.
+    later = [make_chunk(i, 20 * i) for i in range(15, 20)]
+    later.append(silence_chunk(20, 400))
+    assert pipeline.process_chunks(later, timestamp=FIXED_TS).speech_events == []
