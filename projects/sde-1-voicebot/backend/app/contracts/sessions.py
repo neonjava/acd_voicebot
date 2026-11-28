@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Self, Union
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.contracts.audio import CaptureStatus, SpeechEvent
 from app.contracts.browser import BrowserAction
@@ -70,9 +70,24 @@ class WorkflowAuditEvent(EventEnvelope[AuditEvent]):
 class MockSessionRequest(ContractModel):
     """Request body for creating a mock session; forbids extra fields."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{}]})
+
 
 class MockSessionResponse(ContractModel):
     """Finite run mock session response returned by POST /api/sessions/mock."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "session_id": "session-demo",
+                    "state": "completed",
+                    "mode": "mock",
+                    "events": [],
+                }
+            ]
+        }
+    )
 
     session_id: str = Field(min_length=1, pattern=r"\S")
     state: Literal["active", "completed"] = "active"
@@ -112,6 +127,18 @@ class MockSessionResponse(ContractModel):
 class SessionCreateRequest(ContractModel):
     """Request payload for creating a new voicebot session."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "session_id": "session-demo",
+                    "mode": "mock",
+                    "initial_state": "created",
+                }
+            ]
+        }
+    )
+
     session_id: str | None = Field(default=None, min_length=1, pattern=r"\S")
     mode: Literal["mock"] = "mock"
     initial_state: Literal["created", "active"] = "created"
@@ -120,11 +147,30 @@ class SessionCreateRequest(ContractModel):
 class SessionActionRequest(ContractModel):
     """Generic payload for lifecycle action commands (pause/resume/stop)."""
 
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"reason": "User paused the session."}]}
+    )
+
     reason: str | None = Field(default=None, max_length=256)
 
 
 class SessionStateResponse(ContractModel):
     """Normalized wire representation of a session's current lifecycle state."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "session_id": "session-demo",
+                    "state": "created",
+                    "mode": "mock",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "expires_at": None,
+                }
+            ]
+        }
+    )
 
     session_id: str = Field(min_length=1, pattern=r"\S")
     state: SessionState
@@ -136,6 +182,20 @@ class SessionStateResponse(ContractModel):
 
 class SessionEventStreamResponse(ContractModel):
     """Batch of ordered session events returned by replay / polling."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "session_id": "session-demo",
+                    "events": [],
+                    "from_sequence": 0,
+                    "total_events": 0,
+                    "has_more": False,
+                }
+            ]
+        }
+    )
 
     session_id: str = Field(min_length=1, pattern=r"\S")
     events: list[SessionEvent] = Field(default_factory=list)
@@ -161,6 +221,8 @@ class IdempotencyRecord(ContractModel):
 class ApprovalDecisionRequest(ContractModel):
     """Payload for deciding a pending approval request."""
 
+    model_config = ConfigDict(json_schema_extra={"examples": [{"decision": "approve"}]})
+
     decision: Literal["approve", "reject"]
 
 
@@ -182,6 +244,18 @@ class HealthResponse(ContractModel):
 class TurnRequest(ContractModel):
     """One thing the user said or typed to the assistant."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "text": "what's using the most RAM?",
+                    "active_app": "chrome",
+                    "active_window_title": "Google Chrome",
+                }
+            ]
+        }
+    )
+
     text: str = Field(min_length=1, max_length=2000, pattern=r"\S")
     active_app: str | None = Field(default=None, max_length=200)
     active_window_title: str | None = Field(default=None, max_length=500)
@@ -201,6 +275,21 @@ class TurnResponse(ContractModel):
     - ``error``: ``error_code`` holds a safe error code.
     ``spoken_text`` is the short text the assistant speaks (TTS), if any.
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "session_id": "session-demo",
+                    "turn_id": "turn-demo-1",
+                    "kind": "answer",
+                    "answer": "RAM 62% used. Top memory: chrome 3.1 GB.",
+                    "source_ids": ["turn-demo-1"],
+                    "spoken_text": "Chrome, about 3.1 GB.",
+                }
+            ]
+        }
+    )
 
     session_id: str = Field(min_length=1, pattern=r"\S")
     turn_id: str = Field(min_length=1, pattern=r"\S")
@@ -239,6 +328,8 @@ class TurnResponse(ContractModel):
 class CaptureListenRequest(ContractModel):
     """Payload for starting or stopping microphone capture."""
 
+    model_config = ConfigDict(json_schema_extra={"examples": [{"action": "start"}]})
+
     action: Literal["start", "stop"]
 
 
@@ -259,9 +350,26 @@ class AssistantTurnEvent(EventEnvelope[TurnResponse]):
 class BrowserActionPayload(ContractModel):
     """Payload for browser action events without sensitive snapshot text."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "action": {"type": "navigate", "url": "https://example.com"},
+                    "ok": True,
+                }
+            ]
+        }
+    )
+
     action: BrowserAction
     ok: bool
     error_code: str | None = None
+
+    @model_validator(mode="after")
+    def error_when_failed(self) -> Self:
+        if self.ok == (self.error_code is not None):
+            raise ValueError("a failed result needs error_code; a success has none")
+        return self
 
 
 class BrowserActionEvent(EventEnvelope[BrowserActionPayload]):

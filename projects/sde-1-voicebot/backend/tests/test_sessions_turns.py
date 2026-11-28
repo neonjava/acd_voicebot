@@ -59,8 +59,36 @@ def test_turns_safe_ram_query_executes_directly():
     assert turn_events[0].payload.turn_id == turn.turn_id
 
 
-def test_turns_close_app_registers_pending_approval_and_runs_only_once_approved():
+def test_turns_close_app_registers_pending_approval_and_runs_only_once_approved(
+    monkeypatch,
+):
     """'close chrome' creates a pending approval; approving executes it."""
+    from app.agent import tools
+    from app.agent.tools import ToolPolicy
+    from app.contracts.workflow import ToolSpec
+
+    spec = ToolSpec(
+        name="close_app",
+        description="Close an application",
+        consequential=True,
+    )
+    policy = ToolPolicy(
+        spec=spec,
+        scope="system:app:close",
+        validate=lambda args, hosts: None,
+        idempotent=False,
+    )
+    monkeypatch.setitem(tools.TOOL_POLICIES, "close_app", policy)
+    monkeypatch.setitem(tools.TOOL_SPECS, "close_app", spec)
+    orig_invoke = tools.ToolRuntime.invoke
+    monkeypatch.setattr(
+        tools.ToolRuntime,
+        "invoke",
+        lambda self, name, args: (
+            "Closed chrome" if name == "close_app" else orig_invoke(self, name, args)
+        ),
+    )
+
     sess = session_service.create_session(
         "session-close", initial_state=SessionState.active
     )
@@ -206,3 +234,116 @@ def test_turns_terminal_session_returns_409():
     )
     assert resp.status_code == 409
     assert resp.json()["code"] == "SESSION_TERMINAL_STATE"
+
+
+def test_turns_planner_error_returns_kind_error(monkeypatch):
+    """Planner error returns kind='error' with the corresponding error_code."""
+    from app.contracts.common import ErrorEnvelope
+    from app.reasoning.planner import PlanDecision, RuleBasedPlanner
+
+    def mock_plan(self, *args, **kwargs):
+        return PlanDecision(
+            kind="none",
+            error=ErrorEnvelope(
+                code="PLANNER_FAILED",
+                message_safe_for_user="Unable to devise a plan",
+                retryable=False,
+                correlation_id="corr-err",
+            ),
+        )
+
+    monkeypatch.setattr(RuleBasedPlanner, "plan", mock_plan)
+    sess = session_service.create_session(
+        "session-err", initial_state=SessionState.active
+    )
+
+    resp = client.post(
+        f"/api/sessions/{sess.session_id}/turns",
+        json={"text": "check system status"},
+    )
+    assert resp.status_code == 201
+    turn = TurnResponse.model_validate(resp.json())
+    assert turn.kind == "error"
+    assert turn.error_code == "PLANNER_FAILED"
+
+
+def test_turns_question_calls_grounded_answer_with_source_ids(monkeypatch):
+    """Questions call W3 grounded_answer returning cited source_ids."""
+    import app.reasoning.grounding as grounding
+    from app.contracts.reasoning import ReasoningOutcome, ReasoningResult
+
+    def mock_grounded_answer(question, bundle, **kwargs):
+        sid = kwargs.get("session_id", "session-qa")
+        return ReasoningOutcome(
+            request_id="req-qa-1",
+            session_id=sid,
+            attempts=1,
+            result=ReasoningResult(
+                request_id="req-qa-1",
+                session_id=sid,
+                answer="The flight confirmation code is AB1234.",
+                source_ids=["email-confirm-123"],
+                insufficient_evidence=False,
+            ),
+        )
+
+    monkeypatch.setattr(grounding, "grounded_answer", mock_grounded_answer)
+    sess = session_service.create_session(
+        "session-qa", initial_state=SessionState.active
+    )
+
+    resp = client.post(
+        f"/api/sessions/{sess.session_id}/turns",
+        json={"text": "What is my flight confirmation code?"},
+    )
+    assert resp.status_code == 201
+    turn = TurnResponse.model_validate(resp.json())
+    assert turn.kind == "answer"
+    assert turn.source_ids == ["email-confirm-123"]
+    assert "AB1234" in (turn.answer or "")
+    assert "AB1234" in (turn.spoken_text or "")
+
+
+def test_turns_spoken_text_follows_real_stats_dynamically(monkeypatch):
+    """Spoken text is constructed dynamically from stats output, not hardcoded."""
+    from app.agent.tools import ToolRuntime
+
+    orig_invoke = ToolRuntime.invoke
+
+    def mock_stats_invoke(self, name, args):
+        if name == "system_stats":
+            return "RAM 75% used.\nTop memory: firefox 4.2 GB\nCPU 12%."
+        return orig_invoke(self, name, args)
+
+    monkeypatch.setattr(ToolRuntime, "invoke", mock_stats_invoke)
+    sess = session_service.create_session(
+        "session-dynamic-spoken", initial_state=SessionState.active
+    )
+
+    resp = client.post(
+        f"/api/sessions/{sess.session_id}/turns",
+        json={"text": "what's using the most RAM?"},
+    )
+    assert resp.status_code == 201
+    turn = TurnResponse.model_validate(resp.json())
+    assert turn.spoken_text is not None
+    assert "firefox" in turn.spoken_text.lower()
+    assert "4.2 gb" in turn.spoken_text.lower()
+    assert "chrome" not in turn.spoken_text.lower()
+
+
+def test_turns_history_is_capped_at_20_turns():
+    """Session stores at most the last 20 conversation turns."""
+    sess = session_service.create_session(
+        "session-cap-history", initial_state=SessionState.active
+    )
+
+    for i in range(25):
+        resp = client.post(
+            f"/api/sessions/{sess.session_id}/turns",
+            json={"text": f"Question number {i}"},
+        )
+        assert resp.status_code == 201
+
+    assert len(session_service._conversation_turns[sess.session_id]) == 20
+    assert len(session_service._turns[sess.session_id]) == 20

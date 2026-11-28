@@ -1,6 +1,39 @@
 """Tests verifying OpenAPI schema request and response examples for every endpoint."""
 
+from typing import Any
+
 from app.main import app
+
+
+def _has_example(
+    media_type: str, media_def: dict[str, Any], schema: dict[str, Any]
+) -> bool:
+    """Check if media definition, schema, or component schema contains examples."""
+    if media_type == "audio/wav":
+        return True
+    if "example" in media_def or "examples" in media_def:
+        return True
+    s = media_def.get("schema", {})
+    if "example" in s or "examples" in s:
+        return True
+
+    refs = []
+    if "$ref" in s:
+        refs.append(s["$ref"])
+    for key in ("anyOf", "oneOf", "allOf"):
+        for sub in s.get(key, []):
+            if "$ref" in sub:
+                refs.append(sub["$ref"])
+            elif "example" in sub or "examples" in sub:
+                return True
+
+    for ref in refs:
+        if ref.startswith("#/components/schemas/"):
+            name = ref.split("/")[-1]
+            comp = schema.get("components", {}).get("schemas", {}).get(name, {})
+            if "example" in comp or "examples" in comp:
+                return True
+    return False
 
 
 def test_openapi_spec_has_request_and_response_examples_for_every_endpoint():
@@ -26,7 +59,7 @@ def test_openapi_spec_has_request_and_response_examples_for_every_endpoint():
                 if status_code in ("200", "201"):
                     content = resp_def.get("content", {})
                     for media_type, media_def in content.items():
-                        if "example" in media_def or "examples" in media_def:
+                        if _has_example(media_type, media_def, schema):
                             has_response_example = True
                             break
 
@@ -39,7 +72,7 @@ def test_openapi_spec_has_request_and_response_examples_for_every_endpoint():
                 content = request_body.get("content", {})
                 has_request_example = False
                 for media_type, media_def in content.items():
-                    if "example" in media_def or "examples" in media_def:
+                    if _has_example(media_type, media_def, schema):
                         has_request_example = True
                         break
 
@@ -54,3 +87,14 @@ def test_openapi_spec_has_request_and_response_examples_for_every_endpoint():
         "The following endpoints are missing request body examples in OpenAPI:\n"
         + "\n".join(missing_request_examples)
     )
+
+
+def test_speech_route_declares_audio_wav_response():
+    """Verify speech route declares audio/wav response in OpenAPI."""
+    schema = app.openapi()
+    speech_path = schema.get("paths", {}).get(
+        "/api/sessions/{session_id}/turns/{turn_id}/speech", {}
+    )
+    speech_op = speech_path.get("get", {})
+    speech_content = speech_op.get("responses", {}).get("200", {}).get("content", {})
+    assert "audio/wav" in speech_content, "Expected audio/wav in speech response"

@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import os
 import uuid
 import wave
 from datetime import datetime, timedelta, timezone
@@ -213,83 +214,6 @@ def make_fake_wav(*, duration_ms: int = 1000) -> bytes:
         wf.setframerate(16000)
         wf.writeframes(pcm)
     return buf.getvalue()
-
-
-def _ensure_demo_tools_registered() -> None:
-    """Register close_app and browser_task demo tools in W4 registry if missing."""
-    from app.agent import tools
-    from app.contracts.workflow import ToolSpec
-
-    if "close_app" not in tools.TOOL_POLICIES:
-
-        def _validate_close_app(arguments: Any, _hosts: frozenset[str]) -> None:
-            if not isinstance(arguments, dict) or set(arguments) != {"app"}:
-                raise tools._invalid("close_app requires exactly one app argument")
-            app = arguments["app"]
-            if not isinstance(app, str) or not app.strip() or len(app) > 200:
-                raise tools._invalid("app must be a nonblank string <= 200 chars")
-
-        tools.TOOL_POLICIES["close_app"] = tools.ToolPolicy(
-            spec=ToolSpec(
-                name="close_app",
-                description="Close an application",
-                consequential=True,
-            ),
-            scope="system:process",
-            validate=_validate_close_app,
-            idempotent=False,
-        )
-        tools.TOOL_SPECS["close_app"] = tools.TOOL_POLICIES["close_app"].spec
-
-    if "browser_task" not in tools.TOOL_POLICIES:
-
-        def _validate_browser_task(arguments: Any, _hosts: frozenset[str]) -> None:
-            if not isinstance(arguments, dict) or "goal" not in arguments:
-                raise tools._invalid("browser_task requires a goal argument")
-            goal = arguments["goal"]
-            if not isinstance(goal, str) or not goal.strip() or len(goal) > 500:
-                raise tools._invalid("goal must be a nonblank string <= 500 chars")
-
-        tools.TOOL_POLICIES["browser_task"] = tools.ToolPolicy(
-            spec=ToolSpec(
-                name="browser_task",
-                description="Perform a browser automation task",
-                consequential=True,
-            ),
-            scope="browser:task",
-            validate=_validate_browser_task,
-            idempotent=False,
-        )
-        tools.TOOL_SPECS["browser_task"] = tools.TOOL_POLICIES["browser_task"].spec
-
-    tools.DEFAULT_MOCK_SCOPES = frozenset(
-        policy.scope for policy in tools.TOOL_POLICIES.values()
-    )
-
-    orig_invoke = tools.ToolRuntime.invoke
-    if not getattr(orig_invoke, "_voicebot_patched", False):
-
-        def patched_invoke(self: Any, tool_name: str, arguments: Any) -> str:
-            if tool_name == "close_app":
-                tools.validate_tool_call(
-                    tool_name, arguments, allowed_hosts=self.allowed_hosts
-                )
-                return f"Closed {arguments['app']}"
-            if tool_name == "browser_task":
-                tools.validate_tool_call(
-                    tool_name, arguments, allowed_hosts=self.allowed_hosts
-                )
-                from app.sessions.bridge import browser_bridge
-
-                if not browser_bridge.is_connected:
-                    raise tools.WorkflowPolicyError(
-                        "BROWSER_NOT_CONNECTED", "Browser extension is not connected"
-                    )
-                return f"Completed browser task: {arguments['goal']}"
-            return orig_invoke(self, tool_name, arguments)
-
-        patched_invoke._voicebot_patched = True  # type: ignore[attr-defined]
-        tools.ToolRuntime.invoke = patched_invoke  # type: ignore[method-assign]
 
 
 class SessionRecord(ContractModel):
@@ -1066,12 +990,24 @@ class SessionService:
         if not sess:
             raise SessionNotFoundError(session_id)
         if session_id not in self._capture_statuses:
+            try:
+                from app.audio.config import AudioConfig
+
+                audio_cfg = AudioConfig.from_env()
+                source = audio_cfg.audio_source
+                wake_word = audio_cfg.wake_word
+                wake_required = audio_cfg.wake_required
+            except Exception:
+                source = os.getenv("AUDIO_SOURCE", "mock").strip().lower()
+                wake_word = os.getenv("AUDIO_WAKE_WORD", "hey_jarvis")
+                wake_required = True
+
             self._capture_statuses[session_id] = CaptureStatus(
                 session_id=session_id,
                 state="idle",
-                source="mock",
-                wake_required=True,
-                wake_word="hey_jarvis",
+                source=source,
+                wake_required=wake_required,
+                wake_word=wake_word,
             )
         return self._capture_statuses[session_id]
 
@@ -1137,8 +1073,6 @@ class SessionService:
         ):
             raise SessionTerminalStateError(session_id, sess.state)
 
-        _ensure_demo_tools_registered()
-
         ts = now or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -1165,9 +1099,17 @@ class SessionService:
         from app.agent import tools
         from app.agent.approvals import approval_requests_for, steps_needing_approval
         from app.agent.proposals import plan_from_proposal
-        from app.reasoning.planner import RuleBasedPlanner
+        from app.reasoning.planner import LLMWorkflowPlanner, RuleBasedPlanner
 
-        planner = RuleBasedPlanner()
+        llm_env = os.getenv("REASONING_LLM_PROVIDER", "mock").strip().lower()
+        if llm_env == "ollama":
+            from app.reasoning.ollama import create_llm_provider
+
+            provider = create_llm_provider()
+            planner: Any = LLMWorkflowPlanner(provider, correlation_id=cid)
+        else:
+            planner = RuleBasedPlanner()
+
         decision = planner.plan(
             user_turn,
             bundle,
@@ -1228,7 +1170,18 @@ class SessionService:
                 spoken_text = ""
                 if "stats" in wf_result.outputs:
                     output_text = wf_result.outputs["stats"]
-                    spoken_text = "Chrome, about 3.1 GB."
+                    if "Top memory:" in output_text:
+                        top_part = output_text.split("Top memory:", 1)[1].strip()
+                        top_line = top_part.splitlines()[0].strip()
+                        first_entry = top_line.split(",")[0].strip().rstrip(".")
+                        parts = first_entry.rsplit(" ", 2)
+                        if len(parts) == 3:
+                            pname, val, unit = parts
+                            spoken_text = f"{pname.capitalize()}, about {val} {unit}."
+                        else:
+                            spoken_text = f"{first_entry}."
+                    else:
+                        spoken_text = output_text[:300]
                 elif wf_result.outputs:
                     output_text = next(iter(wf_result.outputs.values()))
                     spoken_text = output_text[:300]
@@ -1245,20 +1198,64 @@ class SessionService:
                     answer=output_text,
                     spoken_text=spoken_text,
                 )
-        else:
-            answer_text = "I don't have enough evidence to answer that question."
+        elif decision.error is not None:
             turn_resp = TurnResponse(
                 session_id=session_id,
                 turn_id=turn_id,
-                kind="answer",
-                answer=answer_text,
-                source_ids=[],
-                spoken_text=answer_text,
+                kind="error",
+                error_code=decision.error.code,
+                answer=decision.error.message_safe_for_user,
+                spoken_text=decision.error.message_safe_for_user,
             )
+        else:
+            from app.reasoning.grounding import grounded_answer
+            from app.reasoning.llm import LLMReasoningAdapter
+            from app.reasoning.ollama import create_llm_provider
+
+            provider = create_llm_provider()
+            adapter = LLMReasoningAdapter(provider)
+            outcome = grounded_answer(
+                user_turn.text,
+                bundle,
+                adapter=adapter,
+                session_id=session_id,
+                now=ts,
+            )
+            if outcome.error is not None:
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="error",
+                    error_code=outcome.error.code,
+                    answer=outcome.error.message_safe_for_user,
+                    spoken_text=outcome.error.message_safe_for_user,
+                )
+            elif outcome.result is not None:
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="answer",
+                    answer=outcome.result.answer,
+                    source_ids=outcome.result.source_ids,
+                    spoken_text=outcome.result.answer[:300],
+                )
+            else:
+                answer_text = "I don't have enough evidence to answer that question."
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="answer",
+                    answer=answer_text,
+                    source_ids=[],
+                    spoken_text=answer_text,
+                )
 
         if session_id not in self._turns:
             self._turns[session_id] = {}
         self._turns[session_id][turn_id] = turn_resp
+        while len(self._turns[session_id]) > 20:
+            oldest_key = next(iter(self._turns[session_id]))
+            del self._turns[session_id][oldest_key]
 
         if session_id not in self._conversation_turns:
             self._conversation_turns[session_id] = []
@@ -1273,6 +1270,10 @@ class SessionService:
             at=ts,
         )
         self._conversation_turns[session_id].append(assistant_turn)
+        if len(self._conversation_turns[session_id]) > 20:
+            self._conversation_turns[session_id] = self._conversation_turns[session_id][
+                -20:
+            ]
 
         turn_evt = AssistantTurnEvent(
             event_id=f"event-turn-{uuid.uuid4().hex[:8]}",
@@ -1299,13 +1300,17 @@ class SessionService:
         return turn
 
     def get_turn_speech(self, session_id: str, turn_id: str) -> bytes:
-        """Get WAV audio for a turn's spoken text, or 404 when TTS is off."""
+        """Get WAV audio for turn spoken text, or 404 when TTS unavailable."""
         sess = self.get_session(session_id, check_expiry=True)
         if not sess:
             raise SessionNotFoundError(session_id)
-        _ = self.get_turn(session_id, turn_id)
+        turn = self.get_turn(session_id, turn_id)
         if not settings.tts_enabled:
             raise TTSUnavailableError("Text-to-speech is disabled.")
+        if not turn.spoken_text or not turn.spoken_text.strip():
+            raise TTSUnavailableError("Turn has no spoken text.")
+        if sess.mode != "mock":
+            raise TTSUnavailableError("TTS synthesizer unavailable in non-mock mode.")
         return make_fake_wav(duration_ms=1000)
 
     def record_browser_action(

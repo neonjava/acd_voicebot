@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import secrets
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -29,13 +30,14 @@ class BrowserBridge:
     - Exactly one extension connection active per backend
     - First message must be hello with launch token (never logged)
     - Exactly one action in flight at a time
-    - 15s timeout yields BROWSER_ACTION_TIMEOUT
+    - 15s timeout yields BROWSER_TIMEOUT
     - Disconnect cancels in-flight actions safely
     - When disconnected, perform returns BROWSER_NOT_CONNECTED
     """
 
     def __init__(self) -> None:
         self._active_socket: WebSocket | None = None
+        self._connecting = False
         self._lock = asyncio.Lock()
         self._pending_action: dict[str, asyncio.Future[BrowserActionResult]] = {}
         self._in_flight_lock = asyncio.Lock()
@@ -48,7 +50,7 @@ class BrowserBridge:
     async def handle_connection(self, websocket: WebSocket) -> None:
         """Handle incoming WebSocket connection from the browser extension."""
         async with self._lock:
-            if self._active_socket is not None:
+            if self._active_socket is not None or self._connecting:
                 # Refuse second extension connection
                 logger.warning(
                     "Second browser extension connection refused: one already active"
@@ -57,42 +59,58 @@ class BrowserBridge:
                     code=1008, reason="Another extension is already connected"
                 )
                 return
+            self._connecting = True
 
-        await websocket.accept()
-
-        # Enforce handshake: first message must be hello with launch token
+        connected = False
         try:
-            first_msg_raw = await asyncio.wait_for(
-                websocket.receive_text(), timeout=5.0
-            )
-            first_msg: Any = json.loads(first_msg_raw)
-        except Exception:
-            logger.warning(
-                "Browser extension handshake failed: invalid JSON or timeout"
-            )
-            await websocket.close(code=1008, reason="Invalid handshake")
-            return
+            expected_token = settings.launch_token
+            if not expected_token:
+                logger.warning("Browser bridge refused: no launch token configured")
+                await websocket.close(
+                    code=1008, reason="bridge disabled: no launch token"
+                )
+                return
 
-        if not isinstance(first_msg, dict) or first_msg.get("type") != "hello":
-            logger.warning(
-                "Browser extension handshake failed: first message not hello"
-            )
-            await websocket.close(code=1008, reason="First message must be hello")
-            return
+            await websocket.accept()
 
-        expected_token = settings.launch_token
-        if expected_token:
+            # Enforce handshake: first message must be hello with launch token
+            try:
+                first_msg_raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=5.0
+                )
+                first_msg: Any = json.loads(first_msg_raw)
+            except Exception:
+                logger.warning(
+                    "Browser extension handshake failed: invalid JSON or timeout"
+                )
+                await websocket.close(code=1008, reason="Invalid handshake")
+                return
+
+            if not isinstance(first_msg, dict) or first_msg.get("type") != "hello":
+                logger.warning(
+                    "Browser extension handshake failed: first message not hello"
+                )
+                await websocket.close(code=1008, reason="First message must be hello")
+                return
+
             token = first_msg.get("token")
-            if token != expected_token:
+            if not token or not secrets.compare_digest(str(token), expected_token):
                 logger.warning(
                     "Browser extension handshake failed: invalid launch token"
                 )
                 await websocket.close(code=1008, reason="Invalid launch token")
                 return
 
-        async with self._lock:
-            self._active_socket = websocket
-        logger.info("Browser extension bridge connected")
+            async with self._lock:
+                self._active_socket = websocket
+                connected = True
+            logger.info("Browser extension bridge connected")
+        finally:
+            async with self._lock:
+                self._connecting = False
+
+        if not connected:
+            return
 
         # Receive loop for results from extension
         try:

@@ -9,17 +9,31 @@ from starlette.websockets import WebSocketDisconnect
 from app.config import settings
 from app.contracts.browser import BrowserAction, BrowserActionResult
 from app.contracts.common import SessionState
+from app.contracts.sessions import BrowserActionPayload
 from app.sessions.bridge import BrowserBridge, BrowserBridgeError, browser_bridge
 from app.sessions.service import session_service
 
 
 @pytest.fixture(autouse=True)
-def clean_bridge():
+def clean_bridge(monkeypatch):
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
     browser_bridge.reset_for_tests()
     session_service.clear()
     yield
     browser_bridge.reset_for_tests()
     session_service.clear()
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_when_no_launch_token_configured(monkeypatch):
+    """When no launch token is configured, bridge refuses connection with 1008."""
+    monkeypatch.setattr(settings, "launch_token", None)
+    bridge = BrowserBridge()
+    mock_ws = AsyncMockWebSocket()
+    mock_ws.incoming.put_nowait(json.dumps({"type": "hello"}))
+    await bridge.handle_connection(mock_ws)
+    assert mock_ws.closed
+    assert mock_ws.close_code == 1008
 
 
 @pytest.mark.asyncio
@@ -55,13 +69,15 @@ async def test_bridge_handshake_rejects_missing_or_invalid_token(monkeypatch):
 @pytest.mark.asyncio
 async def test_bridge_refuses_second_simultaneous_connection(monkeypatch):
     """Only one extension connection is active at a time; second is closed."""
-    monkeypatch.setattr(settings, "launch_token", None)
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
     bridge = BrowserBridge()
 
     ws1 = AsyncMockWebSocket()
     ws2 = AsyncMockWebSocket()
 
-    ws1.incoming.put_nowait(json.dumps({"type": "hello"}))
+    ws1.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
     t1 = asyncio.create_task(bridge.handle_connection(ws1))
 
     for _ in range(50):
@@ -72,7 +88,9 @@ async def test_bridge_refuses_second_simultaneous_connection(monkeypatch):
     assert bridge.is_connected
 
     # While conn1 is active, conn2 attempts to connect
-    ws2.incoming.put_nowait(json.dumps({"type": "hello"}))
+    ws2.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
     await bridge.handle_connection(ws2)
     assert ws2.closed
     assert ws2.close_code == 1008
@@ -83,12 +101,67 @@ async def test_bridge_refuses_second_simultaneous_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bridge_perform_action_and_result_routing():
+async def test_bridge_two_simultaneous_connections_race(monkeypatch):
+    """When two connections attempt handshake, exactly one succeeds."""
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
+    bridge = BrowserBridge()
+    ws1 = AsyncMockWebSocket()
+    ws2 = AsyncMockWebSocket()
+    ws1.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
+    ws2.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
+
+    t1 = asyncio.create_task(bridge.handle_connection(ws1))
+    t2 = asyncio.create_task(bridge.handle_connection(ws2))
+
+    for _ in range(50):
+        if bridge.is_connected:
+            break
+        await asyncio.sleep(0.01)
+
+    assert bridge.is_connected
+    closed_codes = [ws.close_code for ws in (ws1, ws2) if ws.closed]
+    assert 1008 in closed_codes
+
+    for ws in (ws1, ws2):
+        if not ws.closed:
+            ws.incoming.put_nowait(json.dumps({"type": "bye"}))
+    await asyncio.gather(t1, t2)
+
+
+def test_browser_action_payload_validation():
+    """BrowserActionPayload requires error_code on failure and forbids on success."""
+    action = BrowserAction(
+        action_id="act-1", session_id="session-demo", kind="click", ref="e1"
+    )
+    with pytest.raises(ValueError, match="a failed result needs error_code"):
+        BrowserActionPayload(action=action, ok=True, error_code="SOMETHING_FAILED")
+
+    with pytest.raises(ValueError, match="a failed result needs error_code"):
+        BrowserActionPayload(action=action, ok=False, error_code=None)
+
+    valid_ok = BrowserActionPayload(action=action, ok=True)
+    assert valid_ok.ok is True and valid_ok.error_code is None
+
+    valid_fail = BrowserActionPayload(
+        action=action, ok=False, error_code="ELEMENT_NOT_FOUND"
+    )
+    assert valid_fail.ok is False and valid_fail.error_code == "ELEMENT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_bridge_perform_action_and_result_routing(monkeypatch):
     """Action is sent to extension and resolved by action_id."""
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
     bridge = BrowserBridge()
     ws = AsyncMockWebSocket()
 
-    ws.incoming.put_nowait(json.dumps({"type": "hello"}))
+    ws.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
     conn_task = asyncio.create_task(bridge.handle_connection(ws))
 
     for _ in range(50):
@@ -127,12 +200,15 @@ async def test_bridge_perform_action_and_result_routing():
 
 
 @pytest.mark.asyncio
-async def test_bridge_action_timeout_yields_browser_timeout():
+async def test_bridge_action_timeout_yields_browser_timeout(monkeypatch):
     """Action exceeding timeout raises BrowserBridgeError with code BROWSER_TIMEOUT."""
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
     bridge = BrowserBridge()
     ws = AsyncMockWebSocket()
 
-    ws.incoming.put_nowait(json.dumps({"type": "hello"}))
+    ws.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
     conn_task = asyncio.create_task(bridge.handle_connection(ws))
 
     for _ in range(50):
@@ -153,12 +229,15 @@ async def test_bridge_action_timeout_yields_browser_timeout():
 
 
 @pytest.mark.asyncio
-async def test_bridge_disconnect_mid_task_cancels_action_safely():
+async def test_bridge_disconnect_mid_task_cancels_action_safely(monkeypatch):
     """Disconnect mid-task fails safely with BROWSER_DISCONNECTED."""
+    monkeypatch.setattr(settings, "launch_token", "secret-launch-token-123")
     bridge = BrowserBridge()
     ws = AsyncMockWebSocket()
 
-    ws.incoming.put_nowait(json.dumps({"type": "hello"}))
+    ws.incoming.put_nowait(
+        json.dumps({"type": "hello", "token": "secret-launch-token-123"})
+    )
     conn_task = asyncio.create_task(bridge.handle_connection(ws))
 
     for _ in range(50):

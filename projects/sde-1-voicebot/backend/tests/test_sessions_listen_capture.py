@@ -134,3 +134,39 @@ def test_speech_nonexistent_turn_returns_404():
     resp = client.get(f"/api/sessions/{sess.session_id}/turns/turn-missing/speech")
     assert resp.status_code == 404
     assert resp.json()["code"] == "TURN_NOT_FOUND"
+
+
+def test_speech_audio_returns_404_when_not_in_mock_mode(monkeypatch):
+    """GET speech returns 404 TTS_UNAVAILABLE when session mode is not mock."""
+    monkeypatch.setattr(settings, "tts_enabled", True)
+    sess = session_service.create_session(
+        "session-real-tts", initial_state=SessionState.active
+    )
+    session_service._sessions[sess.session_id].mode = "real"
+
+    turn = session_service.create_turn(
+        sess.session_id,
+        TurnRequest(text="hello"),
+    )
+
+    resp = client.get(f"/api/sessions/{sess.session_id}/turns/{turn.turn_id}/speech")
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "TTS_UNAVAILABLE"
+
+
+def test_speech_audio_returns_404_when_turn_has_no_spoken_text(monkeypatch):
+    """GET speech returns 404 TTS_UNAVAILABLE when turn has no spoken text."""
+    monkeypatch.setattr(settings, "tts_enabled", True)
+    sess = session_service.create_session(
+        "session-no-spoken", initial_state=SessionState.active
+    )
+
+    turn = session_service.create_turn(
+        sess.session_id,
+        TurnRequest(text="hello"),
+    )
+    session_service._turns[sess.session_id][turn.turn_id].spoken_text = None
+
+    resp = client.get(f"/api/sessions/{sess.session_id}/turns/{turn.turn_id}/speech")
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "TTS_UNAVAILABLE"

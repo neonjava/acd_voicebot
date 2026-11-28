@@ -21,7 +21,6 @@ from fastapi import (
     status,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -820,14 +819,49 @@ def validate_idempotency_key(key: str | None, corr_id: str) -> None:
 # --- Endpoints ---
 
 
-@app.get("/api/health")
+@app.get(
+    "/api/health",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "ok",
+                        "mode": "mock",
+                        "modules": {
+                            "audio": "ok",
+                            "transcription": "ok",
+                            "reasoning": "ok",
+                            "workflow": "ok",
+                        },
+                    }
+                }
+            }
+        }
+    },
+)
 async def health() -> dict[str, Any]:
     """Health endpoint returning aggregated status across all module gateways."""
     aggregated = session_service.get_aggregated_health()
     return aggregated.model_dump(mode="json")
 
 
-@app.get("/api/ready")
+@app.get(
+    "/api/ready",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "ready",
+                        "mode": "mock",
+                        "auth": "off",
+                    }
+                }
+            }
+        }
+    },
+)
 async def ready() -> dict[str, str]:
     """Readiness endpoint verifying configuration and auth mode."""
     if not settings.mock_mode:
@@ -1102,7 +1136,22 @@ async def get_session_events(
     )
 
 
-@app.get("/api/sessions/{session_id}/events/stream")
+@app.get(
+    "/api/sessions/{session_id}/events/stream",
+    responses={
+        200: {
+            "content": {
+                "text/event-stream": {
+                    "example": (
+                        'event: session.status\ndata: {"session_id": "session-demo",'
+                        ' "state": "completed"}\n\n'
+                    )
+                }
+            },
+            "description": "Server-sent events stream for session events and status",
+        }
+    },
+)
 async def stream_session_events(
     request: Request,
     session_id: str,
@@ -1176,6 +1225,24 @@ async def stream_session_events(
 @app.get(
     "/api/sessions/{session_id}/approvals",
     response_model=list[ApprovalRequest],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "approval_id": "p1-approval-close",
+                            "plan_id": "p1",
+                            "step_id": "close",
+                            "session_id": "session-demo",
+                            "status": "pending",
+                            "expires_at": "2026-01-01T00:05:00Z",
+                        }
+                    ]
+                }
+            }
+        }
+    },
 )
 async def list_session_approvals(
     session_id: str,
@@ -1188,6 +1255,22 @@ async def list_session_approvals(
 @app.post(
     "/api/sessions/{session_id}/approvals/{approval_id}",
     response_model=ApprovalRequest,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "approval_id": "p1-approval-close",
+                        "plan_id": "p1",
+                        "step_id": "close",
+                        "session_id": "session-demo",
+                        "status": "approved",
+                        "expires_at": "2026-01-01T00:05:00Z",
+                    }
+                }
+            }
+        }
+    },
 )
 async def decide_session_approval(
     request: Request,
@@ -1233,6 +1316,21 @@ async def create_session_turn(
 @app.get(
     "/api/sessions/{session_id}/capture",
     response_model=CaptureStatus,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "session-demo",
+                        "state": "idle",
+                        "source": "mock",
+                        "wake_required": True,
+                        "wake_word": "hey_jarvis",
+                    }
+                }
+            }
+        }
+    },
 )
 async def get_session_capture_status(
     session_id: str,
@@ -1245,6 +1343,21 @@ async def get_session_capture_status(
 @app.post(
     "/api/sessions/{session_id}/listen",
     response_model=CaptureStatus,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "session-demo",
+                        "state": "listening",
+                        "source": "mock",
+                        "wake_required": True,
+                        "wake_word": "hey_jarvis",
+                    }
+                }
+            }
+        }
+    },
 )
 async def set_session_listen_action(
     request: Request,
@@ -1263,6 +1376,12 @@ async def set_session_listen_action(
 
 @app.get(
     "/api/sessions/{session_id}/turns/{turn_id}/speech",
+    responses={
+        200: {
+            "content": {"audio/wav": {}},
+            "description": "Synthesized WAV audio stream",
+        }
+    },
 )
 async def get_turn_speech_audio(
     session_id: str,
@@ -1282,242 +1401,3 @@ async def get_turn_speech_audio(
 async def browser_bridge_websocket(websocket: WebSocket) -> None:
     """WebSocket connection for the browser extension bridge."""
     await browser_bridge.handle_connection(websocket)
-
-
-# --- Custom OpenAPI Schema with Complete Request and Response Examples ---
-
-
-def custom_openapi() -> dict[str, Any]:
-    """Generate OpenAPI schema ensuring examples for every endpoint."""
-    if app.openapi_schema:
-        return app.openapi_schema
-
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-
-    endpoint_examples: dict[tuple[str, str], dict[str, Any]] = {
-        ("/api/health", "get"): {
-            "response": {
-                "status": "ok",
-                "mode": "mock",
-                "modules": {
-                    "audio": "ok",
-                    "transcription": "ok",
-                    "reasoning": "ok",
-                    "workflow": "ok",
-                },
-            }
-        },
-        ("/api/ready", "get"): {
-            "response": {
-                "status": "ready",
-                "auth": "off",
-                "port": 8000,
-            }
-        },
-        ("/api/sessions/mock", "post"): {
-            "request": {
-                "session_id": "session-demo",
-                "simulate_error": False,
-                "interim_results": False,
-            },
-            "response": {
-                "session_id": "session-demo",
-                "state": "completed",
-                "mode": "mock",
-                "events": [],
-            },
-        },
-        ("/api/sessions", "post"): {
-            "request": {
-                "session_id": "session-demo",
-                "mode": "mock",
-                "initial_state": "created",
-            },
-            "response": {
-                "session_id": "session-demo",
-                "state": "created",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": None,
-            },
-        },
-        ("/api/sessions/{session_id}", "get"): {
-            "response": {
-                "session_id": "session-demo",
-                "state": "active",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": None,
-            }
-        },
-        ("/api/sessions/{session_id}/pause", "post"): {
-            "request": {"reason": "User paused the session."},
-            "response": {
-                "session_id": "session-demo",
-                "state": "paused",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": None,
-            },
-        },
-        ("/api/sessions/{session_id}/resume", "post"): {
-            "request": {"reason": "User resumed the session."},
-            "response": {
-                "session_id": "session-demo",
-                "state": "active",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": None,
-            },
-        },
-        ("/api/sessions/{session_id}/stop", "post"): {
-            "request": {"reason": "User stopped the session."},
-            "response": {
-                "session_id": "session-demo",
-                "state": "completed",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": None,
-            },
-        },
-        ("/api/sessions/{session_id}/expire", "post"): {
-            "response": {
-                "session_id": "session-demo",
-                "state": "expired",
-                "mode": "mock",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "expires_at": "2026-01-01T00:00:00Z",
-            }
-        },
-        ("/api/sessions/{session_id}/events", "get"): {
-            "response": {
-                "session_id": "session-demo",
-                "events": [],
-                "from_sequence": 0,
-                "total_events": 0,
-                "has_more": False,
-            }
-        },
-        ("/api/sessions/{session_id}/events/stream", "get"): {
-            "response": {
-                "session_id": "session-demo",
-                "events": [],
-                "from_sequence": 0,
-                "total_events": 0,
-                "has_more": False,
-            }
-        },
-        ("/api/sessions/{session_id}/approvals", "get"): {
-            "response": [
-                {
-                    "approval_id": "p1-approval-close",
-                    "plan_id": "p1",
-                    "step_id": "close",
-                    "session_id": "session-demo",
-                    "status": "pending",
-                    "expires_at": "2026-01-01T00:05:00Z",
-                }
-            ]
-        },
-        ("/api/sessions/{session_id}/approvals/{approval_id}", "post"): {
-            "request": {"decision": "approve"},
-            "response": {
-                "approval_id": "p1-approval-close",
-                "plan_id": "p1",
-                "step_id": "close",
-                "session_id": "session-demo",
-                "status": "approved",
-                "expires_at": "2026-01-01T00:05:00Z",
-            },
-        },
-        ("/api/sessions/{session_id}/turns", "post"): {
-            "request": {
-                "text": "what's using the most RAM?",
-                "active_app": "chrome",
-                "active_window_title": "Google Chrome",
-            },
-            "response": {
-                "session_id": "session-demo",
-                "turn_id": "turn-demo-1",
-                "kind": "proposal",
-                "answer": "RAM 62% used. Top memory: chrome 3.1 GB.",
-                "proposal": {
-                    "proposal_id": "p1",
-                    "session_id": "session-demo",
-                    "correlation_id": "c1",
-                    "summary": "Check memory and CPU usage",
-                    "steps": [
-                        {
-                            "step_id": "stats",
-                            "tool_name": "system_stats",
-                            "arguments": {},
-                            "requires_approval": False,
-                        }
-                    ],
-                    "source_ids": ["turn-demo-1"],
-                },
-                "approvals": [],
-                "spoken_text": "Chrome, about 3.1 GB.",
-            },
-        },
-        ("/api/sessions/{session_id}/capture", "get"): {
-            "response": {
-                "session_id": "session-demo",
-                "state": "idle",
-                "source": "mock",
-                "wake_required": True,
-                "wake_word": "hey_jarvis",
-            }
-        },
-        ("/api/sessions/{session_id}/listen", "post"): {
-            "request": {"action": "start"},
-            "response": {
-                "session_id": "session-demo",
-                "state": "listening",
-                "source": "mock",
-                "wake_required": True,
-                "wake_word": "hey_jarvis",
-            },
-        },
-        ("/api/sessions/{session_id}/turns/{turn_id}/speech", "get"): {
-            "response": {
-                "content_type": "audio/wav",
-                "size_bytes": 32044,
-            }
-        },
-    }
-
-    for (path, method), ex in endpoint_examples.items():
-        if path in schema.get("paths", {}) and method in schema["paths"][path]:
-            op = schema["paths"][path][method]
-            if "request" in ex and "requestBody" in op:
-                req_content = op["requestBody"].setdefault("content", {})
-                app_json = req_content.setdefault("application/json", {})
-                app_json["example"] = ex["request"]
-            if "response" in ex:
-                resps = op.setdefault("responses", {})
-                for sc in ("200", "201"):
-                    if sc in resps:
-                        c_dict = resps[sc].setdefault("content", {})
-                        target_type = (
-                            "application/json" if "speech" not in path else "audio/wav"
-                        )
-                        sub = c_dict.setdefault(target_type, {})
-                        sub["example"] = ex["response"]
-
-    app.openapi_schema = schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
