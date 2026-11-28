@@ -1,14 +1,22 @@
 """Session contracts and wire projections owned by W5 (Backend)."""
 
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Literal, Self, Union
 
 from pydantic import Field, field_validator, model_validator
 
-from app.contracts.audio import SpeechEvent
+from app.contracts.audio import CaptureStatus, SpeechEvent
+from app.contracts.browser import BrowserAction
 from app.contracts.common import ContractModel, EventEnvelope, SessionState
 from app.contracts.transcription import TranscriptEvent
-from app.contracts.workflow import AuditEvent
+from app.contracts.workflow import (
+    ApprovalRequest,
+    AuditEvent,
+    WorkflowProposal,
+    WorkflowResult,
+)
 
 
 class AudioChunkMetadata(ContractModel):
@@ -56,12 +64,7 @@ class WorkflowAuditEvent(EventEnvelope[AuditEvent]):
     event_type: Literal["workflow.audit"] = "workflow.audit"
 
 
-SessionEvent = Union[
-    AudioChunkEvent,
-    TranscriptEvent,
-    SpeechStreamEvent,
-    WorkflowAuditEvent,
-]
+# (Forward-declared SessionEvent defined after Week 4 models)
 
 
 class MockSessionRequest(ContractModel):
@@ -171,3 +174,112 @@ class HealthResponse(ContractModel):
     status: OverallHealthStatus
     mode: Literal["mock"] = "mock"
     modules: dict[str, ModuleHealthStatus]
+
+
+# --- Week 4: conversational turns (W5 implements, W6 consumes) ---
+
+
+class TurnRequest(ContractModel):
+    """One thing the user said or typed to the assistant."""
+
+    text: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    active_app: str | None = Field(default=None, max_length=200)
+    active_window_title: str | None = Field(default=None, max_length=500)
+
+
+TurnKind = Literal["answer", "clarify", "proposal", "error"]
+
+
+class TurnResponse(ContractModel):
+    """The assistant's reply to one turn.
+
+    - ``answer``: ``answer`` is set, citing ``source_ids`` (empty means the
+      evidence was insufficient and the answer says so).
+    - ``clarify``: ``clarify`` holds one short question.
+    - ``proposal``: ``proposal`` is set. ``approvals`` lists the pending
+      approvals it needs; ``workflow`` is set when only safe steps ran directly.
+    - ``error``: ``error_code`` holds a safe error code.
+    ``spoken_text`` is the short text the assistant speaks (TTS), if any.
+    """
+
+    session_id: str = Field(min_length=1, pattern=r"\S")
+    turn_id: str = Field(min_length=1, pattern=r"\S")
+    kind: TurnKind
+    answer: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    clarify: str | None = Field(default=None, max_length=300)
+    proposal: WorkflowProposal | None = None
+    approvals: list[ApprovalRequest] = Field(default_factory=list)
+    workflow: WorkflowResult | None = None
+    error_code: str | None = None
+    spoken_text: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def fields_match_kind(self) -> Self:
+        required = {
+            "answer": self.answer,
+            "clarify": self.clarify,
+            "proposal": self.proposal,
+            "error": self.error_code,
+        }
+        if required[self.kind] is None:
+            raise ValueError(f"a {self.kind} turn needs its {self.kind} field")
+        if self.kind != "proposal" and (self.approvals or self.workflow):
+            raise ValueError("approvals and workflow belong to proposal turns")
+        if any(
+            sid != self.session_id for sid in [a.session_id for a in self.approvals]
+        ):
+            raise ValueError("approvals must belong to this session")
+        return self
+
+
+# --- Week 4 Stream Events & Union ---
+
+
+class CaptureListenRequest(ContractModel):
+    """Payload for starting or stopping microphone capture."""
+
+    action: Literal["start", "stop"]
+
+
+class AudioCaptureEvent(EventEnvelope[CaptureStatus]):
+    """Session stream envelope for audio capture status changes."""
+
+    producer: Literal["audio"] = "audio"
+    event_type: Literal["audio.capture"] = "audio.capture"
+
+
+class AssistantTurnEvent(EventEnvelope[TurnResponse]):
+    """Session stream envelope for assistant conversational turn responses."""
+
+    producer: Literal["assistant"] = "assistant"
+    event_type: Literal["assistant.turn"] = "assistant.turn"
+
+
+class BrowserActionPayload(ContractModel):
+    """Payload for browser action events without sensitive snapshot text."""
+
+    action: BrowserAction
+    ok: bool
+    error_code: str | None = None
+
+
+class BrowserActionEvent(EventEnvelope[BrowserActionPayload]):
+    """Session stream envelope for browser actions executed via the extension bridge."""
+
+    producer: Literal["browser"] = "browser"
+    event_type: Literal["browser.action"] = "browser.action"
+
+
+SessionEvent = Union[
+    AudioChunkEvent,
+    TranscriptEvent,
+    SpeechStreamEvent,
+    WorkflowAuditEvent,
+    AudioCaptureEvent,
+    AssistantTurnEvent,
+    BrowserActionEvent,
+]
+
+MockSessionResponse.model_rebuild()
+SessionEventStreamResponse.model_rebuild()

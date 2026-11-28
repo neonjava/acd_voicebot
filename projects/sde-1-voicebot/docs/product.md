@@ -109,6 +109,22 @@ Each issue = the internship task (mandatory, checked by reviewers) + the product
 
 Scenarios S1–S5 end to end on Fedora and Windows. RAG over opted-in folders, YouTube via Playwright, Piper voice replies, glow overlay, packaging (AppImage/RPM and Windows installer), failure handling, demo video.
 
+### Week 4 status and plan (hardening and Day 30 demo)
+
+Week 3 merged all six modules (858 tests). The Week 4 issues finish the real conversation loop and harden it for the Day 30 release gate (clean-clone setup, full demo with a normal path and a failure path, critical defects fixed, tests and CI green, README and known limitations):
+
+| Member | Official Week 4 task | Product step |
+|---|---|---|
+| Hemanth (W1) | Profiling, stress tests, privacy checks, troubleshooting guide | Live mic capture loop with `CaptureStatus`, plus the **browser extension** (reads pages, acts, draws the thread cursor) |
+| Megha (W2) | Latency benchmark, long-session consistency, redacted logging, provider guide | Piper text-to-speech for short spoken replies |
+| Saanvi (W3) | Golden test set, privacy and consent tests, latency, data-handling docs | **Browser agent loop** (observe → act → repeat), redaction before the prompt; notes search as a stretch goal |
+| Shalini (W4) | Failure-injection tests, replay fixtures, policy matrix, runbook | `browser_task` policy (one approval per task, stops on sensitive steps) and `close_app` |
+| Rakshita (W5) | Concurrency and malformed-request tests, log hygiene, OpenAPI examples, runbook, clean-clone check | `/turns` conversation endpoint, `/api/bridge` WebSocket for the extension, listen and capture, speech audio |
+| Ruthwin (W6) | End-to-end tests, accessibility, demo mode, troubleshooting guide | **Bottom-right companion** replacing the notch: thread mascot, speech bubble with the plan and approval, step chips, typed and spoken requests |
+
+**UI change (decided 2026-11-24):** the notch is replaced by a small companion in the **bottom-right corner**: a glowing thread mascot with a speech bubble. While Jarvis works in the browser, the extension draws the thread's end as a cursor moving to each element it acts on, with a thin glow around the page (like a browser co-pilot). Desktop apps are opened through safe tools; real OS mouse and keyboard control is out of scope for Week 4 (blocked on GNOME Wayland without extra system permissions).
+
+
 ## 8. Rules for AI-agent-written code (Antigravity and others)
 
 - Read this document, the issue, `docs/contracts.md` and `AGENTS.md` first. Implement only the issue.
