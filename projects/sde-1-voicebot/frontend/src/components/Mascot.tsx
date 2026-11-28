@@ -1,151 +1,45 @@
 import React from 'react';
-import { MascotState } from '../types/contracts';
+import { CompanionState } from '../types/contracts';
+
+/**
+ * The companion's glyph: one loose thread tied in a loop. Its glow and motion show
+ * what Jarvis is doing (idle, listening, thinking, working, done, error). While
+ * working, the free end of the thread reaches out, as the browser extension's
+ * thread cursor does inside the page. Decorative: the owning button carries the label.
+ */
+export const KNOT_PATH =
+  'M6 52 C 14 50, 18 40, 22 30 C 27 17, 42 12, 46 22 C 50 32, 36 40, 28 34 C 20 28, 30 16, 42 26 C 52 34, 50 50, 40 52 C 32 54, 30 46, 36 42 C 44 37, 54 40, 60 34';
+
+/** The free end that "reaches out" while a task runs. */
+export const THREAD_TAIL_PATH = 'M60 34 C 63 30, 63 20, 62 8';
+
+export const STATE_LABELS: Record<CompanionState, string> = {
+  idle: 'Ready',
+  listening: 'Listening',
+  thinking: 'Thinking',
+  working: 'Working',
+  done: 'Done',
+  error: 'Needs attention',
+};
 
 export interface MascotProps {
-  state: MascotState;
+  state: CompanionState;
   reducedMotion?: boolean;
   size?: number;
-  onClick?: () => void;
 }
 
-const STATE_CONFIG: Record<
-  MascotState,
-  { label: string; primaryColor: string; glowColor: string; description: string }
-> = {
-  idle: {
-    label: 'Idle',
-    primaryColor: '#38bdf8', // soft cyan
-    glowColor: 'rgba(56, 189, 248, 0.35)',
-    description: 'Jarvis is resting and ready',
-  },
-  listening: {
-    label: 'Listening',
-    primaryColor: '#60a5fa', // bright blue wave
-    glowColor: 'rgba(96, 165, 250, 0.65)',
-    description: 'Listening for your voice or request',
-  },
-  thinking: {
-    label: 'Thinking',
-    primaryColor: '#c084fc', // purple / violet shimmer
-    glowColor: 'rgba(192, 132, 252, 0.6)',
-    description: 'Reasoning and planning next steps',
-  },
-  working: {
-    label: 'Working',
-    primaryColor: '#2dd4bf', // energetic teal
-    glowColor: 'rgba(45, 212, 191, 0.7)',
-    description: 'Performing browser actions and steps',
-  },
-  done: {
-    label: 'Done',
-    primaryColor: '#34d399', // emerald green
-    glowColor: 'rgba(52, 211, 153, 0.55)',
-    description: 'Finished request successfully',
-  },
-};
-
-export const Mascot: React.FC<MascotProps> = ({
-  state,
-  reducedMotion = false,
-  size = 56,
-  onClick,
-}) => {
-  const config = STATE_CONFIG[state] || STATE_CONFIG.idle;
-
-  return (
-    <div
-      className={`mascot-container mascot-${state} ${reducedMotion ? 'reduced-motion' : ''}`}
-      onClick={onClick}
-      role="status"
-      aria-label={`Jarvis Companion Mascot: ${config.label}`}
-      title={`Jarvis: ${config.label} - ${config.description}`}
-      style={{
-        width: size,
-        height: size,
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        position: 'relative',
-        cursor: onClick ? 'pointer' : 'default',
-      }}
-    >
-      {/* Outer glow ring */}
-      <div
-        className="mascot-glow-ring"
-        style={{
-          position: 'absolute',
-          inset: -4,
-          borderRadius: '50%',
-          background: `radial-gradient(circle, ${config.glowColor} 0%, transparent 70%)`,
-          filter: 'blur(4px)',
-          transition: reducedMotion ? 'none' : 'all 0.4s ease',
-          animation:
-            reducedMotion
-              ? 'none'
-              : state === 'listening' || state === 'working'
-              ? 'pulseRing 1.8s infinite ease-in-out'
-              : 'none',
-        }}
-      />
-
-      {/* SVG Glowing Thread Knot Shape */}
-      <svg
-        width={size}
-        height={size}
-        viewBox="0 0 64 64"
-        fill="none"
-        xmlns="http://www.w3.org/2000/svg"
-        className="mascot-thread-svg"
-        aria-hidden="true"
-        style={{
-          filter: `drop-shadow(0 0 8px ${config.glowColor})`,
-          transition: reducedMotion ? 'none' : 'transform 0.3s ease',
-        }}
-      >
-        <defs>
-          <linearGradient id={`mascot-grad-${state}`} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor={config.primaryColor} stopOpacity="1" />
-            <stop offset="100%" stopColor="#ffffff" stopOpacity="0.85" />
-          </linearGradient>
-        </defs>
-
-        {/* Orbiting / glowing thread path */}
-        <path
-          d="M32 10C20 10 12 18 12 28C12 40 28 44 32 54C36 44 52 40 52 28C52 18 44 10 32 10Z"
-          stroke={`url(#mascot-grad-${state})`}
-          strokeWidth="3.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeDasharray={reducedMotion ? 'none' : state === 'thinking' ? '8 4' : 'none'}
-        />
-
-        {/* Inner loop core */}
-        <circle
-          cx="32"
-          cy="28"
-          r="6"
-          fill={config.primaryColor}
-          opacity="0.9"
-        />
-
-        {/* Dynamic status indicators */}
-        {state === 'listening' && (
-          <circle
-            cx="32"
-            cy="28"
-            r="12"
-            stroke={config.primaryColor}
-            strokeWidth="1.5"
-            strokeDasharray="4 4"
-            opacity="0.6"
-          />
-        )}
-      </svg>
-
-      {/* Screen-reader live announcement */}
-      <span className="sr-only" aria-live="polite">
-        Mascot status is {config.label}: {config.description}
-      </span>
-    </div>
-  );
-};
+export const Mascot: React.FC<MascotProps> = ({ state, reducedMotion = false, size = 56 }) => (
+  <span
+    className={`knot knot-${state}${reducedMotion ? ' reduced-motion' : ''}`}
+    data-testid="companion-knot"
+    data-state={state}
+    aria-hidden="true"
+    style={{ width: size, height: size }}
+  >
+    <svg viewBox="0 0 64 64" width={size} height={size} focusable="false">
+      <path className="knot-halo" d={KNOT_PATH} />
+      <path className="knot-tail" d={THREAD_TAIL_PATH} pathLength={100} />
+      <path className="knot-line" d={KNOT_PATH} pathLength={100} />
+    </svg>
+  </span>
+);

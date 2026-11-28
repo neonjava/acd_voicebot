@@ -1,0 +1,733 @@
+/*
+ * Jarvis companion: a thread-knot glyph in the bottom-right corner that opens into
+ * a small glass card (max 380×320, the Electron window size from electron/bounds.cjs).
+ */
+:root {
+  --glass: rgba(17, 17, 26, 0.8);
+  --glass-strong: rgba(24, 24, 36, 0.92);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --text: #ededf3;
+  --muted: #a3a3b7;
+  --faint: #6f6f86;
+  --idle: #dcd9ff;
+  --listening: #7dd3fc;
+  --thinking: #c4b5fd;
+  --working: #fcd977;
+  --done: #86efac;
+  --error: #fca5a5;
+  --edge: 6px;
+  --radius: 18px;
+  color-scheme: dark;
+}
+
+html,
+body {
+  margin: 0;
+  background: transparent;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, Cantarell, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.is-hidden {
+  display: none !important;
+}
+
+/* A plain browser (vite dev, ?demo) gets a desktop-like backdrop so the glass reads right. */
+.cmp-browser {
+  --edge: 24px;
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(1200px 700px at 15% 10%, #3b2a7a 0%, transparent 60%),
+    radial-gradient(900px 600px at 85% 30%, #7a2a55 0%, transparent 55%),
+    radial-gradient(800px 500px at 60% 100%, #1d4f7a 0%, transparent 60%),
+    #0d0c16;
+}
+
+/* ---------- state accent ---------- */
+.is-idle { --accent: var(--idle); }
+.is-listening { --accent: var(--listening); }
+.is-thinking { --accent: var(--thinking); }
+.is-working { --accent: var(--working); }
+.is-done { --accent: var(--done); }
+.is-error { --accent: var(--error); }
+
+/* ---------- the knot ---------- */
+.knot {
+  display: inline-block;
+  line-height: 0;
+  --accent: var(--idle);
+}
+.knot-listening { --accent: var(--listening); }
+.knot-thinking { --accent: var(--thinking); }
+.knot-working { --accent: var(--working); }
+.knot-done { --accent: var(--done); }
+.knot-error { --accent: var(--error); }
+
+.knot svg {
+  overflow: visible;
+}
+.knot path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.knot-halo {
+  stroke: var(--accent);
+  stroke-width: 9;
+  opacity: 0.22;
+  filter: blur(4px);
+  transition: stroke 0.4s ease, opacity 0.4s ease;
+}
+.knot-line {
+  stroke: #f7f6ff;
+  stroke-width: 3.4;
+  filter: drop-shadow(0 0 3px var(--accent)) drop-shadow(0 0 8px var(--accent));
+  transition: filter 0.4s ease;
+}
+.knot-tail {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  opacity: 0;
+  transition: stroke-dashoffset 0.6s ease, opacity 0.3s ease;
+}
+
+.knot-idle .knot-halo { animation: breathe 4.5s ease-in-out infinite; }
+.knot-listening .knot-halo { opacity: 0.45; animation: pulse 1.2s ease-in-out infinite; }
+.knot-thinking .knot-line {
+  stroke-dasharray: 62 38;
+  animation: flow 1.4s linear infinite;
+}
+.knot-working .knot-tail {
+  opacity: 1;
+  stroke-dashoffset: 0;
+  animation: reach 1.6s ease-in-out infinite;
+}
+.knot-working .knot-halo { opacity: 0.4; }
+.knot-done .knot-halo { opacity: 0.5; animation: flash 0.9s ease-out 1; }
+.knot-error .knot-halo { opacity: 0.45; }
+
+.knot.reduced-motion *,
+.knot.reduced-motion {
+  animation: none !important;
+  transition: none !important;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.16; }
+  50% { opacity: 0.34; }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.3; stroke-width: 8; }
+  50% { opacity: 0.65; stroke-width: 13; }
+}
+@keyframes flow {
+  to { stroke-dashoffset: -100; }
+}
+@keyframes reach {
+  0%, 100% { stroke-dashoffset: 30; }
+  50% { stroke-dashoffset: 0; }
+}
+@keyframes flash {
+  0% { opacity: 0.9; }
+  100% { opacity: 0.5; }
+}
+
+/* ---------- collapsed: the knot alone (72×72 window) ---------- */
+.cmp-pill {
+  position: fixed;
+  right: var(--edge);
+  bottom: var(--edge);
+  width: 60px;
+  height: 60px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  cursor: pointer;
+  background: radial-gradient(circle at 50% 50%, rgba(20, 20, 32, 0.55), rgba(20, 20, 32, 0) 70%);
+  transition: transform 0.2s ease;
+}
+.cmp-pill:hover {
+  transform: scale(1.06);
+}
+.cmp-pill-button {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.cmp-pill-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- expanded: the glass card ---------- */
+.cmp-card {
+  position: fixed;
+  right: var(--edge);
+  bottom: var(--edge);
+  width: min(368px, calc(100vw - 2 * var(--edge)));
+  height: min(308px, calc(100vh - 2 * var(--edge)));
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 18px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  animation: card-in 0.22s ease-out;
+  transform-origin: bottom right;
+}
+/* A hairline of the state colour along the top edge. */
+.cmp-card::before {
+  content: '';
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  top: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.7;
+}
+@keyframes card-in {
+  from { opacity: 0; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cmp-card { animation: none; }
+}
+
+.cmp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px 6px 16px;
+}
+.cmp-id {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.cmp-name {
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+.cmp-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.cmp-state i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+.cmp-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.cmp-tag {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin-right: 4px;
+}
+.cmp-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cmp-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 0;
+}
+.cmp-icon svg path {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.cmp-icon:hover,
+.cmp-icon.is-on {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.cmp-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 16px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+:where(.cmp-card) button:focus-visible,
+:where(.cmp-card) input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------- conversation ---------- */
+.cmp-empty {
+  padding-top: 18px;
+}
+.cmp-hint {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+.cmp-suggest {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.cmp-suggestion {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.cmp-suggestion:hover {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 6px;
+}
+.turn p {
+  margin: 0;
+}
+.turn-user {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 6px 11px;
+  border-radius: 14px 14px 4px 14px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+.turn-reply {
+  padding-left: 10px;
+  border-left: 2px solid var(--accent, var(--idle));
+}
+.turn-clarify p::before {
+  content: '? ';
+  color: var(--thinking);
+  font-weight: 700;
+}
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+.sources li {
+  font-size: 10.5px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 6px;
+}
+.sources li::before {
+  content: 'source · ';
+  color: var(--faint);
+}
+.plan-steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.plan-steps li::before {
+  content: '→ ';
+  color: var(--faint);
+}
+.plan-steps .plan-flag {
+  color: var(--working);
+}
+.plan-steps .plan-flag.is-approved {
+  color: var(--done);
+}
+.plan-steps .plan-flag.is-rejected {
+  color: var(--error);
+}
+
+/* ---------- approval (one per task) ---------- */
+.approval {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(252, 217, 119, 0.07);
+  border: 1px solid rgba(252, 217, 119, 0.25);
+}
+.approval-title {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--working);
+}
+.approval-desc {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.approval-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.btn {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: #f4f2ff;
+  color: #14131f;
+  border-color: transparent;
+}
+.btn-primary:hover:not(:disabled) {
+  background: #ffffff;
+}
+.btn-ghost {
+  background: transparent;
+}
+.btn-go:not(:disabled) {
+  border-color: rgba(134, 239, 172, 0.5);
+  color: var(--done);
+}
+.btn-stop:not(:disabled) {
+  border-color: rgba(252, 165, 165, 0.5);
+  color: var(--error);
+}
+
+/* ---------- browser step chips ---------- */
+.chips {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  padding: 3px 9px 3px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  animation: chip-in 0.25s ease-out;
+}
+.chip-mark {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--done);
+}
+.chip-active {
+  color: var(--text);
+  border-color: rgba(252, 217, 119, 0.45);
+}
+.chip-active .chip-mark {
+  background: var(--working);
+  box-shadow: 0 0 0 0 var(--working);
+  animation: ping 1.1s ease-out infinite;
+}
+.chip-failed {
+  color: var(--error);
+  border-color: rgba(252, 165, 165, 0.4);
+}
+.chip-failed .chip-mark {
+  background: var(--error);
+}
+.chip-code {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  opacity: 0.8;
+}
+@keyframes chip-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes ping {
+  0% { box-shadow: 0 0 0 0 rgba(252, 217, 119, 0.6); }
+  100% { box-shadow: 0 0 0 7px rgba(252, 217, 119, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chip, .chip-active .chip-mark { animation: none; }
+}
+
+/* ---------- status + errors ---------- */
+.status-announcements {
+  margin-top: 10px;
+}
+.live-status-message {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+.live-status-message.is-empty {
+  display: none;
+}
+.live-error-alert {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(252, 165, 165, 0.08);
+  border: 1px solid rgba(252, 165, 165, 0.28);
+  font-size: 12px;
+}
+.live-error-alert p {
+  margin: 0;
+  color: var(--text);
+}
+.err-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+.err-head h4 {
+  margin: 0 0 2px;
+  font-size: 12px;
+  color: var(--error);
+}
+.err-dismiss {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+.err-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--faint);
+  font-family: ui-monospace, monospace;
+}
+.note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  margin-bottom: 6px;
+}
+.note-warn {
+  color: var(--working);
+  background: rgba(252, 217, 119, 0.08);
+}
+.note-muted {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+}
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---------- input row: text, send, and the knot as the listen button ---------- */
+.cmp-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 8px 12px;
+  border-top: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.12);
+}
+.cmp-input input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.cmp-input input::placeholder {
+  color: var(--faint);
+}
+.cmp-send {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  cursor: pointer;
+}
+.cmp-send svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.cmp-knot-button {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.cmp-knot-button[aria-pressed='true'] {
+  background: radial-gradient(circle, rgba(125, 211, 252, 0.16), transparent 70%);
+}
+
+/* ---------- details drawer (session controls, debug views) ---------- */
+.cmp-details {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.cmp-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.cmp-controls .btn {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+.cmp-kv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+}
+.cmp-kv strong,
+.cmp-kv code {
+  color: var(--text);
+  font-weight: 600;
+}
+.cmp-kv-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.cmp-modes {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  margin: 0;
+}
+.cmp-modes legend {
+  padding: 0 4px;
+  color: var(--faint);
+}
+.cmp-modes label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+/* Earlier-week panels carry light inline styles; tone them down inside the dark drawer. */
+.cmp-details :is(aside, div, section, fieldset, ul, li, p, span, strong, label, h3, h4, table, td, th) {
+  background-color: transparent !important;
+  color: inherit !important;
+  border-color: var(--line) !important;
+  box-shadow: none !important;
+}
+.cmp-details :is(h3, h4) {
+  font-size: 11.5px !important;
+  color: var(--text) !important;
+  margin: 0 0 4px !important;
+}
+.cmp-details :is(button) {
+  font-size: 11px;
+}

@@ -203,118 +203,74 @@ export interface SessionEventStreamResponse {
 }
 
 /**
- * Week 4 Contracts & Events:
- * - Companion Mascot States, Turn Lifecycle, Browser Action Chips, Audio Capture.
+ * Week 4 wire contracts. They mirror backend/app/contracts (audio.py CaptureStatus,
+ * sessions.py TurnRequest/TurnResponse, browser.py BrowserAction) and
+ * docs/contracts.md "Week 4 contracts". Change them only together with the backend.
  */
-export type CaptureStatus =
-  | 'captured'
-  | 'disabled'
-  | 'throttled'
-  | 'rejected'
-  | 'exhausted';
+export type CaptureState = 'idle' | 'listening' | 'capturing' | 'paused' | 'stopped';
 
-export interface CaptureOutcome {
-  status: CaptureStatus;
-  frame_id?: string | null;
-  error?: ErrorEnvelope | null;
-  capture_enabled?: boolean;
+/** `audio.capture` event payload and GET/POST /api/sessions/{id}/capture|listen body. */
+export interface CaptureStatus {
+  session_id: string;
+  state: CaptureState;
+  source: 'mock' | 'mic';
+  wake_required: boolean;
+  wake_word?: string | null;
 }
 
-export type MascotState = 'idle' | 'listening' | 'thinking' | 'working' | 'done';
+/** POST /api/sessions/{id}/turns request body. */
+export interface TurnRequest {
+  text: string;
+  active_app?: string | null;
+  active_window_title?: string | null;
+}
 
 export type TurnKind = 'answer' | 'clarify' | 'proposal' | 'error';
 
-export interface TurnSource {
-  id: string;
-  label: string;
-  kind: 'transcript' | 'synthetic_screen' | 'note' | string;
-  locator?: string;
+/** POST /api/sessions/{id}/turns response and `assistant.turn` event payload. */
+export interface TurnResponse {
+  session_id: string;
+  turn_id: string;
+  kind: TurnKind;
+  answer?: string | null;
+  source_ids: string[];
+  clarify?: string | null;
+  proposal?: WorkflowProposal | null;
+  approvals: ApprovalRequest[];
+  workflow?: WorkflowResult | null;
+  error_code?: string | null;
+  spoken_text?: string | null;
 }
 
-export interface TurnRequest {
-  text: string;
-  session_id?: string;
-  correlation_id?: string;
-  mode?: 'mock' | 'live';
-  context_enabled?: boolean;
-}
+export type BrowserActionKind =
+  | 'read_page'
+  | 'navigate'
+  | 'click'
+  | 'type'
+  | 'press_key'
+  | 'scroll'
+  | 'wait';
 
-export interface TurnAnswerResponse {
-  kind: 'answer';
-  text: string;
-  sources?: TurnSource[];
-  spoken_text?: string;
-  session_id?: string;
-}
-
-export interface TurnClarifyResponse {
-  kind: 'clarify';
-  question: string;
-  spoken_text?: string;
-  session_id?: string;
-}
-
-export interface TurnProposalResponse {
-  kind: 'proposal';
-  plan_id: string;
-  summary: string;
-  steps: WorkflowStep[];
-  requires_approval: boolean;
-  approval_id?: string;
-  spoken_text?: string;
-  session_id?: string;
-}
-
-export interface TurnErrorResponse {
-  kind: 'error';
-  message: string;
-  code?: string;
-  retryable?: boolean;
-  session_id?: string;
-}
-
-export type TurnResponse =
-  | TurnAnswerResponse
-  | TurnClarifyResponse
-  | TurnProposalResponse
-  | TurnErrorResponse;
-
-export type BrowserActionStatus = 'pending' | 'running' | 'completed' | 'failed';
-
-export interface BrowserActionEvent {
+export interface BrowserAction {
   action_id: string;
   session_id: string;
-  step_id?: string;
-  action_type: 'navigate' | 'click' | 'read' | 'input' | 'done' | string;
-  label: string;
-  status: BrowserActionStatus;
-  target?: string;
-  details?: Record<string, string>;
+  kind: BrowserActionKind;
+  ref?: string | null;
+  url?: string | null;
+  text?: string | null;
+  key?: string | null;
+  scroll_y?: number | null;
 }
 
-export interface AssistantTurnEvent {
-  turn_id: string;
-  session_id: string;
-  response: TurnResponse;
+/** `browser.action` event payload: the action and its outcome (no page text). */
+export interface BrowserActionEventPayload {
+  action: BrowserAction;
+  ok: boolean;
+  error_code?: string | null;
 }
 
-export interface AudioCaptureEvent {
-  session_id: string;
-  status: CaptureStatus;
-  at_ms?: number;
-}
-
-export interface ListenResponse {
-  status: 'listening' | 'idle';
-  wake_word_detected?: boolean;
-  session_id?: string;
-}
-
-export interface SpeechResponse {
-  audio_url?: string;
-  spoken_text: string;
-  duration_ms?: number;
-}
+/** UI-only: what the companion glyph shows. Not a wire contract. */
+export type CompanionState = 'idle' | 'listening' | 'thinking' | 'working' | 'done' | 'error';
 
 export interface VoicebotDesktopBridge {
   isElectron: true;

@@ -7,7 +7,12 @@ import {
   parseRetryAfterMs,
 } from '../services/sessionClient';
 import { baselineSessionResponse, week2StreamingSessionResponse } from '../fixtures/baselineSession';
-import { MalformedResponseError } from '../utils/validation';
+import {
+  MalformedResponseError,
+  validateBrowserActionEvent,
+  validateCaptureStatus,
+  validateTurnResponse,
+} from '../utils/validation';
 
 describe('SessionClient implementations', () => {
   beforeEach(() => {
@@ -734,148 +739,120 @@ describe('SessionClient implementations', () => {
       expect(auditEvt?.event_id).toBe('evt-audit-decision-appr-det-1-rejected');
     });
 
-    it('FixtureSessionClient handles Week 4 Demo Mode scripted turns, browser task approval and rejection', async () => {
+    // ---------------- Week 4: turns, capture, listen, speech ----------------
+    it('FixtureSessionClient runs one approved browser task with contract-valid events', async () => {
       const client = new FixtureSessionClient();
+      const { session_id: sid } = await client.createSession();
 
-      // Normal flow: request -> answer
-      const ramTurn = await client.createTurn({ text: "what's using the most ram?" });
-      expect(ramTurn.kind).toBe('answer');
-      if (ramTurn.kind === 'answer') {
-        expect(ramTurn.text).toContain('3.1 GB');
-        expect(ramTurn.sources?.[0].locator).toBe('system_stats.memory');
-        expect(ramTurn.spoken_text).toBe('Chrome, about 3.1 GB.');
-      }
+      const answer = await client.createTurn(sid, { text: 'what is using the most ram?' });
+      expect(() => validateTurnResponse(answer, sid)).not.toThrow();
+      expect(answer.kind).toBe('answer');
 
-      // Clarify flow
-      const clarifyTurn = await client.createTurn({ text: 'close it' });
-      expect(clarifyTurn.kind).toBe('clarify');
-      if (clarifyTurn.kind === 'clarify') {
-        expect(clarifyTurn.question).toContain('Chrome');
-      }
+      const proposal = await client.createTurn(sid, { text: 'open youtube and play lo-fi' });
+      expect(() => validateTurnResponse(proposal, sid)).not.toThrow();
+      expect(proposal.kind).toBe('proposal');
+      expect(proposal.proposal?.steps[0]).toMatchObject({
+        tool_name: 'browser_task',
+        requires_approval: true,
+        arguments: { start_url: 'https://www.youtube.com' },
+      });
+      expect(proposal.approvals).toHaveLength(1);
 
-      // Error flow
-      const errorTurn = await client.createTurn({ text: 'simulate error' });
-      expect(errorTurn.kind).toBe('error');
+      const before = (await client.getEvents(sid)).total_events;
+      await client.decideApproval(sid, proposal.approvals[0].approval_id, 'approve');
+      const after = (await client.getEvents(sid, before)).events;
 
-      // Browser task proposal flow
-      const proposalTurn = await client.createTurn({ text: 'open my attendance page' });
-      expect(proposalTurn.kind).toBe('proposal');
-      if (proposalTurn.kind === 'proposal') {
-        expect(proposalTurn.requires_approval).toBe(true);
-        expect(proposalTurn.approval_id).toBeDefined();
-        const approvalId = proposalTurn.approval_id!;
-
-        // Approve the browser task
-        const decided = await client.decideApproval('session-demo', approvalId, 'approve');
-        expect(decided.status).toBe('approved');
-        expect(client.getExecutionCount()).toBe(1);
-
-        // Verify browser.action events emitted in order
-        const stream = await client.getEvents('session-demo');
-        const actions = stream.events.filter((e) => e.event_type === 'browser.action');
-        expect(actions).toHaveLength(3);
-        expect((actions[0].payload as any).label).toBe('Read page');
-        expect((actions[1].payload as any).label).toBe('Click Attendance');
-        expect((actions[2].payload as any).label).toBe('Read results');
-      }
-
-      // Rejection flow guarantees zero execution
-      const rejectClient = new FixtureSessionClient();
-      const p2 = await rejectClient.createTurn({ text: 'open attendance portal' });
-      if (p2.kind === 'proposal') {
-        const rejected = await rejectClient.decideApproval('session-demo', p2.approval_id!, 'reject');
-        expect(rejected.status).toBe('rejected');
-        expect(rejectClient.getExecutionCount()).toBe(0);
-
-        const st = await rejectClient.getEvents('session-demo');
-        const browserActions = st.events.filter((e) => e.event_type === 'browser.action');
-        expect(browserActions).toHaveLength(0);
-      }
-
-      // Capture status toggle
-      expect((await client.getCaptureStatus()).status).toBe('disabled');
-      client.setCaptureEnabled(true);
-      expect((await client.getCaptureStatus()).status).toBe('captured');
-      expect((await client.getCaptureStatus()).capture_enabled).toBe(true);
-
-      // Listen and speech synthesis
-      const listenRes = await client.triggerListen();
-      expect(listenRes.status).toBe('listening');
-      expect(listenRes.wake_word_detected).toBe(true);
-
-      const speechRes = await client.synthesizeSpeech('Hello from Jarvis');
-      expect(speechRes.spoken_text).toBe('Hello from Jarvis');
+      const actions = after.filter((e) => e.event_type === 'browser.action');
+      expect(actions.map((e) => validateBrowserActionEvent(e.payload, sid).action.kind)).toEqual([
+        'navigate',
+        'read_page',
+        'click',
+        'read_page',
+      ]);
+      const finished = after.find(
+        (e) => e.event_type === 'workflow.audit' && (e.payload as { kind: string }).kind === 'step_succeeded'
+      );
+      expect(finished).toBeDefined();
+      expect(client.getExecutionCount()).toBe(1);
     });
 
-    it('HttpSessionClient calls /api/turns, /api/capture, /api/listen, and /api/speech with Bearer token', async () => {
-      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
-        if (url.includes('/api/turns')) {
-          return {
-            ok: true,
-            status: 200,
-            json: async () => ({
-              kind: 'answer',
-              text: 'Chrome, about 3.1 GB.',
-              spoken_text: 'Chrome, about 3.1 GB.',
-            }),
-          };
-        }
-        if (url.includes('/api/capture')) {
-          return {
-            ok: true,
-            status: 200,
-            json: async () => ({
-              status: 'captured',
-              frame_id: 'frame-test-1',
-              capture_enabled: true,
-            }),
-          };
-        }
-        if (url.includes('/api/listen')) {
-          return {
-            ok: true,
-            status: 200,
-            json: async () => ({
-              status: 'listening',
-              wake_word_detected: true,
-            }),
-          };
-        }
-        if (url.includes('/api/speech')) {
-          return {
-            ok: true,
-            status: 200,
-            json: async () => ({
-              spoken_text: 'Spoken reply',
-            }),
-          };
-        }
-        return { ok: false, status: 404, json: async () => ({}) };
-      });
-      globalThis.fetch = fetchMock;
+    it('FixtureSessionClient: a rejected browser task runs no browser actions', async () => {
+      const client = new FixtureSessionClient();
+      const { session_id: sid } = await client.createSession();
+      const proposal = await client.createTurn(sid, { text: 'open my attendance page' });
+      const before = (await client.getEvents(sid)).total_events;
+      await client.decideApproval(sid, proposal.approvals[0].approval_id, 'reject');
+      const after = (await client.getEvents(sid, before)).events;
+      expect(after.some((e) => e.event_type === 'browser.action')).toBe(false);
+      expect(client.getExecutionCount()).toBe(0);
+    });
 
+    it('FixtureSessionClient listen start/stop returns CaptureStatus and emits audio.capture', async () => {
+      const client = new FixtureSessionClient();
+      const started = await client.setListening('session-demo', 'start');
+      expect(validateCaptureStatus(started, 'session-demo').state).toBe('listening');
+      expect((await client.getCaptureStatus('session-demo')).state).toBe('listening');
+      const stopped = await client.setListening('session-demo', 'stop');
+      expect(stopped.state).toBe('stopped');
+      const events = (await client.getEvents('session-demo')).events.filter((e) => e.event_type === 'audio.capture');
+      expect(events.map((e) => (e.payload as { state: string }).state)).toEqual(['listening', 'stopped']);
+    });
+
+    it('HttpSessionClient uses the session-scoped Week 4 routes with the bearer token', async () => {
+      const calls: { url: string; init: RequestInit }[] = [];
+      const last = () => calls[calls.length - 1];
+      const json = (status: number, body: unknown) => ({ ok: status < 400, status, json: async () => body });
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: RequestInit) => {
+        calls.push({ url, init });
+        if (url === '/api/sessions' && init.method === 'POST') return json(201, { session_id: 'sess-9', state: 'active' });
+        if (url.endsWith('/turns')) {
+          return json(201, { session_id: 'sess-9', turn_id: 't1', kind: 'answer', answer: 'hi', source_ids: [], approvals: [] });
+        }
+        if (url.endsWith('/capture') || url.endsWith('/listen')) {
+          return json(200, { session_id: 'sess-9', state: 'listening', source: 'mic', wake_required: true, wake_word: 'hey jarvis' });
+        }
+        if (url.endsWith('/speech')) return { ok: true, status: 200, blob: async () => new Blob(['RIFF']) };
+        return json(404, {});
+      });
       const client = new HttpSessionClient({ token: 'test-bearer-token' });
 
-      const turn = await client.createTurn({ text: 'Test query' });
-      expect(turn.kind).toBe('answer');
-      expect(fetchMock).toHaveBeenCalledWith(
-        '/api/turns',
-        expect.objectContaining({
-          method: 'POST',
-          headers: expect.objectContaining({
-            Authorization: 'Bearer test-bearer-token',
-          }),
-        })
-      );
+      expect((await client.createSession()).session_id).toBe('sess-9');
+      const turn = await client.createTurn('sess-9', { text: 'hello', active_app: 'Firefox' });
+      expect(turn.answer).toBe('hi');
+      const turnCall = calls.find((c) => c.url === '/api/sessions/sess-9/turns')!;
+      expect(turnCall.init.method).toBe('POST');
+      expect(JSON.parse(turnCall.init.body as string)).toEqual({ text: 'hello', active_app: 'Firefox' });
+      expect((turnCall.init.headers as Record<string, string>).Authorization).toBe('Bearer test-bearer-token');
 
-      const capture = await client.getCaptureStatus();
-      expect(capture.status).toBe('captured');
+      expect((await client.getCaptureStatus('sess-9')).state).toBe('listening');
+      expect(last().url).toBe('/api/sessions/sess-9/capture');
+      await client.setListening('sess-9', 'start');
+      expect(last().url).toBe('/api/sessions/sess-9/listen');
+      expect(JSON.parse(last().init.body as string)).toEqual({ action: 'start' });
 
-      const listen = await client.triggerListen();
-      expect(listen.status).toBe('listening');
+      const wav = await client.getTurnSpeech('sess-9', 't1');
+      expect(wav).toBeInstanceOf(Blob);
+      expect(last().url).toBe('/api/sessions/sess-9/turns/t1/speech');
+    });
 
-      const speech = await client.synthesizeSpeech('Spoken reply');
-      expect(speech.spoken_text).toBe('Spoken reply');
+    it('HttpSessionClient rejects a malformed turn and maps missing routes and TTS-off', async () => {
+      const client = new HttpSessionClient({ token: 't' });
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        json: async () => ({ session_id: 'sess-9', turn_id: 't1', kind: 'answer', source_ids: [], approvals: [] }),
+      });
+      await expect(client.createTurn('sess-9', { text: 'x' })).rejects.toThrow(MalformedResponseError);
+
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ detail: 'Not Found' }),
+      });
+      await expect(client.createTurn('sess-9', { text: 'x' })).rejects.toMatchObject({
+        code: 'DEPENDENCY_UNAVAILABLE',
+      });
+      await expect(client.getTurnSpeech('sess-9', 't1')).resolves.toBeNull();
     });
   });
 });

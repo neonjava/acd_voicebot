@@ -1,22 +1,21 @@
 import {
   ApprovalRequest,
   AuditEvent,
-  BrowserActionEvent,
-  CaptureOutcome,
+  BrowserAction,
+  BrowserActionEventPayload,
+  CaptureStatus,
   ErrorEnvelope,
   EventEnvelope,
-  ListenResponse,
   MockSessionResponse,
   SessionEventStreamResponse,
   SessionLifecycleState,
-  SpeechResponse,
   TurnRequest,
   TurnResponse,
-  WorkflowStep,
+  WorkflowProposal,
 } from '../types/contracts';
 import {
   validateApprovalRequest,
-  validateCaptureOutcome,
+  validateCaptureStatus,
   validateErrorEnvelope,
   validateMockSessionResponse,
   validateSessionEventStreamResponse,
@@ -54,10 +53,14 @@ export interface SessionClient {
   getEvents?(sessionId: string, fromSequence?: number, signal?: AbortSignal): Promise<SessionEventStreamResponse>;
   getPendingApprovals?(sessionId: string, signal?: AbortSignal): Promise<ApprovalRequest[]>;
   decideApproval?(sessionId: string, approvalId: string, decision: 'approve' | 'reject', signal?: AbortSignal): Promise<ApprovalRequest>;
-  createTurn?(turnRequest: TurnRequest, signal?: AbortSignal): Promise<TurnResponse>;
-  getCaptureStatus?(signal?: AbortSignal): Promise<CaptureOutcome>;
-  triggerListen?(signal?: AbortSignal): Promise<ListenResponse>;
-  synthesizeSpeech?(text: string, signal?: AbortSignal): Promise<SpeechResponse>;
+  /** POST /api/sessions/{id}/turns (docs/contracts.md, Week 4). */
+  createTurn?(sessionId: string, request: TurnRequest, signal?: AbortSignal): Promise<TurnResponse>;
+  /** GET /api/sessions/{id}/capture. */
+  getCaptureStatus?(sessionId: string, signal?: AbortSignal): Promise<CaptureStatus>;
+  /** POST /api/sessions/{id}/listen with {"action": "start" | "stop"}. */
+  setListening?(sessionId: string, action: 'start' | 'stop', signal?: AbortSignal): Promise<CaptureStatus>;
+  /** GET /api/sessions/{id}/turns/{turn_id}/speech: WAV audio, or null when TTS is off (404). */
+  getTurnSpeech?(sessionId: string, turnId: string, signal?: AbortSignal): Promise<Blob | null>;
   subscribeToEvents?(
     sessionId: string,
     options: StreamEventsOptions,
@@ -465,127 +468,93 @@ export class HttpSessionClient implements SessionClient {
     return validateApprovalRequest(payload, sessionId);
   }
 
-  async createTurn(turnRequest: TurnRequest, signal?: AbortSignal): Promise<TurnResponse> {
+  async createSession(signal?: AbortSignal): Promise<{ session_id: string; state: SessionLifecycleState }> {
+    const payload = await this.send('/api/sessions', { method: 'POST', body: '{}', signal }, 'global', 'session create');
+    if (!payload || typeof payload !== 'object' || typeof (payload as { session_id?: unknown }).session_id !== 'string') {
+      throw new NetworkError('Backend returned a session without a session_id');
+    }
+    const p = payload as { session_id: string; state: unknown };
+    return { session_id: p.session_id, state: validateSessionLifecycleState(p.state) };
+  }
+
+  async createTurn(sessionId: string, request: TurnRequest, signal?: AbortSignal): Promise<TurnResponse> {
+    const payload = await this.send(
+      `/api/sessions/${encodeURIComponent(sessionId)}/turns`,
+      { method: 'POST', body: JSON.stringify(request), signal },
+      sessionId,
+      'turns'
+    );
+    return validateTurnResponse(payload, sessionId);
+  }
+
+  async getCaptureStatus(sessionId: string, signal?: AbortSignal): Promise<CaptureStatus> {
+    const payload = await this.send(
+      `/api/sessions/${encodeURIComponent(sessionId)}/capture`,
+      { method: 'GET', signal },
+      sessionId,
+      'capture'
+    );
+    return validateCaptureStatus(payload, sessionId);
+  }
+
+  async setListening(sessionId: string, action: 'start' | 'stop', signal?: AbortSignal): Promise<CaptureStatus> {
+    const payload = await this.send(
+      `/api/sessions/${encodeURIComponent(sessionId)}/listen`,
+      { method: 'POST', body: JSON.stringify({ action }), signal },
+      sessionId,
+      'listen'
+    );
+    return validateCaptureStatus(payload, sessionId);
+  }
+
+  async getTurnSpeech(sessionId: string, turnId: string, signal?: AbortSignal): Promise<Blob | null> {
+    const url = this.resolveUrl(
+      `/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/speech`
+    );
+    const headers = this.getHeaders();
+    headers.Accept = 'audio/wav';
+    let response: Response;
+    try {
+      response = await fetch(url, { method: 'GET', headers, signal });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new NetworkError(`Failed to fetch speech from ${url}`);
+    }
+    if (response.status === 404) {
+      // TTS_UNAVAILABLE (text-to-speech off) or the route is not there yet: no audio.
+      return null;
+    }
+    if (!response.ok) {
+      await this.readJson(response);
+    }
+    return response.blob();
+  }
+
+  /** Shared fetch for the Week 4 JSON routes: offline check, abort pass-through, error envelopes. */
+  private async send(
+    path: string,
+    init: { method: string; body?: string; signal?: AbortSignal },
+    sessionId: string,
+    routeName: string
+  ): Promise<unknown> {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
     }
-    const url = this.resolveUrl('/api/turns');
+    const url = this.resolveUrl(path);
     let response: Response;
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify(turnRequest),
-        signal,
-      });
+      response = await fetch(url, { ...init, headers: this.getHeaders() });
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new NetworkError(`Failed to post turn to ${url}: ${err instanceof Error ? err.message : 'network error'}`);
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new NetworkError(
+        `Failed to reach ${url}: ${err instanceof Error ? err.message : 'network error'}`
+      );
     }
-
-    const payload = await this.readJson(response, {
-      message: 'Backend turns endpoint is not yet implemented upstream in app.main.',
-      dependency: 'app.main (turns endpoint)',
-      sessionId: turnRequest.session_id || 'unknown',
+    return this.readJson(response, {
+      message: `The backend ${routeName} endpoint is not available yet (W5).`,
+      dependency: `app.main (${routeName} endpoint)`,
+      sessionId,
     });
-
-    return validateTurnResponse(payload);
-  }
-
-  async getCaptureStatus(signal?: AbortSignal): Promise<CaptureOutcome> {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
-    }
-    const url = this.resolveUrl('/api/capture');
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'GET',
-        headers: this.getHeaders(),
-        signal,
-      });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new NetworkError(`Failed to get capture status from ${url}: ${err instanceof Error ? err.message : 'network error'}`);
-    }
-
-    const payload = await this.readJson(response, {
-      message: 'Backend capture endpoint is not yet implemented upstream in app.main.',
-      dependency: 'app.main (capture endpoint)',
-      sessionId: 'global',
-    });
-
-    return validateCaptureOutcome(payload);
-  }
-
-  async triggerListen(signal?: AbortSignal): Promise<ListenResponse> {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
-    }
-    const url = this.resolveUrl('/api/listen');
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({}),
-        signal,
-      });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new NetworkError(`Failed to trigger listen at ${url}: ${err instanceof Error ? err.message : 'network error'}`);
-    }
-
-    const payload = (await this.readJson(response, {
-      message: 'Backend listen endpoint is not yet implemented upstream in app.main.',
-      dependency: 'app.main (listen endpoint)',
-      sessionId: 'global',
-    })) as { status?: string; wake_word_detected?: boolean; session_id?: string };
-
-    return {
-      status: payload.status === 'idle' ? 'idle' : 'listening',
-      wake_word_detected: Boolean(payload.wake_word_detected ?? true),
-      session_id: payload.session_id,
-    };
-  }
-
-  async synthesizeSpeech(text: string, signal?: AbortSignal): Promise<SpeechResponse> {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      throw new NetworkError('Network is offline. Cannot reach backend.', undefined, true);
-    }
-    const url = this.resolveUrl('/api/speech');
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify({ text }),
-        signal,
-      });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new NetworkError(`Failed to post speech synthesis to ${url}: ${err instanceof Error ? err.message : 'network error'}`);
-    }
-
-    const payload = (await this.readJson(response, {
-      message: 'Backend speech endpoint is not yet implemented upstream in app.main.',
-      dependency: 'app.main (speech endpoint)',
-      sessionId: 'global',
-    })) as { audio_url?: string; spoken_text?: string; duration_ms?: number };
-
-    return {
-      audio_url: payload.audio_url,
-      spoken_text: payload.spoken_text || text,
-      duration_ms: payload.duration_ms,
-    };
   }
 
   subscribeToEvents(
@@ -843,64 +812,7 @@ export class FixtureSessionClient implements SessionClient {
       };
       this.events.push(auditEvt as EventEnvelope<unknown>);
 
-      const browserEvts: EventEnvelope<BrowserActionEvent>[] = [
-        {
-          event_id: `evt-action-${appr.plan_id}-1`,
-          event_type: 'browser.action',
-          schema_version: '1.0',
-          session_id: sessionId,
-          correlation_id: `corr-${sessionId}`,
-          timestamp: new Date().toISOString(),
-          producer: 'browser',
-          payload: {
-            action_id: `act-${appr.plan_id}-1`,
-            session_id: sessionId,
-            step_id: 'step-nav',
-            action_type: 'navigate',
-            label: 'Read page',
-            status: 'completed',
-            target: 'https://portal.university.edu/attendance',
-          },
-        },
-        {
-          event_id: `evt-action-${appr.plan_id}-2`,
-          event_type: 'browser.action',
-          schema_version: '1.0',
-          session_id: sessionId,
-          correlation_id: `corr-${sessionId}`,
-          timestamp: new Date().toISOString(),
-          producer: 'browser',
-          payload: {
-            action_id: `act-${appr.plan_id}-2`,
-            session_id: sessionId,
-            step_id: 'step-click',
-            action_type: 'click',
-            label: 'Click Attendance',
-            status: 'completed',
-            target: '#submit-query',
-          },
-        },
-        {
-          event_id: `evt-action-${appr.plan_id}-3`,
-          event_type: 'browser.action',
-          schema_version: '1.0',
-          session_id: sessionId,
-          correlation_id: `corr-${sessionId}`,
-          timestamp: new Date().toISOString(),
-          producer: 'browser',
-          payload: {
-            action_id: `act-${appr.plan_id}-3`,
-            session_id: sessionId,
-            step_id: 'step-read',
-            action_type: 'read',
-            label: 'Read results',
-            status: 'completed',
-          },
-        },
-      ];
-      for (const be of browserEvts) {
-        this.events.push(be as EventEnvelope<unknown>);
-      }
+      this.runMockBrowserTask(sessionId, appr);
     } else {
       // Rejecting NEVER triggers execution!
       // executionCount is strictly unchanged; no browser actions are run
@@ -927,135 +839,153 @@ export class FixtureSessionClient implements SessionClient {
     return structuredClone(appr);
   }
 
-  private screenCaptureEnabled = false;
+  // -------------------------------------------------------------------------
+  // Week 4 mock: a deterministic stand-in for W5's /turns and the browser
+  // agent, so the companion can be demoed and tested without a backend.
+  // Every reply is marked "(mock)" so it is never mistaken for a real answer.
+  // -------------------------------------------------------------------------
+  private turnCounter = 0;
+  private captureState: CaptureStatus['state'] = 'idle';
+  private tasks = new Map<string, { goal: string; startUrl: string }>();
+  /** Delay between mock browser actions; 0 (tests) pushes them at once. */
+  public actionDelayMs = 0;
 
-  setCaptureEnabled(enabled: boolean): void {
-    this.screenCaptureEnabled = enabled;
+  private pushEvent<T>(sessionId: string, eventType: string, producer: string, payload: T): void {
+    this.events.push({
+      event_id: `evt-${eventType}-${this.events.length}`,
+      event_type: eventType,
+      schema_version: '1.0',
+      session_id: sessionId,
+      correlation_id: `corr-${sessionId}`,
+      timestamp: new Date().toISOString(),
+      producer,
+      payload,
+    } as EventEnvelope<unknown>);
   }
 
-  isCaptureEnabled(): boolean {
-    return this.screenCaptureEnabled;
-  }
-
-  async getCaptureStatus(): Promise<CaptureOutcome> {
+  private captureStatus(sessionId: string): CaptureStatus {
     return {
-      status: this.screenCaptureEnabled ? 'captured' : 'disabled',
-      capture_enabled: this.screenCaptureEnabled,
-      frame_id: this.screenCaptureEnabled ? 'frame-mock-demo-1' : null,
+      session_id: sessionId,
+      state: this.captureState,
+      source: 'mock',
+      wake_required: true,
+      wake_word: 'hey jarvis',
     };
   }
 
-  async triggerListen(): Promise<ListenResponse> {
-    return {
-      status: 'listening',
-      wake_word_detected: true,
-      session_id: 'session-demo',
-    };
+  async createSession(): Promise<{ session_id: string; state: SessionLifecycleState }> {
+    this.currentSessionState = 'active';
+    return { session_id: 'session-demo', state: 'active' };
   }
 
-  async synthesizeSpeech(text: string): Promise<SpeechResponse> {
-    return {
-      spoken_text: text,
-      duration_ms: 150,
-    };
+  async getCaptureStatus(sessionId: string): Promise<CaptureStatus> {
+    return this.captureStatus(sessionId);
   }
 
-  async createTurn(turnRequest: TurnRequest): Promise<TurnResponse> {
-    const raw = (turnRequest.text || '').toLowerCase().trim();
-    const sessionId = turnRequest.session_id || 'session-demo';
+  async setListening(sessionId: string, action: 'start' | 'stop'): Promise<CaptureStatus> {
+    this.captureState = action === 'start' ? 'listening' : 'stopped';
+    const status = this.captureStatus(sessionId);
+    this.pushEvent(sessionId, 'audio.capture', 'audio', status);
+    return status;
+  }
 
-    if (raw.includes('fail') || raw.includes('error')) {
-      return {
-        kind: 'error',
-        message: 'Could not connect to service.',
-        code: 'SERVICE_UNAVAILABLE',
-        retryable: true,
-        session_id: sessionId,
-      };
+  async getTurnSpeech(): Promise<Blob | null> {
+    return null; // the mock has no text-to-speech
+  }
+
+  async createTurn(sessionId: string, request: TurnRequest): Promise<TurnResponse> {
+    const text = request.text.trim();
+    const lower = text.toLowerCase();
+    const turnId = `turn-${++this.turnCounter}`;
+    const base = { session_id: sessionId, turn_id: turnId, source_ids: [], approvals: [] };
+
+    if (/\b(fail|error)\b/.test(lower)) {
+      return { ...base, kind: 'error', error_code: 'DEPENDENCY_UNAVAILABLE' };
     }
-
-    if (raw.includes('ram') || raw.includes('memory')) {
-      return {
-        kind: 'answer',
-        text: 'Chrome, about 3.1 GB.',
-        sources: [
+    if (/\b(ram|memory)\b/.test(lower)) {
+      const answer = '(mock) Chrome is using the most memory, about 3.1 GB.';
+      return { ...base, kind: 'answer', answer, source_ids: ['system_stats'], spoken_text: answer };
+    }
+    if (/^close( it)?$/.test(lower)) {
+      const clarify = 'Which app should I close?';
+      return { ...base, kind: 'clarify', clarify, spoken_text: clarify };
+    }
+    if (/^(open|go to|search|play|find|check)\b/.test(lower) || /\b(browser|website|youtube|attendance)\b/.test(lower)) {
+      const planId = `plan-${this.turnCounter}`;
+      const startUrl = /youtube/.test(lower)
+        ? 'https://www.youtube.com'
+        : `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+      const proposal: WorkflowProposal = {
+        proposal_id: planId,
+        session_id: sessionId,
+        correlation_id: `corr-${sessionId}`,
+        summary: `Do this in your browser: ${text}`,
+        steps: [
           {
-            id: 'src-ram-1',
-            label: 'psutil (system stats)',
-            kind: 'system',
-            locator: 'system_stats.memory',
+            step_id: 'step-browser',
+            tool_name: 'browser_task',
+            arguments: { goal: text, start_url: startUrl },
+            requires_approval: true,
           },
         ],
-        spoken_text: 'Chrome, about 3.1 GB.',
-        session_id: sessionId,
       };
-    }
-
-    if (raw.includes('close it') || raw.includes('clarify') || raw === 'close') {
-      return {
-        kind: 'clarify',
-        question: 'Do you mean close Chrome or close the active tab?',
-        spoken_text: 'Do you mean close Chrome or close the active tab?',
-        session_id: sessionId,
-      };
-    }
-
-    if (
-      raw.includes('attendance') ||
-      raw.includes('browser') ||
-      raw.includes('portal') ||
-      raw.includes('open')
-    ) {
-      const planId = `plan-${Date.now()}`;
-      const approvalId = `appr-${Date.now()}`;
-      const steps: WorkflowStep[] = [
-        {
-          step_id: 'step-nav',
-          tool_name: 'open_url',
-          arguments: { url: 'https://portal.university.edu/attendance' },
-          requires_approval: false,
-        },
-        {
-          step_id: 'step-click',
-          tool_name: 'click_element',
-          arguments: { selector: '#attendance-link' },
-          requires_approval: true,
-        },
-        {
-          step_id: 'step-read',
-          tool_name: 'read_page',
-          arguments: { target: 'results_table' },
-          requires_approval: false,
-        },
-      ];
-
-      const appr: ApprovalRequest = {
-        approval_id: approvalId,
+      const approval: ApprovalRequest = {
+        approval_id: `appr-${this.turnCounter}`,
         plan_id: planId,
-        step_id: 'step-click',
+        step_id: 'step-browser',
         session_id: sessionId,
         status: 'pending',
       };
-      this.approvals.push(appr);
-
+      this.approvals.push(approval);
+      this.tasks.set(planId, { goal: text, startUrl });
       return {
+        ...base,
         kind: 'proposal',
-        plan_id: planId,
-        summary: 'Open attendance page, click Attendance link, and read results',
-        steps,
-        requires_approval: true,
-        approval_id: approvalId,
-        spoken_text: 'I planned the attendance check. It needs your approval to proceed.',
-        session_id: sessionId,
+        proposal,
+        approvals: [{ ...approval }],
+        spoken_text: 'I can do that in your browser. Approve to start.',
       };
     }
+    const answer = `(mock) You said: "${text}". The real answer comes from the backend.`;
+    return { ...base, kind: 'answer', answer, spoken_text: answer };
+  }
 
-    return {
-      kind: 'answer',
-      text: `I understand: "${turnRequest.text}". Ready to assist.`,
-      spoken_text: `I understand: "${turnRequest.text}". Ready to assist.`,
-      session_id: sessionId,
+  /** After one approval the mock agent acts in the "browser": the same events the real agent sends. */
+  private runMockBrowserTask(sessionId: string, approval: ApprovalRequest): void {
+    const task = this.tasks.get(approval.plan_id) ?? {
+      goal: 'browser task',
+      startUrl: 'https://www.google.com',
     };
+    const n = { i: 0 };
+    const act = (a: Omit<BrowserAction, 'action_id' | 'session_id'>): BrowserActionEventPayload => ({
+      action: { action_id: `${approval.plan_id}-a${++n.i}`, session_id: sessionId, ...a },
+      ok: true,
+      error_code: null,
+    });
+    const steps: BrowserActionEventPayload[] = [
+      act({ kind: 'navigate', url: task.startUrl }),
+      act({ kind: 'read_page' }),
+      act({ kind: 'click', ref: 'e12' }),
+      act({ kind: 'read_page' }),
+    ];
+    const finish = () =>
+      this.pushEvent<AuditEvent>(sessionId, 'workflow.audit', 'workflow', {
+        sequence: this.events.length,
+        kind: 'step_succeeded',
+        plan_id: approval.plan_id,
+        session_id: sessionId,
+        step_id: approval.step_id,
+        approval_id: approval.approval_id,
+      });
+    if (this.actionDelayMs <= 0) {
+      steps.forEach((st) => this.pushEvent(sessionId, 'browser.action', 'browser', st));
+      finish();
+      return;
+    }
+    steps.forEach((st, i) =>
+      setTimeout(() => this.pushEvent(sessionId, 'browser.action', 'browser', st), (i + 1) * this.actionDelayMs)
+    );
+    setTimeout(finish, (steps.length + 1) * this.actionDelayMs);
   }
 
   getExecutionCount(): number {

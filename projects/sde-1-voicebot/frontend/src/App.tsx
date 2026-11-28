@@ -3,11 +3,11 @@ import {
   ApprovalRequest,
   AuditEvent,
   AudioChunkMetadata,
-  BrowserActionEvent,
-  CaptureOutcome,
+  BrowserActionEventPayload,
+  CaptureStatus,
+  CompanionState,
   ErrorEnvelope,
   EventEnvelope,
-  MascotState,
   MockSessionResponse,
   SessionLifecycleState,
   SimulatedPermissionState,
@@ -27,6 +27,11 @@ import {
   week3NotchSessionResponse,
 } from './fixtures/baselineSession';
 import { TranscriptAccumulator } from './utils/transcriptAccumulator';
+import {
+  validateBrowserActionEvent,
+  validateCaptureStatus,
+  validateTurnResponse,
+} from './utils/validation';
 import { MockModeBanner } from './components/MockModeBanner';
 import { PermissionControl } from './components/PermissionControl';
 import { TranscriptTimeline } from './components/TranscriptTimeline';
@@ -35,8 +40,9 @@ import { ScreenContextPanel } from './components/ScreenContextPanel';
 import { StatusAlert, AppErrorState, formatErrorToState } from './components/StatusAlert';
 import { ApprovalDialog } from './components/ApprovalDialog';
 import { WorkflowProgressPanel } from './components/WorkflowProgressPanel';
-import { Mascot } from './components/Mascot';
-import { SpeechBubble } from './components/SpeechBubble';
+import { Mascot, STATE_LABELS } from './components/Mascot';
+import { PlanDecision, SpeechBubble, turnErrorMessage } from './components/SpeechBubble';
+import { StepChips } from './components/StepChips';
 
 export type SessionUiState =
   | 'idle'
@@ -55,13 +61,22 @@ export interface AppProps {
   initialExpanded?: boolean;
 }
 
-function getStatusColor(uiState: SessionUiState, backendState: SessionLifecycleState | null): string {
-  if (uiState === 'failed') return '#ef4444';
-  if (backendState === 'paused' || uiState === 'paused') return '#f59e0b';
-  if (uiState === 'connecting' || uiState === 'stopping') return '#3b82f6';
-  if (backendState === 'active' || uiState === 'active') return '#10b981';
-  if (backendState === 'completed' || uiState === 'completed') return '#10b981';
-  return '#94a3b8';
+const SUGGESTIONS = ['What is using the most RAM?', 'Open YouTube and play lo-fi music'];
+
+const CLIENT_MODES: [ClientSourceMode, string][] = [
+  ['http', 'Live Backend / Mock HTTP Proxy (/api/sessions/mock)'],
+  ['fixture-week3', 'Synthetic Fixture (Week 3 Live Notch & Progress)'],
+  ['fixture-week2', 'Synthetic Fixture (Week 2 Active Streaming)'],
+  ['fixture-canonical', 'Synthetic Fixture (Canonical Backend)'],
+];
+
+function siteName(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
 }
 
 export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
@@ -90,8 +105,13 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   });
   const [error, setError] = useState<AppErrorState | null>(null);
   const [permission, setPermission] = useState<SimulatedPermissionState>('granted');
-  const [clientMode, setClientMode] = useState<ClientSourceMode>('http');
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  // `?demo` in a plain browser starts on the synthetic fixture (no backend needed).
+  const [clientMode, setClientMode] = useState<ClientSourceMode>(() =>
+    typeof window !== 'undefined' && !window.voicebot?.isElectron && /[?&]demo\b/.test(window.location.search)
+      ? 'fixture-week3'
+      : 'http'
+  );
+  const [sessionId, setSessionIdState] = useState<string | null>(null);
 
   // Actual backend session-state indicator (never assumed or optimistically faked)
   const [backendSessionState, setBackendSessionState] = useState<SessionLifecycleState | null>(null);
@@ -116,11 +136,21 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
 
   // Week 4 Companion & Mascot State
-  const [mascotState, setMascotState] = useState<MascotState>('idle');
+  const [mascotState, setMascotState] = useState<CompanionState>('idle');
   const [userQuery, setUserQuery] = useState<string>('');
   const [turnResponse, setTurnResponse] = useState<TurnResponse | null>(null);
-  const [stepActions, setStepActions] = useState<BrowserActionEvent[]>([]);
+  const [stepActions, setStepActions] = useState<BrowserActionEventPayload[]>([]);
+  const [taskRunning, setTaskRunning] = useState<boolean>(false);
+  const [captureStatus, setCaptureStatus] = useState<CaptureStatus | null>(null);
   const [inputText, setInputText] = useState<string>('');
+  const [showDetails, setShowDetails] = useState<boolean>(false);
+  const sessionIdRef = useRef<string | null>(null);
+  const taskWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const taskSeenRef = useRef<Set<string>>(new Set());
+  const activePlanRef = useRef<string | null>(null);
+  const proposalPlanRef = useRef<string | null>(null);
+  const [planDecision, setPlanDecision] = useState<PlanDecision>('pending');
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const [reducedMotion, setReducedMotion] = useState<boolean>(() => {
     if (typeof window !== 'undefined' && window.matchMedia) {
       return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -229,12 +259,9 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     }
     if (!defaultClientsRef.current[clientMode]) {
       if (clientMode === 'fixture-week3') {
-        defaultClientsRef.current[clientMode] = new FixtureSessionClient(
-          week3NotchSessionResponse,
-          0,
-          'active',
-          [baselineApprovalRequest]
-        );
+        const demo = new FixtureSessionClient(week3NotchSessionResponse, 0, 'active', [baselineApprovalRequest]);
+        demo.actionDelayMs = 700; // pace the mock browser steps so they can be followed
+        defaultClientsRef.current[clientMode] = demo;
       } else if (clientMode === 'fixture-week2') {
         defaultClientsRef.current[clientMode] = new FixtureSessionClient(week2StreamingSessionResponse);
       } else if (clientMode === 'fixture-canonical') {
@@ -246,102 +273,227 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     return defaultClientsRef.current[clientMode]!;
   }, [customClient, clientMode]);
 
+  // Keep a ref in step with the session id so async turn handlers see the latest one.
+  const setSessionId = useCallback((sid: string | null) => {
+    sessionIdRef.current = sid;
+    setSessionIdState(sid);
+  }, []);
+
+  /** Week 4 events (docs/contracts.md): returns true when the running browser task ended. */
+  const applyLiveEvent = useCallback((evt: EventEnvelope<unknown>): boolean => {
+    try {
+      if (evt.event_type === 'browser.action') {
+        const item = validateBrowserActionEvent(evt.payload, evt.session_id);
+        setStepActions((prev) => {
+          const idx = prev.findIndex((a) => a.action.action_id === item.action.action_id);
+          if (idx >= 0) {
+            const copy = [...prev];
+            copy[idx] = item;
+            return copy;
+          }
+          return [...prev, item];
+        });
+        setMascotState(item.ok ? 'working' : 'error');
+        return false;
+      }
+      if (evt.event_type === 'audio.capture') {
+        const status = validateCaptureStatus(evt.payload, evt.session_id);
+        setCaptureStatus(status);
+        if (status.state === 'listening' || status.state === 'capturing') {
+          setMascotState((cur) => (cur === 'idle' || cur === 'done' ? 'listening' : cur));
+        } else {
+          setMascotState((cur) => (cur === 'listening' ? 'idle' : cur));
+        }
+        return false;
+      }
+      if (evt.event_type === 'assistant.turn') {
+        const turn = validateTurnResponse(evt.payload, evt.session_id);
+        setTurnResponse(turn);
+        if (turn.kind === 'proposal' && turn.approvals.length > 0) {
+          setPendingApproval(turn.approvals.find((a) => a.status === 'pending') ?? null);
+        }
+        return false;
+      }
+      if (evt.event_type === 'workflow.audit') {
+        const audit = evt.payload as AuditEvent;
+        const ended = ['step_succeeded', 'step_failed', 'step_timed_out', 'workflow_cancelled'];
+        if (activePlanRef.current && audit.plan_id === activePlanRef.current && ended.includes(audit.kind)) {
+          const ok = audit.kind === 'step_succeeded';
+          setTaskRunning(false);
+          setMascotState(ok ? 'done' : 'error');
+          setStatusMessage(ok ? 'Task finished.' : `Task stopped (${audit.kind.replace(/_/g, ' ')}).`);
+          activePlanRef.current = null;
+          return true;
+        }
+      }
+    } catch (err) {
+      // A malformed live event is dropped, never rendered.
+      setStatusMessage(`Ignored a malformed ${evt.event_type} event.`);
+    }
+    return false;
+  }, []);
+
+  const stopTaskWatch = useCallback(() => {
+    if (taskWatchRef.current) {
+      clearInterval(taskWatchRef.current);
+      taskWatchRef.current = null;
+    }
+  }, []);
+
+  /** Follow one approved browser task through the session event log until it ends (max 2 min). */
+  const watchTask = useCallback(
+    (sid: string) => {
+      const client = getClient();
+      if (!client.getEvents) return;
+      stopTaskWatch();
+      const startedAt = Date.now();
+      let busy = false;
+      const tick = async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          const res = await client.getEvents!(sid, 0);
+          let ended = false;
+          for (const evt of res.events) {
+            if (taskSeenRef.current.has(evt.event_id)) continue;
+            taskSeenRef.current.add(evt.event_id);
+            if (applyLiveEvent(evt)) ended = true;
+          }
+          if (ended || Date.now() - startedAt > 120_000) stopTaskWatch();
+        } catch {
+          stopTaskWatch();
+        } finally {
+          busy = false;
+        }
+      };
+      void tick();
+      taskWatchRef.current = setInterval(() => void tick(), 300);
+    },
+    [getClient, applyLiveEvent, stopTaskWatch]
+  );
+
+  useEffect(() => stopTaskWatch, [stopTaskWatch]);
+
+  /** Turns need a session (POST /api/sessions/{id}/turns): reuse the current one or open one. */
+  const ensureSession = useCallback(async (): Promise<string> => {
+    if (sessionIdRef.current) return sessionIdRef.current;
+    const client = getClient();
+    if (client.createSession) {
+      const created = await client.createSession();
+      setSessionId(created.session_id);
+      return created.session_id;
+    }
+    return 'session-demo';
+  }, [getClient, setSessionId]);
+
+  const playSpeech = useCallback(
+    async (sid: string, turn: TurnResponse) => {
+      const client = getClient();
+      if (!turn.spoken_text || !client.getTurnSpeech) return;
+      try {
+        const wav = await client.getTurnSpeech(sid, turn.turn_id);
+        if (!wav || typeof Audio === 'undefined' || typeof URL.createObjectURL !== 'function') return;
+        const url = URL.createObjectURL(wav);
+        const audio = new Audio(url);
+        audio.onended = () => URL.revokeObjectURL(url);
+        await audio.play();
+      } catch {
+        // Speech is optional; the reply is already on screen.
+      }
+    },
+    [getClient]
+  );
+
   const handleTurnSubmit = useCallback(
     async (query: string) => {
-      if (!query.trim()) return;
       const trimmed = query.trim();
+      if (!trimmed) return;
       setUserQuery(trimmed);
+      setTurnResponse(null);
+      setStepActions([]);
+      setTaskRunning(false);
+      setPendingApproval(null);
+      setPlanDecision('pending');
       setMascotState('thinking');
-      setStatusMessage(`Processing request: "${trimmed}"`);
+      setStatusMessage('Thinking…');
       setError(null);
 
       const client = getClient();
-      const currentSid = sessionId || 'session-demo';
-
+      if (!client.createTurn) {
+        setMascotState('error');
+        setError({
+          type: 'backend',
+          title: 'Turns unavailable',
+          message: 'This backend does not support conversation turns yet.',
+          code: 'DEPENDENCY_UNAVAILABLE',
+        });
+        return;
+      }
       try {
-        if (client.createTurn) {
-          const response = await client.createTurn({
-            text: trimmed,
-            session_id: currentSid,
-            context_enabled: screenContextEnabled,
-          });
-          setTurnResponse(response);
+        const sid = await ensureSession();
+        const turn = await client.createTurn(sid, { text: trimmed });
+        setTurnResponse(turn);
+        proposalPlanRef.current = turn.approvals[0]?.plan_id ?? null;
+        void playSpeech(sid, turn);
 
-          if ('spoken_text' in response && response.spoken_text && client.synthesizeSpeech) {
-            try {
-              await client.synthesizeSpeech(response.spoken_text);
-            } catch {
-              // non-blocking
-            }
-          }
-
-          if (response.kind === 'proposal') {
-            if (response.requires_approval && response.approval_id) {
-              setPendingApproval({
-                approval_id: response.approval_id,
-                plan_id: response.plan_id,
-                step_id: response.steps[0]?.step_id || 'step-1',
-                session_id: currentSid,
-                status: 'pending',
-              });
-              setMascotState('idle');
-              setStatusMessage('Proposal requires approval before execution.');
-            } else {
-              setMascotState('done');
-              setStatusMessage('Plan proposed.');
-            }
-          } else if (response.kind === 'answer') {
-            setMascotState('done');
-            setStatusMessage(response.text);
-            setTimeout(() => {
-              setMascotState((curr) => (curr === 'done' ? 'idle' : curr));
-            }, 2500);
-          } else if (response.kind === 'clarify') {
-            setMascotState('idle');
-            setStatusMessage(response.question);
-          } else if (response.kind === 'error') {
-            setMascotState('idle');
-            setError({
-              type: 'backend',
-              title: 'Request Failed',
-              message: response.message,
-              code: response.code || 'TURN_ERROR',
-            });
-            setStatusMessage(`Error: ${response.message}`);
-          }
-        } else {
+        if (turn.kind === 'proposal') {
+          const pending = turn.approvals.find((a) => a.status === 'pending') ?? null;
+          setPendingApproval(pending);
+          setMascotState('idle');
+          setStatusMessage(pending ? 'Waiting for your approval.' : 'Plan ready.');
+          if (!pending && turn.workflow) setMascotState('done');
+        } else if (turn.kind === 'answer') {
           setMascotState('done');
-          setTurnResponse({
-            kind: 'answer',
-            text: `Echo: "${trimmed}".`,
-            session_id: currentSid,
+          setStatusMessage(null);
+        } else if (turn.kind === 'clarify') {
+          setMascotState('idle');
+          setStatusMessage(null);
+        } else {
+          setMascotState('error');
+          setError({
+            type: 'backend',
+            title: 'Request failed',
+            message: turnErrorMessage(turn.error_code ?? 'UNKNOWN'),
+            code: turn.error_code ?? undefined,
           });
+          setStatusMessage(null);
         }
       } catch (err) {
-        setMascotState('idle');
+        setMascotState('error');
         const formatted = formatErrorToState(err);
         setError(formatted);
-        setStatusMessage(`Request error: ${formatted.message}`);
+        setStatusMessage(null);
       }
     },
-    [sessionId, screenContextEnabled, getClient]
+    [getClient, ensureSession, playSpeech]
   );
 
+  /** The knot: start or stop listening for "Hey Jarvis" (POST /api/sessions/{id}/listen). */
   const handleListenTrigger = useCallback(async () => {
-    setMascotState('listening');
-    setStatusMessage('Listening ("Hey Jarvis")...');
     const client = getClient();
-    try {
-      if (client.triggerListen) {
-        const res = await client.triggerListen();
-        if (res.wake_word_detected) {
-          setStatusMessage('Wake word "Hey Jarvis" detected. Ready for your request.');
-        }
-      }
-    } catch {
-      // non-blocking
+    const listening = captureStatus?.state === 'listening' || captureStatus?.state === 'capturing';
+    const action = listening ? 'stop' : 'start';
+    if (action === 'start') {
+      setMascotState('listening');
+      setStatusMessage('Listening ("Hey Jarvis")...');
     }
-  }, [getClient]);
+    if (!client.setListening) return;
+    try {
+      const sid = await ensureSession();
+      const status = await client.setListening(sid, action);
+      setCaptureStatus(status);
+      if (status.state === 'listening' || status.state === 'capturing') {
+        setMascotState('listening');
+        setStatusMessage('Listening ("Hey Jarvis")...');
+      } else {
+        setMascotState('idle');
+        setStatusMessage('Stopped listening.');
+      }
+    } catch (err) {
+      setMascotState('error');
+      setError(formatErrorToState(err));
+    }
+  }, [getClient, ensureSession, captureStatus]);
 
   const handleStart = useCallback(async () => {
     // A previous session's live poller (for example one left after a failure) must
@@ -508,39 +660,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                       hasNewAuds = true;
                     } else if (evt.event_type === 'transcript.error') {
                       streamTranscriptError = evt.payload as ErrorEnvelope;
-                    } else if (evt.event_type === 'browser.action') {
-                      const action = evt.payload as BrowserActionEvent;
-                      setStepActions((prev) => {
-                        const idx = prev.findIndex((a) => a.action_id === action.action_id);
-                        if (idx >= 0) {
-                          const copy = [...prev];
-                          copy[idx] = action;
-                          return copy;
-                        }
-                        return [...prev, action];
-                      });
-                      if (action.status === 'running') {
-                        setMascotState('working');
-                      } else if (action.status === 'completed') {
-                        setMascotState('done');
-                      }
-                    } else if (evt.event_type === 'audio.capture') {
-                      const cap = evt.payload as CaptureOutcome;
-                      if (cap.status === 'captured') {
-                        // active frame captured
-                      }
-                    } else if (evt.event_type === 'assistant.turn') {
-                      const turn = evt.payload as TurnResponse;
-                      setTurnResponse(turn);
-                      if (turn.kind === 'proposal' && turn.requires_approval && turn.approval_id) {
-                        setPendingApproval({
-                          approval_id: turn.approval_id,
-                          plan_id: turn.plan_id,
-                          step_id: turn.steps[0]?.step_id || 'step-1',
-                          session_id: response.session_id,
-                          status: 'pending',
-                        });
-                      }
+                    } else if (
+                      evt.event_type === 'browser.action' ||
+                      evt.event_type === 'audio.capture' ||
+                      evt.event_type === 'assistant.turn'
+                    ) {
+                      applyLiveEvent(evt);
                     }
                   }
 
@@ -821,25 +946,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
             newAudits.push(evt.payload as AuditEvent);
           } else if (evt.event_type === 'transcript.error') {
             transcriptErrorEnvelope = evt.payload as ErrorEnvelope;
-          } else if (evt.event_type === 'browser.action') {
-            const action = evt.payload as BrowserActionEvent;
-            setStepActions((prev) => {
-              const idx = prev.findIndex((a) => a.action_id === action.action_id);
-              if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = action;
-                return copy;
-              }
-              return [...prev, action];
-            });
-            if (action.status === 'running') {
-              setMascotState('working');
-            } else if (action.status === 'completed') {
-              setMascotState('done');
-            }
-          } else if (evt.event_type === 'assistant.turn') {
-            const turn = evt.payload as TurnResponse;
-            setTurnResponse(turn);
+          } else if (
+            evt.event_type === 'browser.action' ||
+            evt.event_type === 'audio.capture' ||
+            evt.event_type === 'assistant.turn'
+          ) {
+            applyLiveEvent(evt);
           }
         }
 
@@ -912,7 +1024,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
 
   const handleApprove = useCallback(
     async (approvalId: string) => {
-      const sid = sessionId || 'session-demo';
+      const sid = sessionIdRef.current || sessionId || 'session-demo';
       const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
@@ -938,10 +1050,21 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         setPendingApproval(null);
         setStatusMessage(`Approval granted for step ${updated.step_id}.`);
 
-        setMascotState('done');
-        setTimeout(() => {
-          setMascotState((c) => (c === 'done' ? 'idle' : c));
-        }, 3000);
+        if (proposalPlanRef.current === updated.plan_id) {
+          // One approval per task: the browser agent now runs; follow its actions.
+          setPlanDecision('approved');
+          activePlanRef.current = updated.plan_id;
+          setStepActions([]);
+          setTaskRunning(true);
+          setMascotState('working');
+          setStatusMessage('Approved. Working in your browser…');
+          watchTask(sid);
+        } else {
+          setMascotState('done');
+          setTimeout(() => {
+            setMascotState((c) => (c === 'done' ? 'idle' : c));
+          }, 3000);
+        }
 
         // Do not mark a synthetic event ID as seen: the seen-set size is the replay
         // from_sequence, so a fake entry would skip one real event on reconnect.
@@ -970,12 +1093,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
         setError(formatted);
       }
     },
-    [sessionId, getClient]
+    [sessionId, getClient, watchTask]
   );
 
   const handleReject = useCallback(
     async (approvalId: string) => {
-      const sid = sessionId || 'session-demo';
+      const sid = sessionIdRef.current || sessionId || 'session-demo';
       const requestSessionToken = currentSessionTokenRef.current;
       const client = getClient();
       if (!client.decideApproval) return;
@@ -998,6 +1121,7 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
 
         setPendingApproval(null);
         setMascotState('idle');
+        if (proposalPlanRef.current === updated.plan_id) setPlanDecision('rejected');
         setStatusMessage(`Approval rejected for step ${updated.step_id}. Step execution prevented.`);
 
         // See handleApprove: no synthetic seen IDs (they shift from_sequence).
@@ -1026,6 +1150,12 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
     },
     [sessionId, getClient]
   );
+
+  // Keep the newest part of the conversation (approval, step chips, status) in view.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && !showDetails) el.scrollTop = el.scrollHeight;
+  }, [turnResponse, pendingApproval, stepActions, statusMessage, error, showDetails]);
 
   const isSessionInProgress =
     uiState === 'connecting' ||
@@ -1112,193 +1242,243 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
   // Latest caption text preview for collapsed notch
   const latestCaption = segments.length > 0 ? segments[segments.length - 1].text : null;
 
+  const isListening = captureStatus?.state === 'listening' || captureStatus?.state === 'capturing';
+  const stateLabel = STATE_LABELS[mascotState];
+  const proposalStep = turnResponse?.proposal?.steps.find((st) => st.tool_name === 'browser_task');
+  const approvalTask =
+    pendingApproval && proposalStep && pendingApproval.plan_id === proposalPlanRef.current
+      ? { goal: proposalStep.arguments.goal ?? '', site: siteName(proposalStep.arguments.start_url) }
+      : null;
+  const isEmpty = !userQuery && !turnResponse && !pendingApproval && stepActions.length === 0;
+
   return (
-    <div
-      className="voicebot-notch-root"
-      style={{
-        fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-      }}
-    >
-      {/* Collapsed Pill (Bottom-Right, 72×72 px) */}
+    <div className={`voicebot-notch-root cmp-root${isElectronApp ? '' : ' cmp-browser'}`}>
       {!isExpanded && (
         <div
           data-testid="notch-pill"
           role="region"
           aria-label="Voicebot notch pill"
-          title={latestCaption || `Jarvis Companion (${uiState})`}
+          className={`cmp-pill is-${mascotState}`}
+          title={`Jarvis: ${stateLabel}${latestCaption ? ` (“${latestCaption}”)` : ''}`}
           onClick={() => toggleExpanded(true)}
-          style={{
-            position: 'fixed',
-            bottom: '16px',
-            right: '16px',
-            width: '72px',
-            height: '72px',
-            borderRadius: '50%',
-            backgroundColor: '#090d16',
-            border: `1px solid ${getStatusColor(uiState, backendSessionState)}`,
-            boxShadow: '0 8px 24px rgba(0,0,0,0.7)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: 'pointer',
-            zIndex: 99999,
-            color: '#f8fafc',
-            userSelect: 'none',
-            boxSizing: 'border-box',
-          }}
         >
-          <Mascot
-            state={mascotState}
-            reducedMotion={reducedMotion}
-            size={52}
-            onClick={() => toggleExpanded(true)}
-          />
-          {/* The expanded console's aria-live regions are unmounted while collapsed;
+          <Mascot state={mascotState} reducedMotion={reducedMotion} size={56} />
+          {/* The expanded console's live regions are unmounted while collapsed;
               keep status and errors announced from the pill. */}
-          <span
-            data-testid="notch-pill-live-status"
-            role="status"
-            aria-live="polite"
-            style={{
-              position: 'absolute',
-              width: '1px',
-              height: '1px',
-              padding: 0,
-              margin: '-1px',
-              overflow: 'hidden',
-              clip: 'rect(0, 0, 0, 0)',
-              whiteSpace: 'nowrap',
-              border: 0,
-            }}
-          >
+          <span data-testid="notch-pill-live-status" role="status" aria-live="polite" className="sr-only">
             {error ? `${error.title}: ${error.message}` : statusMessage}
           </span>
           <button
             type="button"
             data-testid="notch-expand-button"
             aria-label="Expand notch"
+            className="cmp-pill-button"
             onClick={(e) => {
               e.stopPropagation();
               toggleExpanded(true);
             }}
-            style={{
-              position: 'absolute',
-              bottom: '2px',
-              right: '2px',
-              background: 'rgba(15, 23, 42, 0.9)',
-              border: '1px solid rgba(56, 189, 248, 0.3)',
-              borderRadius: '50%',
-              color: '#38bdf8',
-              cursor: 'pointer',
-              padding: '2px',
-              fontSize: '9px',
-              lineHeight: 1,
-            }}
-            title="Expand companion (Alt+N)"
-          >
-            ▲
-          </button>
+            title="Open Jarvis (Alt+N)"
+          />
         </div>
       )}
 
-      {/* Expanded Companion Console (Max 380×320 px at Bottom-Right) */}
       {isExpanded && (
         <div
           data-testid="notch-expanded"
           role="region"
           aria-label="Voicebot notch console"
-          style={{
-            position: 'fixed',
-            bottom: '16px',
-            right: '16px',
-            width: '100%',
-            maxWidth: '380px',
-            maxHeight: '320px',
-            backgroundColor: '#090d16',
-            border: '1px solid #334155',
-            borderRadius: '16px',
-            boxShadow: '0 12px 28px rgba(0, 0, 0, 0.75)',
-            display: 'flex',
-            flexDirection: 'column',
-            overflowY: 'auto',
-            zIndex: 99999,
-            color: '#f8fafc',
-            padding: '10px 12px',
-            boxSizing: 'border-box',
-          }}
+          className={`cmp-card is-${mascotState}`}
         >
-          {/* Header Row */}
-          <header
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              marginBottom: '6px',
-              paddingBottom: '4px',
-              borderBottom: '1px solid #1e293b',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Mascot state={mascotState} reducedMotion={reducedMotion} size={24} />
-              <h2 style={{ margin: 0, fontSize: '13px', fontWeight: 700, color: '#f8fafc' }}>
-                Jarvis Companion
-              </h2>
+          <header className="cmp-head">
+            <div className="cmp-id">
+              <span className="cmp-name">Jarvis</span>
+              <span className="cmp-state" data-testid="companion-state">
+                <i aria-hidden="true" />
+                {stateLabel}
+              </span>
             </div>
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <div className="cmp-head-actions">
+              {(clientMode !== 'http' || captureStatus?.source === 'mock') && <span className="cmp-tag">mock</span>}
               <button
                 type="button"
-                data-testid="reconnect-button"
-                onClick={handleReconnect}
-                disabled={!sessionId}
-                title="Reconnect and replay missed events"
-                style={{
-                  padding: '2px 6px',
-                  fontSize: '10px',
-                  backgroundColor: '#1e293b',
-                  color: '#94a3b8',
-                  border: '1px solid #334155',
-                  borderRadius: '4px',
-                  cursor: sessionId ? 'pointer' : 'not-allowed',
-                }}
+                className={`cmp-icon${showDetails ? ' is-on' : ''}`}
+                aria-label="Session details"
+                aria-expanded={showDetails}
+                aria-controls="cmp-details"
+                onClick={() => setShowDetails((v) => !v)}
+                title="Session details"
               >
-                ↻ Reconnect
+                <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="13" cy="8" r="1.4" /></svg>
               </button>
               <button
                 type="button"
                 data-testid="notch-collapse-button"
                 aria-label="Collapse notch"
+                className="cmp-icon"
                 onClick={() => toggleExpanded(false)}
-                style={{
-                  background: '#1e293b',
-                  border: '1px solid #334155',
-                  borderRadius: '4px',
-                  color: '#94a3b8',
-                  cursor: 'pointer',
-                  padding: '2px 8px',
-                  fontSize: '11px',
-                }}
-                title="Collapse companion (Alt+N)"
+                title="Minimise (Alt+N)"
               >
-                ▼
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
               </button>
             </div>
           </header>
 
-          {/* Speech Bubble (User Query, Plan, Turn Response, Step Chips) */}
-          <SpeechBubble
-            userQuery={userQuery}
-            turnResponse={turnResponse}
-            stepActions={stepActions}
-            pendingApproval={pendingApproval}
-            onApprove={handleApprove}
-            onReject={handleReject}
-            isApproving={isTransitioning}
-            reducedMotion={reducedMotion}
-          />
+          <div className="cmp-scroll" ref={scrollRef}>
+            <section className={`cmp-convo${showDetails ? ' is-hidden' : ''}`} aria-label="Conversation">
+              {isEmpty && (
+                <div className="cmp-empty">
+                  <p className="cmp-hint">Say “Hey Jarvis”, or type below.</p>
+                  <div className="cmp-suggest">
+                    {SUGGESTIONS.map((q) => (
+                      <button key={q} type="button" className="cmp-suggestion" onClick={() => handleTurnSubmit(q)}>
+                        {q}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
-          {/* Interactive Turn Input & Hey Jarvis Listen Trigger */}
+              <SpeechBubble userQuery={userQuery} turnResponse={turnResponse} planDecision={planDecision} />
+
+              {pendingApproval && (
+                <ApprovalDialog
+                  approval={pendingApproval}
+                  onApprove={handleApprove}
+                  onReject={handleReject}
+                  task={approvalTask}
+                />
+              )}
+
+              <StepChips actions={stepActions} running={taskRunning} />
+
+              <StatusAlert
+                statusMessage={statusMessage}
+                error={error}
+                isLoading={uiState === 'connecting' || isTransitioning}
+                isOffline={isOffline}
+                onDismissError={() => setError(null)}
+              />
+            </section>
+
+            <section
+              id="cmp-details"
+              className={`cmp-details${showDetails ? '' : ' is-hidden'}`}
+              aria-label="Session details"
+            >
+              <MockModeBanner />
+
+              <div className="cmp-controls">
+                <button
+                  type="button"
+                  data-testid="start-button"
+                  onClick={handleStart}
+                  disabled={isStartDisabled}
+                  title={isElectronApp && !isBackendReady ? 'Waiting for backend sidecar to be ready...' : undefined}
+                  aria-label="Start Session"
+                  className="btn btn-go"
+                >
+                  Start
+                </button>
+                <button
+                  type="button"
+                  data-testid="pause-button"
+                  onClick={handlePause}
+                  disabled={isPauseDisabled}
+                  aria-label="Pause Session"
+                  className="btn"
+                >
+                  Pause
+                </button>
+                <button
+                  type="button"
+                  data-testid="resume-button"
+                  onClick={handleResume}
+                  disabled={isResumeDisabled}
+                  aria-label="Resume Session"
+                  className="btn"
+                >
+                  Resume
+                </button>
+                <button
+                  type="button"
+                  data-testid="stop-button"
+                  onClick={handleStop}
+                  disabled={isStopDisabled}
+                  aria-label="Stop Session"
+                  className="btn btn-stop"
+                >
+                  Stop
+                </button>
+                <button
+                  type="button"
+                  data-testid="reconnect-button"
+                  onClick={handleReconnect}
+                  disabled={!sessionId}
+                  title="Reconnect and replay missed events"
+                  className="btn"
+                >
+                  Reconnect
+                </button>
+              </div>
+
+              <div className="cmp-kv">
+                <span data-testid="ui-state-indicator">
+                  UI: <strong>{uiState}</strong>
+                </span>
+                <span data-testid="backend-state-indicator">
+                  Backend: <strong>{backendSessionState ?? 'not_started'}</strong>
+                </span>
+                {sessionId && (
+                  <span className="cmp-kv-id">
+                    ID: <code>{sessionId}</code>
+                  </span>
+                )}
+              </div>
+
+              <WorkflowProgressPanel auditEvents={auditEvents} />
+              <TranscriptTimeline
+                segments={segments}
+                isRevised={(id) => (revisionCounts.get(id) ?? 0) > 0}
+                revisionCount={(id) => revisionCounts.get(id) ?? 0}
+              />
+              <ScreenContextPanel
+                enabled={screenContextEnabled}
+                onToggle={(enabled) => setScreenContextEnabled(enabled)}
+                disabled={isSessionInProgress}
+                transcriptSegments={segments}
+              />
+              <AudioEventsSummary events={audioEvents} />
+              <PermissionControl
+                permission={permission}
+                onChange={(newPerm) => {
+                  setPermission(newPerm);
+                  setError(null);
+                }}
+                disabled={isSessionInProgress}
+              />
+              {!customClient && (
+                <fieldset className="cmp-modes">
+                  <legend>Client Source Mode</legend>
+                  {CLIENT_MODES.map(([mode, label]) => (
+                    <label key={mode}>
+                      <input
+                        type="radio"
+                        name="clientMode"
+                        value={mode}
+                        checked={clientMode === mode}
+                        onChange={() => setClientMode(mode)}
+                        disabled={isSessionInProgress}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </fieldset>
+              )}
+            </section>
+          </div>
+
           <form
+            className="cmp-input"
             onSubmit={(e) => {
               e.preventDefault();
               if (inputText.trim()) {
@@ -1306,312 +1486,31 @@ export const App: React.FC<AppProps> = ({ customClient, initialExpanded }) => {
                 setInputText('');
               }
             }}
-            style={{
-              display: 'flex',
-              gap: '6px',
-              marginTop: '6px',
-              marginBottom: '4px',
-            }}
           >
             <input
               type="text"
               data-testid="turn-input"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="Type request or say 'hey jarvis'..."
+              placeholder="Ask Jarvis…"
               aria-label="Type request or say hey jarvis"
-              style={{
-                flex: 1,
-                padding: '4px 8px',
-                fontSize: '11px',
-                borderRadius: '6px',
-                background: '#0f172a',
-                border: '1px solid #334155',
-                color: '#f8fafc',
-              }}
+              maxLength={2000}
             />
-            <button
-              type="submit"
-              data-testid="turn-submit"
-              aria-label="Send request"
-              style={{
-                padding: '4px 10px',
-                fontSize: '11px',
-                borderRadius: '6px',
-                background: '#0284c7',
-                color: '#ffffff',
-                border: 'none',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-            >
-              Send
+            <button type="submit" data-testid="turn-submit" aria-label="Send request" className="cmp-send">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" /></svg>
             </button>
             <button
               type="button"
               data-testid="listen-button"
-              aria-label="Listen (Hey Jarvis)"
+              aria-label={isListening ? 'Stop listening' : 'Listen (Hey Jarvis)'}
+              aria-pressed={isListening}
               onClick={handleListenTrigger}
-              title="Listen / Wake Word (Alt+L)"
-              style={{
-                padding: '4px 8px',
-                fontSize: '11px',
-                borderRadius: '6px',
-                background: mascotState === 'listening' ? '#2563eb' : '#1e293b',
-                color: '#38bdf8',
-                border: '1px solid #38bdf8',
-                cursor: 'pointer',
-              }}
+              title={isListening ? 'Stop listening (Alt+L)' : 'Listen for “Hey Jarvis” (Alt+L)'}
+              className="cmp-knot-button"
             >
-              🎙️
+              <Mascot state={mascotState} reducedMotion={reducedMotion} size={44} />
             </button>
           </form>
-
-          {/* Banner */}
-          <MockModeBanner />
-
-          {/* Status, Loading & Alerts */}
-          <StatusAlert
-            statusMessage={statusMessage}
-            error={error}
-            isLoading={uiState === 'connecting' || isTransitioning}
-            isOffline={isOffline}
-            onDismissError={() => setError(null)}
-          />
-
-          {/* Action Approval Dialog */}
-          {pendingApproval && (
-            <ApprovalDialog
-              approval={pendingApproval}
-              onApprove={handleApprove}
-              onReject={handleReject}
-            />
-          )}
-
-          {/* Compact Control Buttons */}
-          <div
-            style={{
-              display: 'flex',
-              gap: '6px',
-              flexWrap: 'wrap',
-              margin: '8px 0',
-            }}
-          >
-            <button
-              type="button"
-              data-testid="start-button"
-              onClick={handleStart}
-              disabled={isStartDisabled}
-              title={isElectronApp && !isBackendReady ? 'Waiting for backend sidecar to be ready...' : undefined}
-              aria-label="Start Session"
-              style={{
-                flex: 1,
-                padding: '6px 10px',
-                fontSize: '11px',
-                fontWeight: 600,
-                backgroundColor: isStartDisabled ? '#334155' : '#10b981',
-                color: isStartDisabled ? '#64748b' : '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isStartDisabled ? 'not-allowed' : 'pointer',
-              }}
-            >
-              Start
-            </button>
-            <button
-              type="button"
-              data-testid="pause-button"
-              onClick={handlePause}
-              disabled={isPauseDisabled}
-              aria-label="Pause Session"
-              style={{
-                flex: 1,
-                padding: '6px 10px',
-                fontSize: '11px',
-                fontWeight: 600,
-                backgroundColor: isPauseDisabled ? '#334155' : '#f59e0b',
-                color: isPauseDisabled ? '#64748b' : '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isPauseDisabled ? 'not-allowed' : 'pointer',
-              }}
-            >
-              Pause
-            </button>
-            <button
-              type="button"
-              data-testid="resume-button"
-              onClick={handleResume}
-              disabled={isResumeDisabled}
-              aria-label="Resume Session"
-              style={{
-                flex: 1,
-                padding: '6px 10px',
-                fontSize: '11px',
-                fontWeight: 600,
-                backgroundColor: isResumeDisabled ? '#334155' : '#3b82f6',
-                color: isResumeDisabled ? '#64748b' : '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isResumeDisabled ? 'not-allowed' : 'pointer',
-              }}
-            >
-              Resume
-            </button>
-            <button
-              type="button"
-              data-testid="stop-button"
-              onClick={handleStop}
-              disabled={isStopDisabled}
-              aria-label="Stop Session"
-              style={{
-                flex: 1,
-                padding: '6px 10px',
-                fontSize: '11px',
-                fontWeight: 600,
-                backgroundColor: isStopDisabled ? '#334155' : '#ef4444',
-                color: isStopDisabled ? '#64748b' : '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isStopDisabled ? 'not-allowed' : 'pointer',
-              }}
-            >
-              Stop
-            </button>
-          </div>
-
-          {/* Session State Indicators */}
-          <div
-            style={{
-              display: 'flex',
-              gap: '8px',
-              padding: '4px 8px',
-              backgroundColor: '#0f172a',
-              borderRadius: '4px',
-              fontSize: '10px',
-              marginBottom: '8px',
-              border: '1px solid #1e293b',
-            }}
-          >
-            <span data-testid="ui-state-indicator" style={{ color: '#94a3b8' }}>
-              UI: <strong style={{ color: '#e2e8f0' }}>{uiState}</strong>
-            </span>
-            <span style={{ color: '#334155' }}>|</span>
-            <span data-testid="backend-state-indicator" style={{ color: '#94a3b8' }}>
-              Backend:{' '}
-              <strong style={{ color: backendSessionState ? '#38bdf8' : '#64748b' }}>
-                {backendSessionState ?? 'not_started'}
-              </strong>
-            </span>
-            {sessionId && (
-              <>
-                <span style={{ color: '#334155' }}>|</span>
-                <span style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  ID: <code style={{ color: '#a78bfa' }}>{sessionId}</code>
-                </span>
-              </>
-            )}
-          </div>
-
-          {/* Workflow Progress (workflow.audit events) */}
-          <WorkflowProgressPanel auditEvents={auditEvents} />
-
-          {/* Live Captions / Transcript Timeline */}
-          <div style={{ margin: '6px 0' }}>
-            <TranscriptTimeline
-              segments={segments}
-              isRevised={(id) => (revisionCounts.get(id) ?? 0) > 0}
-              revisionCount={(id) => revisionCounts.get(id) ?? 0}
-            />
-          </div>
-
-          {/* Privacy Settings / Screen-Context Panel (OFF by default) */}
-          <ScreenContextPanel
-            enabled={screenContextEnabled}
-            onToggle={(enabled) => setScreenContextEnabled(enabled)}
-            disabled={isSessionInProgress}
-            transcriptSegments={segments}
-          />
-
-          {/* Audio Chunks Summary */}
-          <div style={{ marginTop: '8px' }}>
-            <AudioEventsSummary events={audioEvents} />
-          </div>
-
-          {/* Configuration controls */}
-          <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <PermissionControl
-              permission={permission}
-              onChange={(newPerm) => {
-                setPermission(newPerm);
-                setError(null);
-              }}
-              disabled={isSessionInProgress}
-            />
-
-            {!customClient && (
-              <fieldset
-                style={{
-                  border: '1px solid #334155',
-                  borderRadius: '4px',
-                  padding: '6px 8px',
-                  backgroundColor: '#0f172a',
-                  color: '#e2e8f0',
-                  fontSize: '11px',
-                }}
-              >
-                <legend style={{ fontWeight: 600, padding: '0 4px', fontSize: '10px', color: '#94a3b8' }}>
-                  Client Source Mode
-                </legend>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '4px' }}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                    <input
-                      type="radio"
-                      name="clientMode"
-                      value="http"
-                      checked={clientMode === 'http'}
-                      onChange={() => setClientMode('http')}
-                      disabled={isSessionInProgress}
-                    />
-                    <span>Live Backend / Mock HTTP Proxy (/api/sessions/mock)</span>
-                  </label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                    <input
-                      type="radio"
-                      name="clientMode"
-                      value="fixture-week3"
-                      checked={clientMode === 'fixture-week3'}
-                      onChange={() => setClientMode('fixture-week3')}
-                      disabled={isSessionInProgress}
-                    />
-                    <span>Synthetic Fixture (Week 3 Live Notch & Progress)</span>
-                  </label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                    <input
-                      type="radio"
-                      name="clientMode"
-                      value="fixture-week2"
-                      checked={clientMode === 'fixture-week2'}
-                      onChange={() => setClientMode('fixture-week2')}
-                      disabled={isSessionInProgress}
-                    />
-                    <span>Synthetic Fixture (Week 2 Active Streaming)</span>
-                  </label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                    <input
-                      type="radio"
-                      name="clientMode"
-                      value="fixture-canonical"
-                      checked={clientMode === 'fixture-canonical'}
-                      onChange={() => setClientMode('fixture-canonical')}
-                      disabled={isSessionInProgress}
-                    />
-                    <span>Synthetic Fixture (Canonical Backend)</span>
-                  </label>
-                </div>
-              </fieldset>
-            )}
-          </div>
         </div>
       )}
     </div>
