@@ -4,15 +4,21 @@ import {
   COLLAPSED_WIDTH,
   MAX_EXPANDED_HEIGHT,
   MAX_EXPANDED_WIDTH,
+  getCompanionBounds,
   getNotchBounds,
 } from '../bounds';
-// Test the exact CommonJS module loaded by main.cjs as required by Finding 11
+// Test the exact CommonJS module loaded by main.cjs
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const boundsCjs = require('../bounds.cjs');
 
-describe('getNotchBounds (Finding 11 & 12)', () => {
+describe('getCompanionBounds / getNotchBounds (Week 4 Companion Geometry)', () => {
   it('guarantees bounds.ts re-exports the exact same implementation as bounds.cjs', () => {
+    expect(getCompanionBounds).toBe(boundsCjs.getCompanionBounds);
     expect(getNotchBounds).toBe(boundsCjs.getNotchBounds);
+    expect(COLLAPSED_WIDTH).toBe(72);
+    expect(COLLAPSED_HEIGHT).toBe(72);
+    expect(MAX_EXPANDED_WIDTH).toBe(380);
+    expect(MAX_EXPANDED_HEIGHT).toBe(320);
     expect(COLLAPSED_WIDTH).toBe(boundsCjs.COLLAPSED_WIDTH);
     expect(COLLAPSED_HEIGHT).toBe(boundsCjs.COLLAPSED_HEIGHT);
     expect(MAX_EXPANDED_WIDTH).toBe(boundsCjs.MAX_EXPANDED_WIDTH);
@@ -22,22 +28,22 @@ describe('getNotchBounds (Finding 11 & 12)', () => {
   it('calculates collapsed and expanded bounds for 1366x768 display', () => {
     const display = { width: 1366, height: 768 };
 
-    const collapsed = getNotchBounds(display, false);
+    const collapsed = getCompanionBounds(display, false);
     expect(collapsed).toEqual({
-      x: Math.round((1366 - COLLAPSED_WIDTH) / 2),
-      y: 0,
-      width: 200,
-      height: 36,
+      x: 1366 - 72, // 1294
+      y: 768 - 72,  // 696
+      width: 72,
+      height: 72,
     });
     expect(collapsed.width).toBeLessThanOrEqual(MAX_EXPANDED_WIDTH);
     expect(collapsed.height).toBeLessThanOrEqual(MAX_EXPANDED_HEIGHT);
 
-    const expanded = getNotchBounds(display, true);
+    const expanded = getCompanionBounds(display, true);
     expect(expanded).toEqual({
-      x: Math.round((1366 - MAX_EXPANDED_WIDTH) / 2),
-      y: 0,
-      width: 480,
-      height: 360,
+      x: 1366 - 380, // 986
+      y: 768 - 320,  // 448
+      width: 380,
+      height: 320,
     });
     expect(expanded.width).toBeLessThanOrEqual(MAX_EXPANDED_WIDTH);
     expect(expanded.height).toBeLessThanOrEqual(MAX_EXPANDED_HEIGHT);
@@ -46,111 +52,132 @@ describe('getNotchBounds (Finding 11 & 12)', () => {
   it('calculates collapsed and expanded bounds for 1920x1080 display', () => {
     const display = { width: 1920, height: 1080 };
 
-    const collapsed = getNotchBounds(display, false);
+    const collapsed = getCompanionBounds(display, false);
     expect(collapsed).toEqual({
-      x: 860,
-      y: 0,
-      width: 200,
-      height: 36,
+      x: 1848,
+      y: 1008,
+      width: 72,
+      height: 72,
     });
 
-    const expanded = getNotchBounds(display, true);
+    const expanded = getCompanionBounds(display, true);
     expect(expanded).toEqual({
-      x: 720,
-      y: 0,
-      width: 480,
-      height: 360,
+      x: 1540,
+      y: 760,
+      width: 380,
+      height: 320,
     });
-    expect(expanded.width).toBeLessThanOrEqual(480);
-    expect(expanded.height).toBeLessThanOrEqual(360);
+    expect(expanded.width).toBeLessThanOrEqual(380);
+    expect(expanded.height).toBeLessThanOrEqual(320);
   });
 
   it('calculates collapsed and expanded bounds for 2560x1440 display', () => {
     const display = { width: 2560, height: 1440 };
 
-    const collapsed = getNotchBounds(display, false);
+    const collapsed = getCompanionBounds(display, false);
     expect(collapsed).toEqual({
-      x: 1180,
-      y: 0,
-      width: 200,
-      height: 36,
+      x: 2488,
+      y: 1368,
+      width: 72,
+      height: 72,
     });
 
-    const expanded = getNotchBounds(display, true);
+    const expanded = getCompanionBounds(display, true);
     expect(expanded).toEqual({
-      x: 1040,
-      y: 0,
-      width: 480,
-      height: 360,
+      x: 2180,
+      y: 1120,
+      width: 380,
+      height: 320,
     });
-    expect(expanded.width).toBeLessThanOrEqual(480);
-    expect(expanded.height).toBeLessThanOrEqual(360);
+    expect(expanded.width).toBeLessThanOrEqual(380);
+    expect(expanded.height).toBeLessThanOrEqual(320);
   });
 
-  it('positions notch correctly with multi-monitor non-zero display origins (Finding 12)', () => {
-    // Primary display is positioned to the right of another monitor (x = 1920)
-    const rightDisplay = { x: 1920, y: 0, width: 1366, height: 768 };
-    const collapsedRight = boundsCjs.getNotchBounds(rightDisplay, false);
-    expect(collapsedRight).toEqual({
-      x: 1920 + Math.round((1366 - 200) / 2), // 2503
-      y: 0,
-      width: 200,
-      height: 36,
+  it('positions companion correctly on secondary display at x = 1920', () => {
+    const displayAt1920 = { x: 1920, y: 0, width: 1920, height: 1080 };
+
+    const collapsed = getCompanionBounds(displayAt1920, false);
+    expect(collapsed).toEqual({
+      x: 1920 + (1920 - 72), // 3768
+      y: 0 + (1080 - 72),    // 1008
+      width: 72,
+      height: 72,
     });
 
-    // Primary display is stacked vertically below another monitor (y = 1080)
-    const bottomDisplay = { x: 0, y: 1080, width: 1920, height: 1080 };
-    const collapsedBottom = boundsCjs.getNotchBounds(bottomDisplay, false);
-    expect(collapsedBottom).toEqual({
-      x: 860,
-      y: 1080,
-      width: 200,
-      height: 36,
-    });
-
-    // Secondary monitor with negative x offset and custom y offset
-    const leftDisplay = { x: -1920, y: 150, width: 1920, height: 1080 };
-    const expandedLeft = boundsCjs.getNotchBounds(leftDisplay, true);
-    expect(expandedLeft).toEqual({
-      x: -1920 + Math.round((1920 - 480) / 2), // -1200
-      y: 150,
-      width: 480,
-      height: 360,
+    const expanded = getCompanionBounds(displayAt1920, true);
+    expect(expanded).toEqual({
+      x: 1920 + (1920 - 380), // 3460
+      y: 0 + (1080 - 320),    // 760
+      width: 380,
+      height: 320,
     });
   });
 
-  it('always anchors to top-center (y = display.y)', () => {
+  it('respects workArea accounting for taskbar / dock', () => {
+    const displayWithTaskbar = {
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 0, y: 0, width: 1920, height: 1040 }, // 40px taskbar at bottom
+    };
+
+    const collapsed = getCompanionBounds(displayWithTaskbar, false);
+    expect(collapsed).toEqual({
+      x: 1848,
+      y: 968, // 1040 - 72
+      width: 72,
+      height: 72,
+    });
+
+    const expanded = getCompanionBounds(displayWithTaskbar, true);
+    expect(expanded).toEqual({
+      x: 1540,
+      y: 720, // 1040 - 320
+      width: 380,
+      height: 320,
+    });
+  });
+
+  it('clamps width and height when display is smaller than expanded bounds', () => {
+    const tinyDisplay = { x: 10, y: 20, width: 300, height: 250 };
+    const expanded = getCompanionBounds(tinyDisplay, true);
+
+    expect(expanded.width).toBe(300);
+    expect(expanded.height).toBe(250);
+    expect(expanded.x).toBe(10);
+    expect(expanded.y).toBe(20);
+  });
+
+  it('throws on invalid or non-positive display dimensions', () => {
+    expect(() => getCompanionBounds(null as any, false)).toThrow('Display dimensions must be positive integers');
+    expect(() => getCompanionBounds({ width: -10, height: 100 } as any, false)).toThrow('Display dimensions must be positive integers');
+    expect(() => getCompanionBounds({ width: 100, height: 0 } as any, false)).toThrow('Display dimensions must be positive integers');
+  });
+
+  it('guarantees bounds are never larger than 380x320 and never full screen', () => {
     const displays = [
-      { x: 0, y: 0, width: 1280, height: 800 },
-      { x: 100, y: 200, width: 1440, height: 900 },
-      { x: 0, y: 0, width: 3840, height: 2160 },
+      { x: 0, y: 0, width: 1366, height: 768 },
+      { x: 0, y: 0, width: 1920, height: 1080 },
+      { x: 1920, y: 0, width: 2560, height: 1440 },
+      { x: -1920, y: 100, width: 1920, height: 1200 },
     ];
 
     for (const d of displays) {
-      const c = getNotchBounds(d, false);
-      const e = getNotchBounds(d, true);
+      const c = getCompanionBounds(d, false);
+      const e = getCompanionBounds(d, true);
 
-      expect(c.y).toBe(d.y);
-      expect(e.y).toBe(d.y);
-      expect(c.x).toBe(d.x + Math.round((d.width - c.width) / 2));
-      expect(e.x).toBe(d.x + Math.round((d.width - e.width) / 2));
-      expect(e.width).toBeLessThanOrEqual(480);
-      expect(e.height).toBeLessThanOrEqual(360);
+      expect(c.width).toBe(72);
+      expect(c.height).toBe(72);
+      expect(e.width).toBeLessThanOrEqual(380);
+      expect(e.height).toBeLessThanOrEqual(320);
+
+      // Verify bottom-right positioning within display
+      expect(c.x + c.width).toBe(d.x + d.width);
+      expect(c.y + c.height).toBe(d.y + d.height);
+      expect(e.x + e.width).toBe(d.x + d.width);
+      expect(e.y + e.height).toBe(d.y + d.height);
+
+      // Verify never full screen
+      expect(e.width).toBeLessThan(d.width);
+      expect(e.height).toBeLessThan(d.height);
     }
-  });
-
-  it('clamps width when display is narrower than expanded notch', () => {
-    const smallDisplay = { x: 50, y: 10, width: 400, height: 600 };
-    const expanded = getNotchBounds(smallDisplay, true);
-
-    expect(expanded.width).toBe(400);
-    expect(expanded.height).toBe(360);
-    expect(expanded.x).toBe(50);
-    expect(expanded.y).toBe(10);
-  });
-
-  it('throws on non-positive display dimensions', () => {
-    expect(() => getNotchBounds({ width: 0, height: 800 }, false)).toThrow();
-    expect(() => getNotchBounds({ width: 1920, height: -10 }, true)).toThrow();
   });
 });

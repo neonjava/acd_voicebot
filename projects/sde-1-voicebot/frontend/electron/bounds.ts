@@ -1,5 +1,5 @@
 /**
- * Pure functions for calculating Electron notch window geometry.
+ * Pure functions for calculating Electron companion window geometry.
  * Re-exports the single shared CommonJS implementation used by main.cjs.
  */
 
@@ -11,6 +11,12 @@ export interface DisplaySize {
   y?: number;
   width: number;
   height: number;
+  workArea?: {
+    x?: number;
+    y?: number;
+    width: number;
+    height: number;
+  };
 }
 
 export interface WindowBounds {
@@ -25,5 +31,14 @@ export const COLLAPSED_HEIGHT: number = boundsCjs.COLLAPSED_HEIGHT;
 export const MAX_EXPANDED_WIDTH: number = boundsCjs.MAX_EXPANDED_WIDTH;
 export const MAX_EXPANDED_HEIGHT: number = boundsCjs.MAX_EXPANDED_HEIGHT;
 
-export const getNotchBounds: (display: DisplaySize, expanded: boolean) => WindowBounds =
-  boundsCjs.getNotchBounds;
+export const getCompanionBounds: (
+  display: DisplaySize,
+  expanded: boolean,
+  margin?: number
+) => WindowBounds = boundsCjs.getCompanionBounds;
+
+export const getNotchBounds: (
+  display: DisplaySize,
+  expanded: boolean,
+  margin?: number
+) => WindowBounds = boundsCjs.getNotchBounds;

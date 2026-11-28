@@ -24,7 +24,7 @@ try {
 const { app, BrowserWindow, ipcMain, screen, protocol, net } = electron;
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
-const { getNotchBounds } = require('./bounds.cjs');
+const { getCompanionBounds, getNotchBounds } = require('./bounds.cjs');
 const { generateLaunchToken } = require('./token.cjs');
 const { startBackendSidecar } = require('./sidecar.cjs');
 const { resolveBackendPort, backendOrigin, devServerUrl } = require('./config.cjs');
@@ -148,7 +148,8 @@ function isTrustedSender(event) {
 
 function createWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
-  const bounds = getNotchBounds(primaryDisplay.bounds, false);
+  const targetArea = primaryDisplay.workArea || primaryDisplay.bounds;
+  const bounds = getCompanionBounds(targetArea, false);
 
   mainWindow = new BrowserWindow({
     x: bounds.x,
@@ -207,7 +208,8 @@ if (ipcMain) {
     isExpanded = Boolean(expanded);
     if (!mainWindow || mainWindow.isDestroyed()) return;
     const currentDisplay = screen.getPrimaryDisplay();
-    const newBounds = getNotchBounds(currentDisplay.bounds, isExpanded);
+    const targetArea = currentDisplay.workArea || currentDisplay.bounds;
+    const newBounds = getCompanionBounds(targetArea, isExpanded);
     mainWindow.setBounds(newBounds, true);
   });
 }

@@ -3,6 +3,11 @@ import {
   AuditEvent,
   AuditKind,
   AudioChunkMetadata,
+  BrowserAction,
+  BrowserActionEventPayload,
+  BrowserActionKind,
+  CaptureState,
+  CaptureStatus,
   ContextItem,
   ErrorEnvelope,
   EventEnvelope,
@@ -15,7 +20,10 @@ import {
   SpeechEvent,
   SpeechEventKind,
   TranscriptSegment,
+  TurnKind,
+  TurnResponse,
   WorkflowProposal,
+  WorkflowResult,
   WorkflowStep,
 } from '../types/contracts';
 
@@ -256,6 +264,12 @@ export function validateEventEnvelope(val: unknown, expectedSessionId: string): 
     payload = validateSpeechEvent(val.payload, expectedSessionId);
   } else if (val.event_type === 'workflow.audit') {
     payload = validateAuditEvent(val.payload, expectedSessionId);
+  } else if (val.event_type === 'browser.action') {
+    payload = validateBrowserActionEvent(val.payload, expectedSessionId);
+  } else if (val.event_type === 'audio.capture') {
+    payload = validateCaptureStatus(val.payload, expectedSessionId);
+  } else if (val.event_type === 'assistant.turn') {
+    payload = validateTurnResponse(val.payload, expectedSessionId);
   } else {
     throw new MalformedResponseError(`Unsupported event_type "${val.event_type}"`);
   }
@@ -766,4 +780,310 @@ export function validateSessionEventStreamResponse(val: unknown): SessionEventSt
     total_events: val.total_events,
     has_more: val.has_more,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Week 4 (docs/contracts.md "Week 4 contracts"). These mirror the Pydantic
+// validators, so the companion rejects exactly what the backend would.
+// ---------------------------------------------------------------------------
+
+function optionalString(val: unknown, field: string, owner: string, maxLength?: number): string | null {
+  if (val === undefined || val === null) return null;
+  if (typeof val !== 'string') {
+    throw new MalformedResponseError(`${owner} "${field}" must be a string or null`);
+  }
+  if (maxLength !== undefined && val.length > maxLength) {
+    throw new MalformedResponseError(`${owner} "${field}" is longer than ${maxLength} characters`);
+  }
+  return val;
+}
+
+export const VALID_CAPTURE_STATES: ReadonlySet<CaptureState> = new Set([
+  'idle',
+  'listening',
+  'capturing',
+  'paused',
+  'stopped',
+]);
+
+export function validateCaptureStatus(val: unknown, expectedSessionId?: string): CaptureStatus {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('CaptureStatus must be an object');
+  }
+  if (!isNonEmptyString(val.session_id) || val.session_id.trim() === '') {
+    throw new MalformedResponseError('CaptureStatus missing non-empty "session_id"');
+  }
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `CaptureStatus session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+  if (typeof val.state !== 'string' || !VALID_CAPTURE_STATES.has(val.state as CaptureState)) {
+    throw new MalformedResponseError(`CaptureStatus has invalid state "${String(val.state)}"`);
+  }
+  if (val.source !== 'mock' && val.source !== 'mic') {
+    throw new MalformedResponseError(`CaptureStatus source must be mock or mic, got "${String(val.source)}"`);
+  }
+  if (typeof val.wake_required !== 'boolean') {
+    throw new MalformedResponseError('CaptureStatus "wake_required" must be a boolean');
+  }
+  const wakeWord = optionalString(val.wake_word, 'wake_word', 'CaptureStatus');
+  if (wakeWord !== null && wakeWord.trim() === '') {
+    throw new MalformedResponseError('CaptureStatus "wake_word" must not be blank');
+  }
+  return {
+    session_id: val.session_id,
+    state: val.state as CaptureState,
+    source: val.source,
+    wake_required: val.wake_required,
+    wake_word: wakeWord,
+  };
+}
+
+const WORKFLOW_STATES: ReadonlySet<string> = new Set([
+  'draft',
+  'awaiting_approval',
+  'running',
+  'paused',
+  'succeeded',
+  'failed',
+  'cancelled',
+]);
+
+export function validateWorkflowResult(val: unknown, expectedSessionId?: string): WorkflowResult {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('WorkflowResult must be an object');
+  }
+  if (!isNonEmptyString(val.plan_id)) {
+    throw new MalformedResponseError('WorkflowResult missing non-empty "plan_id"');
+  }
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('WorkflowResult missing non-empty "session_id"');
+  }
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError('WorkflowResult belongs to another session');
+  }
+  if (typeof val.state !== 'string' || !WORKFLOW_STATES.has(val.state)) {
+    throw new MalformedResponseError(`WorkflowResult has invalid state "${String(val.state)}"`);
+  }
+  const outputs: Record<string, string> = {};
+  if (val.outputs !== undefined && val.outputs !== null) {
+    if (!isObject(val.outputs)) {
+      throw new MalformedResponseError('WorkflowResult "outputs" must be an object');
+    }
+    for (const [k, v] of Object.entries(val.outputs)) {
+      if (typeof v !== 'string') {
+        throw new MalformedResponseError(`WorkflowResult output "${k}" must be a string`);
+      }
+      outputs[k] = v;
+    }
+  }
+  return {
+    plan_id: val.plan_id,
+    session_id: val.session_id,
+    state: val.state as WorkflowResult['state'],
+    outputs,
+    error: val.error ? validateErrorEnvelope(val.error) : null,
+    audit_events: Array.isArray(val.audit_events)
+      ? val.audit_events.map((a) => validateAuditEvent(a, val.session_id as string))
+      : [],
+  };
+}
+
+const TURN_KINDS: ReadonlySet<TurnKind> = new Set(['answer', 'clarify', 'proposal', 'error']);
+
+/** Mirrors TurnResponse.fields_match_kind in backend/app/contracts/sessions.py. */
+export function validateTurnResponse(val: unknown, expectedSessionId?: string): TurnResponse {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('TurnResponse must be an object');
+  }
+  if (!isNonEmptyString(val.session_id) || val.session_id.trim() === '') {
+    throw new MalformedResponseError('TurnResponse missing non-empty "session_id"');
+  }
+  const sessionId = val.session_id;
+  if (expectedSessionId && sessionId !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `TurnResponse session_id "${sessionId}" does not match expected "${expectedSessionId}"`
+    );
+  }
+  if (!isNonEmptyString(val.turn_id) || val.turn_id.trim() === '') {
+    throw new MalformedResponseError('TurnResponse missing non-empty "turn_id"');
+  }
+  if (typeof val.kind !== 'string' || !TURN_KINDS.has(val.kind as TurnKind)) {
+    throw new MalformedResponseError(`Unknown TurnResponse kind "${String(val.kind)}"`);
+  }
+  const kind = val.kind as TurnKind;
+
+  const answer = optionalString(val.answer, 'answer', 'TurnResponse');
+  const clarify = optionalString(val.clarify, 'clarify', 'TurnResponse', 300);
+  const errorCode = optionalString(val.error_code, 'error_code', 'TurnResponse');
+  const spokenText = optionalString(val.spoken_text, 'spoken_text', 'TurnResponse', 300);
+
+  let sourceIds: string[] = [];
+  if (val.source_ids !== undefined) {
+    if (!Array.isArray(val.source_ids) || !val.source_ids.every((x) => typeof x === 'string')) {
+      throw new MalformedResponseError('TurnResponse "source_ids" must be a list of strings');
+    }
+    sourceIds = val.source_ids as string[];
+  }
+
+  const proposal =
+    val.proposal === undefined || val.proposal === null ? null : validateWorkflowProposal(val.proposal);
+
+  let approvals: ApprovalRequest[] = [];
+  if (val.approvals !== undefined) {
+    if (!Array.isArray(val.approvals)) {
+      throw new MalformedResponseError('TurnResponse "approvals" must be a list');
+    }
+    approvals = val.approvals.map((a) => validateApprovalRequest(a));
+  }
+
+  const workflow =
+    val.workflow === undefined || val.workflow === null ? null : validateWorkflowResult(val.workflow);
+
+  const required: Record<TurnKind, unknown> = {
+    answer,
+    clarify,
+    proposal,
+    error: errorCode,
+  };
+  if (required[kind] === null) {
+    throw new MalformedResponseError(`a ${kind} turn needs its ${kind} field`);
+  }
+  if (kind !== 'proposal' && (approvals.length > 0 || workflow !== null)) {
+    throw new MalformedResponseError('approvals and workflow belong to proposal turns');
+  }
+  if (approvals.some((a) => a.session_id !== sessionId)) {
+    throw new MalformedResponseError('approvals must belong to this session');
+  }
+
+  return {
+    session_id: sessionId,
+    turn_id: val.turn_id,
+    kind,
+    answer,
+    source_ids: sourceIds,
+    clarify,
+    proposal,
+    approvals,
+    workflow,
+    error_code: errorCode,
+    spoken_text: spokenText,
+  };
+}
+
+const BROWSER_ACTION_KINDS: ReadonlySet<BrowserActionKind> = new Set([
+  'read_page',
+  'navigate',
+  'click',
+  'type',
+  'press_key',
+  'scroll',
+  'wait',
+]);
+
+/** Keys the extension may press (ALLOWED_KEYS in backend/app/contracts/browser.py). */
+export const ALLOWED_BROWSER_KEYS: ReadonlySet<string> = new Set([
+  'Enter',
+  'Tab',
+  'Escape',
+  'Backspace',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  'Space',
+]);
+
+const ACTION_NEEDS: Partial<Record<BrowserActionKind, (keyof BrowserAction)[]>> = {
+  navigate: ['url'],
+  click: ['ref'],
+  type: ['ref', 'text'],
+  press_key: ['key'],
+  scroll: ['scroll_y'],
+};
+
+export function validateBrowserAction(val: unknown, expectedSessionId?: string): BrowserAction {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('BrowserAction must be an object');
+  }
+  if (!isNonEmptyString(val.action_id) || val.action_id.length > 64 || val.action_id.trim() === '') {
+    throw new MalformedResponseError('BrowserAction needs a non-empty "action_id" (max 64)');
+  }
+  if (!isNonEmptyString(val.session_id)) {
+    throw new MalformedResponseError('BrowserAction missing non-empty "session_id"');
+  }
+  if (expectedSessionId && val.session_id !== expectedSessionId) {
+    throw new MalformedResponseError(
+      `BrowserAction session_id "${val.session_id}" does not match expected "${expectedSessionId}"`
+    );
+  }
+  if (typeof val.kind !== 'string' || !BROWSER_ACTION_KINDS.has(val.kind as BrowserActionKind)) {
+    throw new MalformedResponseError(`BrowserAction has unknown kind "${String(val.kind)}"`);
+  }
+  const kind = val.kind as BrowserActionKind;
+  const ref = optionalString(val.ref, 'ref', 'BrowserAction', 32);
+  const url = optionalString(val.url, 'url', 'BrowserAction', 2048);
+  const text = optionalString(val.text, 'text', 'BrowserAction', 2000);
+  const key = optionalString(val.key, 'key', 'BrowserAction');
+  let scrollY: number | null = null;
+  if (val.scroll_y !== undefined && val.scroll_y !== null) {
+    if (!isInteger(val.scroll_y) || val.scroll_y < -5000 || val.scroll_y > 5000) {
+      throw new MalformedResponseError('BrowserAction "scroll_y" must be an integer in -5000..5000');
+    }
+    scrollY = val.scroll_y;
+  }
+  if (url !== null) {
+    let scheme = '';
+    try {
+      scheme = new URL(url).protocol;
+    } catch {
+      throw new MalformedResponseError('BrowserAction "url" is not a valid URL');
+    }
+    if (scheme !== 'https:') {
+      throw new MalformedResponseError('BrowserAction navigates only to https URLs');
+    }
+  }
+  if (key !== null && !ALLOWED_BROWSER_KEYS.has(key)) {
+    throw new MalformedResponseError(`BrowserAction key "${key}" is not allowed`);
+  }
+  const action: BrowserAction = {
+    action_id: val.action_id,
+    session_id: val.session_id,
+    kind,
+    ref,
+    url,
+    text,
+    key,
+    scroll_y: scrollY,
+  };
+  for (const field of ACTION_NEEDS[kind] ?? []) {
+    if (action[field] === null) {
+      throw new MalformedResponseError(`${kind} needs ${field}`);
+    }
+  }
+  return action;
+}
+
+/** `browser.action` event payload: {action, ok, error_code}. Exactly one of ok / error_code. */
+export function validateBrowserActionEvent(
+  val: unknown,
+  expectedSessionId?: string
+): BrowserActionEventPayload {
+  if (!isObject(val)) {
+    throw new MalformedResponseError('browser.action payload must be an object');
+  }
+  const action = validateBrowserAction(val.action, expectedSessionId);
+  if (typeof val.ok !== 'boolean') {
+    throw new MalformedResponseError('browser.action payload "ok" must be a boolean');
+  }
+  const errorCode = optionalString(val.error_code, 'error_code', 'browser.action payload');
+  if (val.ok === (errorCode !== null)) {
+    throw new MalformedResponseError('browser.action payload needs ok=true or an error_code, not both');
+  }
+  return { action, ok: val.ok, error_code: errorCode };
 }

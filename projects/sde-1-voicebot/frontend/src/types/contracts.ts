@@ -202,6 +202,76 @@ export interface SessionEventStreamResponse {
   has_more: boolean;
 }
 
+/**
+ * Week 4 wire contracts. They mirror backend/app/contracts (audio.py CaptureStatus,
+ * sessions.py TurnRequest/TurnResponse, browser.py BrowserAction) and
+ * docs/contracts.md "Week 4 contracts". Change them only together with the backend.
+ */
+export type CaptureState = 'idle' | 'listening' | 'capturing' | 'paused' | 'stopped';
+
+/** `audio.capture` event payload and GET/POST /api/sessions/{id}/capture|listen body. */
+export interface CaptureStatus {
+  session_id: string;
+  state: CaptureState;
+  source: 'mock' | 'mic';
+  wake_required: boolean;
+  wake_word?: string | null;
+}
+
+/** POST /api/sessions/{id}/turns request body. */
+export interface TurnRequest {
+  text: string;
+  active_app?: string | null;
+  active_window_title?: string | null;
+}
+
+export type TurnKind = 'answer' | 'clarify' | 'proposal' | 'error';
+
+/** POST /api/sessions/{id}/turns response and `assistant.turn` event payload. */
+export interface TurnResponse {
+  session_id: string;
+  turn_id: string;
+  kind: TurnKind;
+  answer?: string | null;
+  source_ids: string[];
+  clarify?: string | null;
+  proposal?: WorkflowProposal | null;
+  approvals: ApprovalRequest[];
+  workflow?: WorkflowResult | null;
+  error_code?: string | null;
+  spoken_text?: string | null;
+}
+
+export type BrowserActionKind =
+  | 'read_page'
+  | 'navigate'
+  | 'click'
+  | 'type'
+  | 'press_key'
+  | 'scroll'
+  | 'wait';
+
+export interface BrowserAction {
+  action_id: string;
+  session_id: string;
+  kind: BrowserActionKind;
+  ref?: string | null;
+  url?: string | null;
+  text?: string | null;
+  key?: string | null;
+  scroll_y?: number | null;
+}
+
+/** `browser.action` event payload: the action and its outcome (no page text). */
+export interface BrowserActionEventPayload {
+  action: BrowserAction;
+  ok: boolean;
+  error_code?: string | null;
+}
+
+/** UI-only: what the companion glyph shows. Not a wire contract. */
+export type CompanionState = 'idle' | 'listening' | 'thinking' | 'working' | 'done' | 'error';
+
 export interface VoicebotDesktopBridge {
   isElectron: true;
   getToken: () => string;
@@ -215,5 +285,6 @@ declare global {
     voicebot?: VoicebotDesktopBridge;
   }
 }
+
 
 

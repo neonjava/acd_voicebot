@@ -7,7 +7,12 @@ import {
   parseRetryAfterMs,
 } from '../services/sessionClient';
 import { baselineSessionResponse, week2StreamingSessionResponse } from '../fixtures/baselineSession';
-import { MalformedResponseError } from '../utils/validation';
+import {
+  MalformedResponseError,
+  validateBrowserActionEvent,
+  validateCaptureStatus,
+  validateTurnResponse,
+} from '../utils/validation';
 
 describe('SessionClient implementations', () => {
   beforeEach(() => {
@@ -732,6 +737,122 @@ describe('SessionClient implementations', () => {
       );
       expect(auditEvt).toBeDefined();
       expect(auditEvt?.event_id).toBe('evt-audit-decision-appr-det-1-rejected');
+    });
+
+    // ---------------- Week 4: turns, capture, listen, speech ----------------
+    it('FixtureSessionClient runs one approved browser task with contract-valid events', async () => {
+      const client = new FixtureSessionClient();
+      const { session_id: sid } = await client.createSession();
+
+      const answer = await client.createTurn(sid, { text: 'what is using the most ram?' });
+      expect(() => validateTurnResponse(answer, sid)).not.toThrow();
+      expect(answer.kind).toBe('answer');
+
+      const proposal = await client.createTurn(sid, { text: 'open youtube and play lo-fi' });
+      expect(() => validateTurnResponse(proposal, sid)).not.toThrow();
+      expect(proposal.kind).toBe('proposal');
+      expect(proposal.proposal?.steps[0]).toMatchObject({
+        tool_name: 'browser_task',
+        requires_approval: true,
+        arguments: { start_url: 'https://www.youtube.com' },
+      });
+      expect(proposal.approvals).toHaveLength(1);
+
+      const before = (await client.getEvents(sid)).total_events;
+      await client.decideApproval(sid, proposal.approvals[0].approval_id, 'approve');
+      const after = (await client.getEvents(sid, before)).events;
+
+      const actions = after.filter((e) => e.event_type === 'browser.action');
+      expect(actions.map((e) => validateBrowserActionEvent(e.payload, sid).action.kind)).toEqual([
+        'navigate',
+        'read_page',
+        'click',
+        'read_page',
+      ]);
+      const finished = after.find(
+        (e) => e.event_type === 'workflow.audit' && (e.payload as { kind: string }).kind === 'step_succeeded'
+      );
+      expect(finished).toBeDefined();
+      expect(client.getExecutionCount()).toBe(1);
+    });
+
+    it('FixtureSessionClient: a rejected browser task runs no browser actions', async () => {
+      const client = new FixtureSessionClient();
+      const { session_id: sid } = await client.createSession();
+      const proposal = await client.createTurn(sid, { text: 'open my attendance page' });
+      const before = (await client.getEvents(sid)).total_events;
+      await client.decideApproval(sid, proposal.approvals[0].approval_id, 'reject');
+      const after = (await client.getEvents(sid, before)).events;
+      expect(after.some((e) => e.event_type === 'browser.action')).toBe(false);
+      expect(client.getExecutionCount()).toBe(0);
+    });
+
+    it('FixtureSessionClient listen start/stop returns CaptureStatus and emits audio.capture', async () => {
+      const client = new FixtureSessionClient();
+      const started = await client.setListening('session-demo', 'start');
+      expect(validateCaptureStatus(started, 'session-demo').state).toBe('listening');
+      expect((await client.getCaptureStatus('session-demo')).state).toBe('listening');
+      const stopped = await client.setListening('session-demo', 'stop');
+      expect(stopped.state).toBe('stopped');
+      const events = (await client.getEvents('session-demo')).events.filter((e) => e.event_type === 'audio.capture');
+      expect(events.map((e) => (e.payload as { state: string }).state)).toEqual(['listening', 'stopped']);
+    });
+
+    it('HttpSessionClient uses the session-scoped Week 4 routes with the bearer token', async () => {
+      const calls: { url: string; init: RequestInit }[] = [];
+      const last = () => calls[calls.length - 1];
+      const json = (status: number, body: unknown) => ({ ok: status < 400, status, json: async () => body });
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string, init: RequestInit) => {
+        calls.push({ url, init });
+        if (url === '/api/sessions' && init.method === 'POST') return json(201, { session_id: 'sess-9', state: 'active' });
+        if (url.endsWith('/turns')) {
+          return json(201, { session_id: 'sess-9', turn_id: 't1', kind: 'answer', answer: 'hi', source_ids: [], approvals: [] });
+        }
+        if (url.endsWith('/capture') || url.endsWith('/listen')) {
+          return json(200, { session_id: 'sess-9', state: 'listening', source: 'mic', wake_required: true, wake_word: 'hey jarvis' });
+        }
+        if (url.endsWith('/speech')) return { ok: true, status: 200, blob: async () => new Blob(['RIFF']) };
+        return json(404, {});
+      });
+      const client = new HttpSessionClient({ token: 'test-bearer-token' });
+
+      expect((await client.createSession()).session_id).toBe('sess-9');
+      const turn = await client.createTurn('sess-9', { text: 'hello', active_app: 'Firefox' });
+      expect(turn.answer).toBe('hi');
+      const turnCall = calls.find((c) => c.url === '/api/sessions/sess-9/turns')!;
+      expect(turnCall.init.method).toBe('POST');
+      expect(JSON.parse(turnCall.init.body as string)).toEqual({ text: 'hello', active_app: 'Firefox' });
+      expect((turnCall.init.headers as Record<string, string>).Authorization).toBe('Bearer test-bearer-token');
+
+      expect((await client.getCaptureStatus('sess-9')).state).toBe('listening');
+      expect(last().url).toBe('/api/sessions/sess-9/capture');
+      await client.setListening('sess-9', 'start');
+      expect(last().url).toBe('/api/sessions/sess-9/listen');
+      expect(JSON.parse(last().init.body as string)).toEqual({ action: 'start' });
+
+      const wav = await client.getTurnSpeech('sess-9', 't1');
+      expect(wav).toBeInstanceOf(Blob);
+      expect(last().url).toBe('/api/sessions/sess-9/turns/t1/speech');
+    });
+
+    it('HttpSessionClient rejects a malformed turn and maps missing routes and TTS-off', async () => {
+      const client = new HttpSessionClient({ token: 't' });
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        json: async () => ({ session_id: 'sess-9', turn_id: 't1', kind: 'answer', source_ids: [], approvals: [] }),
+      });
+      await expect(client.createTurn('sess-9', { text: 'x' })).rejects.toThrow(MalformedResponseError);
+
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ detail: 'Not Found' }),
+      });
+      await expect(client.createTurn('sess-9', { text: 'x' })).rejects.toMatchObject({
+        code: 'DEPENDENCY_UNAVAILABLE',
+      });
+      await expect(client.getTurnSpeech('sess-9', 't1')).resolves.toBeNull();
     });
   });
 });

@@ -15,6 +15,9 @@ import {
   validateWorkflowProposal,
   validateSessionEventStreamResponse,
   validateEventEnvelope,
+  validateCaptureStatus,
+  validateTurnResponse,
+  validateBrowserActionEvent,
   MalformedResponseError,
 } from '../utils/validation';
 import { baselineSessionResponse } from '../fixtures/baselineSession';
@@ -606,6 +609,168 @@ describe('Runtime Validation', () => {
           'sess-direct'
         )
       ).toThrow(/Unsupported event_type/);
+    });
+
+    // ---------------- Week 4 (docs/contracts.md "Week 4 contracts") ----------------
+    const turnBase = { session_id: 'sess-1', turn_id: 'turn-1', source_ids: [], approvals: [] };
+    const pendingApproval = {
+      approval_id: 'appr-1',
+      plan_id: 'plan-1',
+      step_id: 'step-browser',
+      session_id: 'sess-1',
+      status: 'pending',
+    };
+    const browserProposal = {
+      proposal_id: 'plan-1',
+      session_id: 'sess-1',
+      correlation_id: 'corr-1',
+      summary: 'Play the third lo-fi video on YouTube',
+      steps: [
+        {
+          step_id: 'step-browser',
+          tool_name: 'browser_task',
+          arguments: { goal: 'play the third lo-fi video', start_url: 'https://www.youtube.com' },
+          requires_approval: true,
+        },
+      ],
+    };
+
+    it('accepts each TurnResponse kind with its required field', () => {
+      const answer = validateTurnResponse({ ...turnBase, kind: 'answer', answer: 'Chrome, 3.1 GB.', source_ids: ['system_stats'] });
+      expect(answer.answer).toBe('Chrome, 3.1 GB.');
+      expect(answer.source_ids).toEqual(['system_stats']);
+
+      const clarify = validateTurnResponse({ ...turnBase, kind: 'clarify', clarify: 'Which app?' });
+      expect(clarify.clarify).toBe('Which app?');
+
+      const proposal = validateTurnResponse({
+        ...turnBase,
+        kind: 'proposal',
+        proposal: browserProposal,
+        approvals: [pendingApproval],
+      });
+      expect(proposal.proposal?.steps[0].tool_name).toBe('browser_task');
+      expect(proposal.approvals[0].approval_id).toBe('appr-1');
+
+      const error = validateTurnResponse({ ...turnBase, kind: 'error', error_code: 'BROWSER_NOT_CONNECTED' });
+      expect(error.error_code).toBe('BROWSER_NOT_CONNECTED');
+    });
+
+    it('rejects a TurnResponse whose kind field is missing (mirrors fields_match_kind)', () => {
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'answer' })).toThrow(/answer turn needs its answer/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'clarify', answer: 'x' })).toThrow(/clarify turn needs/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'proposal' })).toThrow(/proposal turn needs/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'error' })).toThrow(/error turn needs/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'chat', answer: 'x' })).toThrow(/Unknown TurnResponse kind/);
+    });
+
+    it('rejects approvals outside proposals, from another session, and over-long spoken text', () => {
+      expect(() =>
+        validateTurnResponse({ ...turnBase, kind: 'answer', answer: 'ok', approvals: [pendingApproval] })
+      ).toThrow(/belong to proposal turns/);
+      expect(() =>
+        validateTurnResponse({
+          ...turnBase,
+          kind: 'proposal',
+          proposal: browserProposal,
+          approvals: [{ ...pendingApproval, session_id: 'sess-other' }],
+        })
+      ).toThrow(/approvals must belong to this session/);
+      expect(() =>
+        validateTurnResponse({ ...turnBase, kind: 'answer', answer: 'ok', spoken_text: 'x'.repeat(301) })
+      ).toThrow(/longer than 300/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'clarify', clarify: 'x'.repeat(301) })).toThrow(
+        /longer than 300/
+      );
+      expect(() => validateTurnResponse({ ...turnBase, turn_id: ' ', kind: 'answer', answer: 'ok' })).toThrow(/turn_id/);
+      expect(() => validateTurnResponse({ ...turnBase, kind: 'answer', answer: 'ok' }, 'sess-2')).toThrow(
+        /does not match/
+      );
+    });
+
+    it('validates CaptureStatus states, source and wake fields', () => {
+      const ok = validateCaptureStatus({
+        session_id: 'sess-1',
+        state: 'listening',
+        source: 'mic',
+        wake_required: true,
+        wake_word: 'hey jarvis',
+      });
+      expect(ok.state).toBe('listening');
+      expect(ok.wake_word).toBe('hey jarvis');
+      const base = { session_id: 'sess-1', state: 'idle', source: 'mock', wake_required: false };
+      expect(validateCaptureStatus(base).wake_word).toBeNull();
+      expect(() => validateCaptureStatus({ ...base, state: 'captured' })).toThrow(/invalid state/);
+      expect(() => validateCaptureStatus({ ...base, source: 'cloud' })).toThrow(/source must be mock or mic/);
+      expect(() => validateCaptureStatus({ ...base, wake_required: 'yes' })).toThrow(/wake_required/);
+      expect(() => validateCaptureStatus({ ...base, wake_word: '  ' })).toThrow(/must not be blank/);
+      expect(() => validateCaptureStatus(base, 'sess-2')).toThrow(/does not match/);
+    });
+
+    it('validates browser.action payloads like BrowserAction and BrowserActionResult', () => {
+      const action = { action_id: 'a1', session_id: 'sess-1' };
+      const ok = validateBrowserActionEvent({
+        action: { ...action, kind: 'navigate', url: 'https://www.youtube.com' },
+        ok: true,
+        error_code: null,
+      });
+      expect(ok.action.kind).toBe('navigate');
+      const failed = validateBrowserActionEvent({
+        action: { ...action, kind: 'click', ref: 'e12' },
+        ok: false,
+        error_code: 'ELEMENT_NOT_FOUND',
+      });
+      expect(failed.error_code).toBe('ELEMENT_NOT_FOUND');
+
+      const bad = (a: Record<string, unknown>, extra: Record<string, unknown> = { ok: true }) => () =>
+        validateBrowserActionEvent({ action: { ...action, ...a }, ...extra });
+      expect(bad({ kind: 'navigate' })).toThrow(/navigate needs url/);
+      expect(bad({ kind: 'navigate', url: 'http://example.com' })).toThrow(/only to https/);
+      expect(bad({ kind: 'type', ref: 'e1' })).toThrow(/type needs text/);
+      expect(bad({ kind: 'press_key', key: 'F12' })).toThrow(/not allowed/);
+      expect(bad({ kind: 'scroll', scroll_y: 5001 })).toThrow(/-5000\.\.5000/);
+      expect(bad({ kind: 'teleport' })).toThrow(/unknown kind/);
+      expect(bad({ kind: 'read_page' }, { ok: true, error_code: 'X' })).toThrow(/not both/);
+      expect(bad({ kind: 'read_page' }, { ok: false })).toThrow(/not both/);
+      expect(() =>
+        validateBrowserActionEvent({ action: { ...action, kind: 'wait' }, ok: true }, 'sess-2')
+      ).toThrow(/does not match/);
+    });
+
+    it('validates Week 4 events inside the session event envelope', () => {
+      const envelope = (event_type: string, payload: unknown) => ({
+        event_id: `evt-${event_type}`,
+        event_type,
+        schema_version: '1.0',
+        session_id: 'sess-1',
+        correlation_id: 'corr-1',
+        timestamp: '2026-01-01T00:00:00Z',
+        producer: 'test',
+        payload,
+      });
+      const turn = validateEventEnvelope(
+        envelope('assistant.turn', { ...turnBase, kind: 'answer', answer: 'hi' }),
+        'sess-1'
+      );
+      expect((turn.payload as { answer: string }).answer).toBe('hi');
+      expect(() =>
+        validateEventEnvelope(envelope('assistant.turn', { ...turnBase, kind: 'answer' }), 'sess-1')
+      ).toThrow(MalformedResponseError);
+      expect(() =>
+        validateEventEnvelope(
+          envelope('audio.capture', { session_id: 'sess-1', state: 'captured', source: 'mock', wake_required: true }),
+          'sess-1'
+        )
+      ).toThrow(/invalid state/);
+      expect(() =>
+        validateEventEnvelope(
+          envelope('browser.action', {
+            action: { action_id: 'a1', session_id: 'sess-1', kind: 'click' },
+            ok: true,
+          }),
+          'sess-1'
+        )
+      ).toThrow(/click needs ref/);
     });
   });
 });
