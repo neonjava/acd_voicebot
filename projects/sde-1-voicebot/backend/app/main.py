@@ -10,7 +10,16 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -19,14 +28,19 @@ from app.config import settings
 from app.contracts.common import ErrorEnvelope, SessionState
 from app.contracts.sessions import (
     ApprovalDecisionRequest,
+    CaptureListenRequest,
+    CaptureStatus,
     MockSessionRequest,
     MockSessionResponse,
     SessionActionRequest,
     SessionCreateRequest,
     SessionEventStreamResponse,
     SessionStateResponse,
+    TurnRequest,
+    TurnResponse,
 )
 from app.contracts.workflow import ApprovalRequest
+from app.sessions.bridge import BrowserBridgeError, browser_bridge
 from app.sessions.gateways import GatewayError
 from app.sessions.logging import (
     StructuredRedactingFormatter,
@@ -46,6 +60,8 @@ from app.sessions.service import (
     SessionExpiredError,
     SessionNotFoundError,
     SessionTerminalStateError,
+    TTSUnavailableError,
+    TurnNotFoundError,
     session_service,
 )
 
@@ -707,6 +723,87 @@ async def http_exception_handler(
     return response
 
 
+@app.exception_handler(TTSUnavailableError)
+async def tts_unavailable_handler(
+    request: Request,
+    exc: TTSUnavailableError,
+) -> JSONResponse:
+    """Report TTS unavailable as 404 with ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="TTS_UNAVAILABLE",
+        message_safe_for_user="Text-to-speech is disabled or unavailable.",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(TurnNotFoundError)
+async def turn_not_found_handler(
+    request: Request,
+    exc: TurnNotFoundError,
+) -> JSONResponse:
+    """Report turn not found as 404 with ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    error_envelope = ErrorEnvelope(
+        code="TURN_NOT_FOUND",
+        message_safe_for_user=f"Turn was not found: {exc.turn_id}",
+        retryable=False,
+        correlation_id=corr_id,
+        details_redacted={"turn_id": exc.turn_id},
+    )
+    response = JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
+@app.exception_handler(BrowserBridgeError)
+async def browser_bridge_error_handler(
+    request: Request,
+    exc: BrowserBridgeError,
+) -> JSONResponse:
+    """Format browser bridge errors into safe ErrorEnvelope."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+    if exc.code == "BROWSER_TIMEOUT":
+        status_code = status.HTTP_504_GATEWAY_TIMEOUT
+    elif exc.code == "BROWSER_NOT_CONNECTED":
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    error_envelope = ErrorEnvelope(
+        code=exc.code,
+        message_safe_for_user=exc.message,
+        retryable=exc.code != "BROWSER_NOT_CONNECTED",
+        correlation_id=corr_id,
+        details_redacted={},
+    )
+    response = JSONResponse(
+        status_code=status_code,
+        content=error_envelope.model_dump(mode="json"),
+    )
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = corr_id
+    return response
+
+
 # --- Helper for Idempotency Key Validation ---
 
 
@@ -722,14 +819,49 @@ def validate_idempotency_key(key: str | None, corr_id: str) -> None:
 # --- Endpoints ---
 
 
-@app.get("/api/health")
+@app.get(
+    "/api/health",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "ok",
+                        "mode": "mock",
+                        "modules": {
+                            "audio": "ok",
+                            "transcription": "ok",
+                            "reasoning": "ok",
+                            "workflow": "ok",
+                        },
+                    }
+                }
+            }
+        }
+    },
+)
 async def health() -> dict[str, Any]:
     """Health endpoint returning aggregated status across all module gateways."""
     aggregated = session_service.get_aggregated_health()
     return aggregated.model_dump(mode="json")
 
 
-@app.get("/api/ready")
+@app.get(
+    "/api/ready",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "ready",
+                        "mode": "mock",
+                        "auth": "off",
+                    }
+                }
+            }
+        }
+    },
+)
 async def ready() -> dict[str, str]:
     """Readiness endpoint verifying configuration and auth mode."""
     if not settings.mock_mode:
@@ -1004,7 +1136,22 @@ async def get_session_events(
     )
 
 
-@app.get("/api/sessions/{session_id}/events/stream")
+@app.get(
+    "/api/sessions/{session_id}/events/stream",
+    responses={
+        200: {
+            "content": {
+                "text/event-stream": {
+                    "example": (
+                        'event: session.status\ndata: {"session_id": "session-demo",'
+                        ' "state": "completed"}\n\n'
+                    )
+                }
+            },
+            "description": "Server-sent events stream for session events and status",
+        }
+    },
+)
 async def stream_session_events(
     request: Request,
     session_id: str,
@@ -1078,6 +1225,24 @@ async def stream_session_events(
 @app.get(
     "/api/sessions/{session_id}/approvals",
     response_model=list[ApprovalRequest],
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "approval_id": "p1-approval-close",
+                            "plan_id": "p1",
+                            "step_id": "close",
+                            "session_id": "session-demo",
+                            "status": "pending",
+                            "expires_at": "2026-01-01T00:05:00Z",
+                        }
+                    ]
+                }
+            }
+        }
+    },
 )
 async def list_session_approvals(
     session_id: str,
@@ -1090,6 +1255,22 @@ async def list_session_approvals(
 @app.post(
     "/api/sessions/{session_id}/approvals/{approval_id}",
     response_model=ApprovalRequest,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "approval_id": "p1-approval-close",
+                        "plan_id": "p1",
+                        "step_id": "close",
+                        "session_id": "session-demo",
+                        "status": "approved",
+                        "expires_at": "2026-01-01T00:05:00Z",
+                    }
+                }
+            }
+        }
+    },
 )
 async def decide_session_approval(
     request: Request,
@@ -1107,3 +1288,116 @@ async def decide_session_approval(
         correlation_id=corr_id,
     )
     return updated
+
+
+# --- Week 4 Conversation, Audio Capture, Speech, and Browser Bridge ---
+
+
+@app.post(
+    "/api/sessions/{session_id}/turns",
+    response_model=TurnResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_session_turn(
+    request: Request,
+    session_id: str,
+    body: TurnRequest,
+) -> TurnResponse:
+    """Submit a user conversational turn and obtain assistant response."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    current_session_id.set(session_id)
+    return session_service.create_turn(
+        session_id,
+        body,
+        correlation_id=corr_id,
+    )
+
+
+@app.get(
+    "/api/sessions/{session_id}/capture",
+    response_model=CaptureStatus,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "session-demo",
+                        "state": "idle",
+                        "source": "mock",
+                        "wake_required": True,
+                        "wake_word": "hey_jarvis",
+                    }
+                }
+            }
+        }
+    },
+)
+async def get_session_capture_status(
+    session_id: str,
+) -> CaptureStatus:
+    """Retrieve audio capture status for the session."""
+    current_session_id.set(session_id)
+    return session_service.get_capture_status(session_id)
+
+
+@app.post(
+    "/api/sessions/{session_id}/listen",
+    response_model=CaptureStatus,
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "session_id": "session-demo",
+                        "state": "listening",
+                        "source": "mock",
+                        "wake_required": True,
+                        "wake_word": "hey_jarvis",
+                    }
+                }
+            }
+        }
+    },
+)
+async def set_session_listen_action(
+    request: Request,
+    session_id: str,
+    body: CaptureListenRequest,
+) -> CaptureStatus:
+    """Start or stop microphone capture."""
+    corr_id = getattr(request.state, "correlation_id", f"corr-{uuid.uuid4().hex[:16]}")
+    current_session_id.set(session_id)
+    return session_service.set_listen_action(
+        session_id,
+        body.action,
+        correlation_id=corr_id,
+    )
+
+
+@app.get(
+    "/api/sessions/{session_id}/turns/{turn_id}/speech",
+    responses={
+        200: {
+            "content": {"audio/wav": {}},
+            "description": "Synthesized WAV audio stream",
+        }
+    },
+)
+async def get_turn_speech_audio(
+    session_id: str,
+    turn_id: str,
+) -> Response:
+    """Retrieve speech WAV audio for a conversational turn."""
+    current_session_id.set(session_id)
+    audio_bytes = session_service.get_turn_speech(session_id, turn_id)
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'inline; filename="{turn_id}.wav"'},
+    )
+
+
+@app.websocket("/api/bridge")
+async def browser_bridge_websocket(websocket: WebSocket) -> None:
+    """WebSocket connection for the browser extension bridge."""
+    await browser_bridge.handle_connection(websocket)

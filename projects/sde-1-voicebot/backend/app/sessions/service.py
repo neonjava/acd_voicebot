@@ -1,15 +1,24 @@
 """In-memory session repository, state transitions, and mock session runner."""
 
 import importlib.util
+import io
+import os
 import uuid
+import wave
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from app.config import settings
+from app.contracts.audio import CaptureStatus
+from app.contracts.browser import BrowserAction
 from app.contracts.common import ContractModel, SessionState
 from app.contracts.sessions import (
+    AssistantTurnEvent,
+    AudioCaptureEvent,
     AudioChunkEvent,
     AudioChunkMetadata,
+    BrowserActionEvent,
+    BrowserActionPayload,
     HealthResponse,
     IdempotencyRecord,
     MockSessionResponse,
@@ -18,6 +27,8 @@ from app.contracts.sessions import (
     SessionEvent,
     SessionStateResponse,
     SpeechStreamEvent,
+    TurnRequest,
+    TurnResponse,
     WorkflowAuditEvent,
 )
 from app.contracts.transcription import TranscriptEvent, TranscriptSegment
@@ -26,6 +37,7 @@ from app.contracts.workflow import (
     WorkflowPlan,
     WorkflowResult,
 )
+from app.reasoning.bundle import ActiveWindow, Turn, build_bundle
 from app.sessions.gateways import (
     audio_gateway,
     reasoning_gateway,
@@ -174,6 +186,36 @@ class MissingWorkflowPlanError(Exception):
         self.plan_id = plan_id
 
 
+class TTSUnavailableError(Exception):
+    """Raised when speech audio is requested but text-to-speech is disabled."""
+
+    def __init__(self, message: str = "Text-to-speech is disabled.") -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class TurnNotFoundError(Exception):
+    """Raised when looking up a turn ID that does not exist."""
+
+    def __init__(self, turn_id: str) -> None:
+        super().__init__(f"Turn not found: {turn_id}")
+        self.turn_id = turn_id
+
+
+def make_fake_wav(*, duration_ms: int = 1000) -> bytes:
+    """Generate synthetic 16kHz mono WAV bytes from fake PCM."""
+    from app.audio.source import make_fake_pcm
+
+    pcm = make_fake_pcm(duration_ms=duration_ms)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
 class SessionRecord(ContractModel):
     """In-memory representation of an active, paused, or completed session."""
 
@@ -194,6 +236,9 @@ class SessionService:
         self._idempotency_cache: dict[str, IdempotencyRecord] = {}
         self._approvals: dict[str, ApprovalRequest] = {}
         self._workflow_plans: dict[str, WorkflowPlan] = {}
+        self._capture_statuses: dict[str, CaptureStatus] = {}
+        self._turns: dict[str, dict[str, TurnResponse]] = {}
+        self._conversation_turns: dict[str, list[Turn]] = {}
 
     def clear(self) -> None:
         """Clear all sessions and caches (primarily for test isolation)."""
@@ -202,6 +247,9 @@ class SessionService:
         self._idempotency_cache.clear()
         self._approvals.clear()
         self._workflow_plans.clear()
+        self._capture_statuses.clear()
+        self._turns.clear()
+        self._conversation_turns.clear()
 
     def create_session(
         self,
@@ -933,6 +981,389 @@ class SessionService:
         except Exception:
             self.transition(sid, SessionState.failed, now=ts)
             raise
+
+    # --- Week 4 Listen, Capture, Turns, and Browser Extensions ---
+
+    def get_capture_status(self, session_id: str) -> CaptureStatus:
+        """Retrieve current audio capture status for the session."""
+        sess = self.get_session(session_id, check_expiry=True)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+        if session_id not in self._capture_statuses:
+            try:
+                from app.audio.config import AudioConfig
+
+                audio_cfg = AudioConfig.from_env()
+                source = audio_cfg.audio_source
+                wake_word = audio_cfg.wake_word
+                wake_required = audio_cfg.wake_required
+            except Exception:
+                source = os.getenv("AUDIO_SOURCE", "mock").strip().lower()
+                wake_word = os.getenv("AUDIO_WAKE_WORD", "hey_jarvis")
+                wake_required = True
+
+            self._capture_statuses[session_id] = CaptureStatus(
+                session_id=session_id,
+                state="idle",
+                source=source,
+                wake_required=wake_required,
+                wake_word=wake_word,
+            )
+        return self._capture_statuses[session_id]
+
+    def set_listen_action(
+        self,
+        session_id: str,
+        action: Literal["start", "stop"],
+        *,
+        correlation_id: str | None = None,
+        now: datetime | None = None,
+    ) -> CaptureStatus:
+        """Transition capture status (start -> listening, stop -> stopped)."""
+        sess = self.get_session(session_id, check_expiry=True, now=now)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+        if sess.state in (
+            SessionState.completed,
+            SessionState.failed,
+            SessionState.expired,
+        ):
+            raise SessionTerminalStateError(session_id, sess.state)
+
+        ts = now or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+
+        current = self.get_capture_status(session_id)
+        new_state = "listening" if action == "start" else "stopped"
+        updated = current.model_copy(update={"state": new_state})
+        self._capture_statuses[session_id] = updated
+
+        capture_event = AudioCaptureEvent(
+            event_id=f"event-capture-{uuid.uuid4().hex[:8]}",
+            event_type="audio.capture",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id=cid,
+            timestamp=ts,
+            producer="audio",
+            payload=updated,
+        )
+        self.add_event(session_id, capture_event)
+        return updated
+
+    def create_turn(
+        self,
+        session_id: str,
+        turn_request: TurnRequest,
+        *,
+        correlation_id: str | None = None,
+        now: datetime | None = None,
+    ) -> TurnResponse:
+        """Process a conversational turn through W3 and W4."""
+        sess = self.get_session(session_id, check_expiry=True, now=now)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+
+        if sess.state in (
+            SessionState.completed,
+            SessionState.failed,
+            SessionState.expired,
+        ):
+            raise SessionTerminalStateError(session_id, sess.state)
+
+        ts = now or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+        turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+
+        recent_turns = self._conversation_turns.get(session_id, [])
+        user_turn = Turn(
+            turn_id=turn_id,
+            role="user",
+            text=turn_request.text,
+            at=ts,
+        )
+        active_window = (
+            ActiveWindow(
+                app=turn_request.active_app,
+                title=turn_request.active_window_title or "",
+            )
+            if turn_request.active_app
+            else None
+        )
+        bundle = build_bundle(recent_turns, active_window=active_window)
+
+        from app.agent import tools
+        from app.agent.approvals import approval_requests_for, steps_needing_approval
+        from app.agent.proposals import plan_from_proposal
+        from app.reasoning.planner import LLMWorkflowPlanner, RuleBasedPlanner
+
+        llm_env = os.getenv("REASONING_LLM_PROVIDER", "mock").strip().lower()
+        if llm_env == "ollama":
+            from app.reasoning.ollama import create_llm_provider
+
+            provider = create_llm_provider()
+            planner: Any = LLMWorkflowPlanner(provider, correlation_id=cid)
+        else:
+            planner = RuleBasedPlanner()
+
+        decision = planner.plan(
+            user_turn,
+            bundle,
+            catalogue=tools.TOOL_SPECS,
+            session_id=session_id,
+            correlation_id=cid,
+        )
+
+        turn_resp: TurnResponse
+        if decision.kind == "clarify":
+            turn_resp = TurnResponse(
+                session_id=session_id,
+                turn_id=turn_id,
+                kind="clarify",
+                clarify=decision.message,
+                spoken_text=decision.message,
+            )
+        elif decision.kind == "proposal":
+            proposal = decision.proposal
+            assert proposal is not None
+            plan = plan_from_proposal(proposal)
+            needing = steps_needing_approval(plan)
+
+            if needing:
+                pending_reqs = approval_requests_for(plan, now=ts)
+                for req in pending_reqs:
+                    self.register_approval(req, plan)
+                summary_spoken = (
+                    f"I've prepared a plan to {proposal.summary.lower()}. "
+                    "Please approve to proceed."
+                )
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="proposal",
+                    proposal=proposal,
+                    approvals=pending_reqs,
+                    spoken_text=summary_spoken,
+                )
+            else:
+                wf_result, audit_events = workflow_gateway.execute_plan(
+                    plan, [], correlation_id=cid, clock=lambda: ts
+                )
+                for audit in audit_events:
+                    audit_evt = WorkflowAuditEvent(
+                        event_id=f"event-audit-{uuid.uuid4().hex[:8]}",
+                        event_type="workflow.audit",
+                        schema_version="1.0",
+                        session_id=session_id,
+                        correlation_id=cid,
+                        timestamp=ts,
+                        producer="workflow",
+                        payload=audit,
+                    )
+                    self.add_event(session_id, audit_evt)
+
+                output_text = ""
+                spoken_text = ""
+                if "stats" in wf_result.outputs:
+                    output_text = wf_result.outputs["stats"]
+                    if "Top memory:" in output_text:
+                        top_part = output_text.split("Top memory:", 1)[1].strip()
+                        top_line = top_part.splitlines()[0].strip()
+                        first_entry = top_line.split(",")[0].strip().rstrip(".")
+                        parts = first_entry.rsplit(" ", 2)
+                        if len(parts) == 3:
+                            pname, val, unit = parts
+                            spoken_text = f"{pname.capitalize()}, about {val} {unit}."
+                        else:
+                            spoken_text = f"{first_entry}."
+                    else:
+                        spoken_text = output_text[:300]
+                elif wf_result.outputs:
+                    output_text = next(iter(wf_result.outputs.values()))
+                    spoken_text = output_text[:300]
+                else:
+                    output_text = "Done."
+                    spoken_text = "Done."
+
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="proposal",
+                    proposal=proposal,
+                    workflow=wf_result,
+                    answer=output_text,
+                    spoken_text=spoken_text,
+                )
+        elif decision.error is not None:
+            turn_resp = TurnResponse(
+                session_id=session_id,
+                turn_id=turn_id,
+                kind="error",
+                error_code=decision.error.code,
+                answer=decision.error.message_safe_for_user,
+                spoken_text=decision.error.message_safe_for_user,
+            )
+        else:
+            from app.reasoning.grounding import grounded_answer
+            from app.reasoning.llm import LLMReasoningAdapter
+            from app.reasoning.ollama import create_llm_provider
+
+            provider = create_llm_provider()
+            adapter = LLMReasoningAdapter(provider)
+            outcome = grounded_answer(
+                user_turn.text,
+                bundle,
+                adapter=adapter,
+                session_id=session_id,
+                now=ts,
+            )
+            if outcome.error is not None:
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="error",
+                    error_code=outcome.error.code,
+                    answer=outcome.error.message_safe_for_user,
+                    spoken_text=outcome.error.message_safe_for_user,
+                )
+            elif outcome.result is not None:
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="answer",
+                    answer=outcome.result.answer,
+                    source_ids=outcome.result.source_ids,
+                    spoken_text=outcome.result.answer[:300],
+                )
+            else:
+                answer_text = "I don't have enough evidence to answer that question."
+                turn_resp = TurnResponse(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    kind="answer",
+                    answer=answer_text,
+                    source_ids=[],
+                    spoken_text=answer_text,
+                )
+
+        if session_id not in self._turns:
+            self._turns[session_id] = {}
+        self._turns[session_id][turn_id] = turn_resp
+        while len(self._turns[session_id]) > 20:
+            oldest_key = next(iter(self._turns[session_id]))
+            del self._turns[session_id][oldest_key]
+
+        if session_id not in self._conversation_turns:
+            self._conversation_turns[session_id] = []
+        self._conversation_turns[session_id].append(user_turn)
+        assistant_turn = Turn(
+            turn_id=f"{turn_id}-reply",
+            role="assistant",
+            text=turn_resp.spoken_text
+            or turn_resp.answer
+            or turn_resp.clarify
+            or "proposal",
+            at=ts,
+        )
+        self._conversation_turns[session_id].append(assistant_turn)
+        if len(self._conversation_turns[session_id]) > 20:
+            self._conversation_turns[session_id] = self._conversation_turns[session_id][
+                -20:
+            ]
+
+        turn_evt = AssistantTurnEvent(
+            event_id=f"event-turn-{uuid.uuid4().hex[:8]}",
+            event_type="assistant.turn",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id=cid,
+            timestamp=ts,
+            producer="assistant",
+            payload=turn_resp,
+        )
+        self.add_event(session_id, turn_evt)
+        return turn_resp
+
+    def get_turn(self, session_id: str, turn_id: str) -> TurnResponse:
+        """Retrieve a specific turn response."""
+        sess = self.get_session(session_id, check_expiry=True)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+        turns = self._turns.get(session_id, {})
+        turn = turns.get(turn_id)
+        if turn is None:
+            raise TurnNotFoundError(turn_id)
+        return turn
+
+    def get_turn_speech(self, session_id: str, turn_id: str) -> bytes:
+        """Get WAV audio for turn spoken text, or 404 when TTS unavailable."""
+        sess = self.get_session(session_id, check_expiry=True)
+        if not sess:
+            raise SessionNotFoundError(session_id)
+        turn = self.get_turn(session_id, turn_id)
+        if not settings.tts_enabled:
+            raise TTSUnavailableError("Text-to-speech is disabled.")
+        if not turn.spoken_text or not turn.spoken_text.strip():
+            raise TTSUnavailableError("Turn has no spoken text.")
+        if sess.mode != "mock":
+            raise TTSUnavailableError("TTS synthesizer unavailable in non-mock mode.")
+        return make_fake_wav(duration_ms=1000)
+
+    def record_browser_action(
+        self,
+        session_id: str,
+        action: BrowserAction,
+        *,
+        ok: bool,
+        error_code: str | None = None,
+        correlation_id: str | None = None,
+        now: datetime | None = None,
+    ) -> BrowserActionEvent:
+        """Record browser action event on session stream without sensitive text."""
+        ts = now or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        cid = correlation_id or f"corr-{uuid.uuid4().hex[:16]}"
+        payload = BrowserActionPayload(action=action, ok=ok, error_code=error_code)
+        evt = BrowserActionEvent(
+            event_id=f"event-browser-{uuid.uuid4().hex[:8]}",
+            event_type="browser.action",
+            schema_version="1.0",
+            session_id=session_id,
+            correlation_id=cid,
+            timestamp=ts,
+            producer="browser",
+            payload=payload,
+        )
+        self.add_event(session_id, evt)
+        return evt
+
+    def process_spoken_utterance(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        active_app: str | None = None,
+        active_window_title: str | None = None,
+        correlation_id: str | None = None,
+        now: datetime | None = None,
+    ) -> TurnResponse:
+        """Create a turn automatically from a final spoken transcript segment."""
+        req = TurnRequest(
+            text=text,
+            active_app=active_app,
+            active_window_title=active_window_title,
+        )
+        return self.create_turn(
+            session_id,
+            req,
+            correlation_id=correlation_id,
+            now=now,
+        )
 
 
 session_service = SessionService()
