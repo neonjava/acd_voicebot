@@ -314,11 +314,17 @@ class WorkflowGateway:
     ) -> tuple[WorkflowResult, list[AuditEvent]]:
         """Execute workflow plan using W4 executor and generate AuditEvents."""
         try:
+            from app.agent import tools
             from app.agent.executor import execute
 
             clk = clock or (lambda: datetime.now(timezone.utc))
+            scopes = frozenset(p.scope for p in tools.TOOL_POLICIES.values())
             result = execute(
-                plan, approvals=approvals, clock=clk, correlation_id=correlation_id
+                plan,
+                approvals=approvals,
+                granted_scopes=scopes,
+                clock=clk,
+                correlation_id=correlation_id,
             )
             return result, result.audit_events
 

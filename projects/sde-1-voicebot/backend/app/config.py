@@ -23,6 +23,9 @@ class Settings(ContractModel):
     launch_token: str | None = Field(default=None)
     rate_limit_requests: int = Field(default=100, gt=0)
     rate_limit_window_seconds: int = Field(default=60, gt=0)
+    tts_enabled: bool = Field(default=False)
+    browser_timeout_seconds: float = Field(default=15.0, gt=0)
+    notes_dirs: str | None = Field(default=None)
 
     @field_validator("host")
     @classmethod
@@ -95,6 +98,18 @@ class Settings(ContractModel):
                 f"VOICEBOT_RATE_LIMIT_WINDOW must be an integer: {err}"
             ) from err
 
+        tts_raw = os.getenv("TTS_ENABLED", "false").lower()
+        tts_val = tts_raw in ("1", "true", "yes", "on")
+
+        try:
+            browser_timeout_val = float(os.getenv("VOICEBOT_BROWSER_TIMEOUT", "15.0"))
+        except ValueError as err:
+            raise ValueError(
+                f"VOICEBOT_BROWSER_TIMEOUT must be a number: {err}"
+            ) from err
+
+        notes_dirs_val = os.getenv("REASONING_NOTES_DIRS")
+
         return cls(
             mock_mode=mock_val,
             host=host_val,
@@ -106,6 +121,9 @@ class Settings(ContractModel):
             launch_token=launch_token_val,
             rate_limit_requests=rate_limit_req_val,
             rate_limit_window_seconds=rate_limit_win_val,
+            tts_enabled=tts_val,
+            browser_timeout_seconds=browser_timeout_val,
+            notes_dirs=notes_dirs_val,
         )
 
 

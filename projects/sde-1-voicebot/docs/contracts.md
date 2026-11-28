@@ -121,6 +121,61 @@ These are defined now so all six Week 3 branches can build against them in paral
 - **Event stream:** the existing `GET /api/sessions/{id}/events` and `/events/stream` also carry `audio.speech` (payload `SpeechEvent`) and `workflow.audit` (payload `AuditEvent`) events. Reconnect: the client passes `from_sequence` = number of events already received; the server replays from there with no gaps or duplicates.
 - **Approvals:** `GET /api/sessions/{id}/approvals` → list of pending `ApprovalRequest`. `POST /api/sessions/{id}/approvals/{approval_id}` with body `{"decision":"approve"|"reject"}` → the updated `ApprovalRequest`. Deciding an expired or already-decided approval → 409 `ErrorEnvelope`. Rejecting never executes the step.
 
+## Week 4 contracts (fixed before the Week 4 issues; change only through Hemanth)
+
+Week 4 connects every module into the real conversation loop for the Day 30 demo. Product context: [product.md](product.md).
+
+### W1 → W5 → W6: `CaptureStatus` (`app/contracts/audio.py`)
+
+- Fields: `session_id`, `state` (`idle` | `listening` | `capturing` | `paused` | `stopped`), `source` (`mock` | `mic`), `wake_required`, `wake_word`.
+- `listening` = waiting for "hey jarvis"; `capturing` = recording an utterance. Audio is never written to disk in any state.
+- API (W5): `GET /api/sessions/{id}/capture` → `CaptureStatus`; `POST /api/sessions/{id}/listen` with `{"action":"start"|"stop"}` → `CaptureStatus`. Session stream event: `event_type="audio.capture"`, `producer="audio"`, payload `CaptureStatus`, sent on every state change.
+
+### W5 → W6: conversational turns (`app/contracts/sessions.py`)
+
+- `POST /api/sessions/{id}/turns` with `TurnRequest` (`text` 1–2000 chars, optional `active_app`, `active_window_title`) → 201 `TurnResponse`.
+- `TurnResponse.kind`:
+  - `answer`: `answer` + `source_ids` (empty = "not enough evidence" answer);
+  - `clarify`: one short question;
+  - `proposal`: the `WorkflowProposal`, the pending `approvals` it needs, and `workflow` when only safe steps ran directly;
+  - `error`: a safe `error_code`.
+- `spoken_text`: the short line the assistant speaks. Audio: `GET /api/sessions/{id}/turns/{turn_id}/speech` → `audio/wav` (404 `TTS_UNAVAILABLE` when text-to-speech is off).
+- Session stream event: `event_type="assistant.turn"`, `producer="assistant"`, payload `TurnResponse`.
+- A spoken utterance becomes a turn automatically: W1 speech → W2 final transcript → W5 creates the turn with the final text.
+
+### W3 / W4: tools for the demo scenarios (W4 registry, W3 planner)
+
+| Tool | Arguments | Safety | Scenario |
+|---|---|---|---|
+| `system_stats` | none | safe | S3 |
+| `open_url` | `url` (https, allow-listed) | safe | S2 |
+| `browser_task` | `goal`, `start_url` (https) | **consequential**: one approval per task (see "Browser agent" below) | S1, S2 and any web task |
+| `close_app` | `app` | **consequential** (always asks first) | S4 |
+
+### Browser agent: extension bridge (`app/contracts/browser.py`)
+
+Jarvis works inside the user's own browser like a browser co-pilot: it reads the page, then clicks, types, navigates and scrolls, one action at a time.
+
+- **Extension (W1)** `projects/sde-1-voicebot/extension/`: Chrome/Chromium Manifest V3. It connects to `ws://127.0.0.1:<VOICEBOT_PORT>/api/bridge`; the first message must be `{"type":"hello","token":"<VOICEBOT_LAUNCH_TOKEN>","version":"..."}`, otherwise the server closes the socket. It executes `BrowserAction`s on the active tab and replies with `BrowserActionResult` (including a fresh `PageSnapshot`). Inside the page it draws the **thread cursor** that moves to each element it acts on, and a thin glow border while a task runs.
+- **Bridge (W5)**: `/api/bridge` WebSocket. Messages are JSON `{"type": "hello"|"action"|"result"|"bye", ...}`. Server → extension: `{"type":"action","action":BrowserAction}`. Extension → server: `{"type":"result","result":BrowserActionResult}`. Exactly one extension connection is active per backend; one action is in flight at a time, with a 15 s timeout (`BROWSER_TIMEOUT`).
+- **Agent loop (W3)**: snapshot → choose the next `BrowserAction` (local LLM, or the deterministic mock) → result → repeat until done, at most 25 actions per task. `PageSnapshot.text` and element names are **untrusted data**: they never change the goal or add actions the user did not ask for.
+- **Policy (W4)**, one approval per task: the user approves the plan once (`browser_task` goal and start site). After that the agent may read, navigate, click, scroll and type within the task's site (the start URL's domain, plus domains the user named). It must stop and ask again before:
+  - typing into a `sensitive` field (password, card, one-time code);
+  - submitting anything that pays, buys, deletes, sends or posts;
+  - leaving the allowed domains.
+- **Events**: `event_type="browser.action"`, `producer="browser"`, with payload `{action: BrowserAction, ok, error_code}` (no snapshot text), so the companion UI can show step chips.
+- Without the extension connected, `browser_task` returns the safe error `BROWSER_NOT_CONNECTED`. Mock mode uses a fake extension in tests.
+
+### W3: notes (RAG)
+
+- `SourceReference.kind` now also allows `note` (W6 validation updated in the same change).
+- Only folders listed in `REASONING_NOTES_DIRS` (opt-in, off by default) are read. Note text is untrusted data, like screen text.
+
+### New optional extras
+
+- `browser`: Playwright, used only for automated end-to-end tests of the extension (optional). Browsers are installed with `uv run playwright install chromium`, never in normal tests.
+- `tts`: Piper (W2 text-to-speech). Voice models are downloaded on first use, never committed.
+
 ## File locations and handoffs
 
 All Python paths above are relative to `backend/app/`, except paths explicitly starting with `app/` which are relative to `backend/`. Import through `app`, e.g. `from app.contracts.audio import AudioChunk`. W4's module is `app.agent`, while its event producer remains "workflow" and its schema file remains `app/contracts/workflow.py`. W5 creates `app/main.py` and `app/__main__.py`; session logic belongs to `app/sessions/`. Do not create a second backend package.
